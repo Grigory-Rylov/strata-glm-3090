@@ -167,3 +167,27 @@ Tried and dropped (no gain, or worse):
   traced routing against 40% for the shipped profile, but missed MORE on held-out prompts (CPU experts per layer
   5.3 vs 4.0 short, 10.8 vs 6.6 at 32K) - it fits the traces; the shipped profile generalises.
 - A q4_0 / q8_0 MTP head: tools/mtp_pack.py writes them, but the drafter only runs Q2_0 experts.
+
+### Second pass (2026-09-30, two read-only audits with a fresh context, then measured)
+
+Where a decode round goes (nsys, 262K context, ~21 ms a round): the GPU runs back to back; 4.6 ms is the copy
+kernel pulling the PCIe share and 3.4 ms is spinning on the CPU pool's flags - neither overlaps other GPU work. The
+CPU pool reads DRAM at 55 GB/s against a measured ceiling of ~65 GB/s (4 x 32 GB DDR5-5600): it is memory-bound.
+
+Kept:
+- **Start: the expert arena loads on its own thread** while the dense weights, PLE, MTP and head load, and the
+  cuBLAS handle (0.9 s) is created on another: first prompt token at ~8.0 s instead of ~10.1 s.
+- **Prompt path: NVFP4 scales applied where they are read** (swiglu, combine) instead of passes over the MMQ
+  outputs, and one launch per expert gather: +5.6% prompt reading at 32K, bit-identical.
+- **The verify commit does not wait** (single GPU): it overlaps the MTP draft; +2.1% rounds/s.
+
+Tried and dropped:
+- The hyper-connection kernels (3.4 ms/round, ~5x off the weights' bandwidth): 2 or 4 warps per block instead of
+  8 (more SMs), all weight chunks loaded up front, activations read without the staged tiles - none faster, some
+  slower. Nsight Compute crashes here (0xC0000409), so the stall reasons were not measured.
+- Prefetching the next token's inputs in the prompt path's GDN recurrence: the phase -4%, the chunk unchanged.
+- Readers not waiting for the arena's per-layer registration on large pages: 0.9 s faster and a CORRUPTED arena
+  (STRATA_VERIFY_ARENA different every run). The wait stays.
+- A drafter window of 8K or 4K instead of 32K: 0.54 s less prompt reading at 32K, but decode -14% at that length.
+- The adaptive tier's swaps spread over every round (24 a round instead of 96 every 4): 1.2% fewer rounds/s.
+  Without the tier decode drops 23%. High process priority: no change.
