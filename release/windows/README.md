@@ -10,7 +10,11 @@ Source, measurements and how it works: https://github.com/sergqwer/strata-nvfp4
 - **Driver:** NVIDIA 580 or newer (CUDA 13). The CUDA runtime is inside `strata.exe` and cuBLAS is in `engine\`,
   so no CUDA toolkit is needed.
 - **RAM:** 96 GB or more; measured with 128 GB. A run holds ~69 GiB of physical RAM (63 GiB of it the pinned
-  experts) and ~98 GiB of commit charge (Windows counts the GPU's allocations too): leave the pagefile on.
+  experts).
+- **Pagefile:** at least **32 GB with 128 GB of RAM, 64 GB with 96 GB** (System > About > Advanced system settings >
+  Performance > Advanced > Virtual memory; set a fixed initial size). Windows allows all programs together to reserve
+  only RAM + pagefile, and the engine reserves ~98 GiB (Windows counts the GPU's memory too); nothing of the model is
+  actually written to the pagefile. Too small, and the start fails with an allocation error.
 - **CPU:** any x86-64 with AVX2; AVX-512 (Zen 4/5) is used automatically for the CPU share of the experts.
 - **Disk:** ~340 GB free while the model is prepared, ~200 GB afterwards (delete `models\checkpoint`, 135 GB, and
   `models\mtp\tensors` once `prepare-model.cmd` is done). The start reads 63 GiB, so the fastest NVMe drive you
