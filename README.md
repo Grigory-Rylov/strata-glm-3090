@@ -43,6 +43,10 @@ Method, per-product error measurements and everything that was tried and dropped
   activations to 4 bits too. `src/prefill/mmq_nvfp4_w4a8.cu` compiles its int8 path for this GPU instead: 16x
   smaller error per product (0.46% vs 7.2% on real activations) at 86% of the FP4 speed. `STRATA_PREFILL_NVFP4`
   switches between `w4a8`, `w4a4` and `fp16`.
+- **The n-gram (PLE) table as shipped.** Qwen stores the 51.2e9-value table in FP8 E4M3; Strata read it only as
+  IQ4_NL, 8.1% off per row. `tools/ple_fp8_pack.py` keeps the FP8 bytes unchanged and the engine reads either format.
+  The IQ4_NL table moved the first token's distribution by KL 0.0026 on average - more than the whole W4A8 prompt
+  path - at the same speed (the table is read from the SSD, 16 rows a token).
 - **AVX-512 NVFP4 rows for the CPU pool** (`src/kernels/cpu/nvfp4_avx512.cpp`): each 64-value block decoded once
   per verify window, same arithmetic as ggml-cpu (1.8x at one token, 3.7x at seven).
 - **Loading.** `experts.bin` is read unbuffered straight into the pinned arena by 16 readers while another thread
@@ -75,15 +79,17 @@ python -m venv .venv
 .venv\Scripts\python -m pip install numpy torch safetensors transformers sentencepiece
 set PYTHONPATH=third_party\llama.cpp\gguf-py
 
-:: 1. the checkpoint (126 GiB) and ISTA-DASLab's shard 2, which carries the n-gram (PLE) table as IQ4_NL
+:: 1. the checkpoint (126 GiB)
 hf download jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4 --local-dir models\orca-nvfp4
-hf download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf --local-dir models\ista-ple
 
-:: 2. GGUF (NVFP4 experts, Q8_0/BF16 dense) and the pack (experts.bin 63 GiB, tokenizer)
+:: 2. the n-gram (PLE) table, 51.2 GB: its FP8 bytes copied as they are (read from the SSD, never loaded into RAM)
+.venv\Scripts\python tools\ple_fp8_pack.py --model models\orca-nvfp4 --out models\ple-fp8.gguf
+
+:: 3. GGUF (NVFP4 experts, Q8_0/BF16 dense) and the pack (experts.bin 63 GiB, tokenizer)
 .venv\Scripts\python tools\nvfp4_convert.py --model models\orca-nvfp4 --outfile models\orca-nvfp4.gguf
 .venv\Scripts\python tools\iq_pack.py --gguf models\orca-nvfp4.gguf --out packs\orca-nvfp4
 
-:: 3. the fine-tune's own MTP draft head
+:: 4. the fine-tune's own MTP draft head
 .venv\Scripts\python tools\mtp_extract.py --model models\orca-nvfp4 --out mtp-orca
 .venv\Scripts\python tools\mtp_pack.py --src mtp-orca --experts q2_0 --out mtp-orca\mtp-q2_0.gguf
 .venv\Scripts\python tools\mtp_rt.py --gguf mtp-orca\mtp-q2_0.gguf --out mtp-orca\rt
@@ -98,7 +104,7 @@ One-shot:
 
 ```bat
 build\strata.exe --pack packs\orca-nvfp4 --native models\orca-nvfp4.gguf --native-dense-gguf models\orca-nvfp4.gguf ^
-  --ple-gguf models\ista-ple\IQ3_S\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf ^
+  --ple-gguf models\ple-fp8.gguf ^
   --mtp mtp-orca\rt --spec 4 --spec-min-p 0.5 --prefill auto ^
   --expert-profile data\expert-profile.bin --expert-cache auto ^
   --max-context 262144 --kv int8 --tokens-file prompt.txt --max-new 256

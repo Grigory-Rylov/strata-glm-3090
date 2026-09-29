@@ -4,7 +4,7 @@
     "--pack", "models/pack",
     "--native", "models/orca-nvfp4.gguf",
     "--native-dense-gguf", "models/orca-nvfp4.gguf",
-    "--ple-gguf", "models/ple/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+    "--ple-gguf", "models/ple-fp8.gguf",
     "--expert-profile", "data/expert-profile.bin", "--expert-cache", "auto",
     "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
     "--mtp", "models/mtp/rt",

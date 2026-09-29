@@ -50,6 +50,24 @@ On a real prompt's rows (`STRATA_DUMP_MOE_INPUT` + `mmq_nvfp4_parity --real`, la
 experts, max|x|/rms 4 median and 9 at most) one product is off by: `w4a8` 0.46% (gate/up) and 0.90% (down, whose
 SwiGLU input has the heavier tails), `w4a4` 7.2% and 8.4%, `fp16` 0.017% and 0.021%.
 
+## The n-gram (PLE) table
+
+Layer 1 adds 16 rows of a 320,001,536 x 160 n-gram table per token. Qwen ships it in FP8 E4M3 (128 shards of
+[2500012, 160] and one scale, 51.2 GB); no source holds more precision (OrcaRouter's BF16 copy is this FP8
+widened). Strata read only IQ4_NL (ISTA-DASLab's shard 2, 28.8 GB), which is 8.1% off the FP8 values per row -
+correlation 0.996-0.997 on rows from every shard, so the same table in the same order, and the abliteration left it
+alone. `tools/ple_fp8_pack.py` copies the FP8 bytes into a GGUF (I8, `strata.ple.format` = f8_e4m3,
+`strata.ple.scale`); `ple_fp8_parity` checks the engine's rows against torch's decode of the checkpoint, bit for bit.
+
+| first-token KL, 8 prompts (1K-8K) | mean | median | max | top-1 |
+| --- | ---: | ---: | ---: | ---: |
+| noise floor (summation order) | 0.00023 | 0.00003 | 0.0016 | 8/8 |
+| w4a8 prompt path vs fp16 | 0.0018 | 0.0010 | 0.0096 | 8/8 |
+| **IQ4_NL PLE vs FP8 PLE** | **0.0026** | **0.0012** | **0.013** | 8/8 |
+
+It costs 22 GB more disk and nothing else: the table stays on the SSD (16 page reads a token either way; a row is
+160 B instead of 90) and the row cache grows from ~95 to ~160 MB. Prompt reading speed was unchanged.
+
 ## CPU experts
 
 `src/kernels/cpu/nvfp4_avx512.cpp` computes the CPU pool's NVFP4 rows in 512-bit lanes: each 64-value

@@ -1,6 +1,6 @@
 @echo off
 setlocal
-rem Downloads the ModelOpt NVFP4 checkpoint and the PLE table, and converts them for engine\strata.exe into models\.
+rem Downloads the ModelOpt NVFP4 checkpoint and converts it for engine\strata.exe into models\.
 rem Needs Python 3.11+ on PATH and ~300 GB free on this drive; models\checkpoint (126 GB) can go afterwards.
 rem Each step is skipped when its output already exists, so a failed run can simply be started again.
 cd /d "%~dp0"
@@ -19,8 +19,10 @@ if not exist "%PY%" (
 echo [1/5] the checkpoint, 126 GB ...
 "%HF%" download jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4 --local-dir models\checkpoint || goto :fail
 
-echo [2/5] the PLE table: ISTA-DASLab's shard 2, 27 GB ...
-"%HF%" download ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf --local-dir models\ple || goto :fail
+echo [2/5] the n-gram (PLE) table in FP8, byte for byte as shipped, 51 GB ...
+if not exist models\ple-fp8.gguf (
+  "%PY%" tools\ple_fp8_pack.py --model models\checkpoint --out models\ple-fp8.gguf || goto :fail
+)
 
 echo [3/5] the GGUF: NVFP4 experts repacked without loss, 69 GB ...
 if not exist models\orca-nvfp4.gguf (

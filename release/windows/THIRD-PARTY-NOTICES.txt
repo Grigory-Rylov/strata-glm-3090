@@ -15,6 +15,5 @@ NVIDIA CUDA runtime (statically linked) and cuBLAS (engine\cublas64_13.dll, engi
   as redistributable: https://docs.nvidia.com/cuda/eula/
   Copyright (c) NVIDIA Corporation. All rights reserved.
 
-Model weights are NOT included. prepare-model.cmd downloads them from Hugging Face under their own licenses:
+Model weights are NOT included. prepare-model.cmd downloads them from Hugging Face under their own license:
   jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4
-  ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF (the PLE table in shard 2)
