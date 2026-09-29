@@ -109,8 +109,46 @@ OpenAI-compatible server: save the same arguments as a config (`{"exe": "build/s
 `python -m serve.server --engine strata --config that.json`.
 
 `--native` and `--native-dense-gguf` both point at the GGUF: `--native` alone would take the PLE file for a second
-shard of the same model. For large pages (2 MB, steadier CPU pool) the account needs *Lock pages in memory*
-(`secpol.msc`) and a fresh sign-in; without it the arena falls back to 4 KB pages and says so.
+shard of the same model.
+
+## Claude Code
+
+```bat
+set ANTHROPIC_BASE_URL=http://127.0.0.1:8097
+set ANTHROPIC_API_KEY=local
+set ANTHROPIC_MODEL=strata-nvfp4
+set ANTHROPIC_SMALL_FAST_MODEL=strata-nvfp4
+claude
+```
+
+The model is hybrid (Gated DeltaNet layers keep a recurrent state that cannot be cut back to a position), so an
+agent turn that differs from the last one a few tokens in would re-read everything without checkpoints. The server
+keeps one at every turn boundary. Measured with a real `claude -p` session doing three tool turns: the first request
+read its 21,964-token system prompt once (5.8 s), the next ones 209 and 106 new tokens (0.55 s and 0.4 s). An edit
+in the middle of a history falls back to the checkpoint just before it. `/v1/messages/count_tokens` is served, and
+a request that asks for no thinking (Claude Code's small helper calls) gets none.
+
+## Large pages (why a reboot)
+
+This is not more memory, it is bigger pages. Windows maps memory in 4 KB pages, so the 63 GiB expert arena is
+16.5 million of them; the CPU part of every token reads experts from it at DRAM speed, and each page needs a TLB
+entry. With 2 MB pages it is 32 thousand, and the CPU pool holds steady: 7.3-7.7 ms per round on this machine
+against 7.4-11 ms with 4 KB pages. Decode itself is GPU-bound here, so the rate moves little; the point is the
+steadiness (and a slightly faster start and exit).
+
+Windows only gives large pages to an account that holds *Lock pages in memory* (SeLockMemoryPrivilege), and it
+puts a privilege into a sign-in's token only when that sign-in starts. So:
+
+1. `powershell -ExecutionPolicy Bypass -File tools\enable-large-pages.ps1` — asks for admin (UAC) and grants it to
+   the current user through `secedit` (works on Windows Home, which has no `secpol.msc`); the policy as it was is
+   saved to `%LOCALAPPDATA%\strata-large-pages\before.inf`, and `-Revoke` takes it back.
+2. **Sign out and back in, or reboot.** Locking the screen is not a new sign-in.
+3. Check: the same script with `-Check`, or the engine's start line `expert arena: ... large pages (2097152 B)`.
+
+Without the privilege the engine says `large pages refused ... VirtualAlloc error 1314` and runs on 4 KB pages.
+Error 1450 instead means the privilege is there but Windows found no 32 thousand free 2 MB blocks (memory
+fragmented after a long uptime): it falls back the same way, and a reboot clears it. The arena is locked in RAM
+either way - CUDA pins it for the GPU's copies.
 
 ## Switches
 
@@ -118,6 +156,7 @@ shard of the same model. For large pages (2 MB, steadier CPU pool) the account n
 | --- | --- |
 | `STRATA_PREFILL_NVFP4=w4a8\|w4a4\|fp16` | prompt path precision (default `w4a8`) |
 | `--pcie-frac F` | share of cache misses fetched over PCIe (NVFP4 default 0.25) |
+| `STRATA_NO_LARGEPAGES=1` | 4 KB pages even when large pages are allowed (A/B) |
 | `STRATA_NO_NVFP4_512=1` | CPU pool on ggml-cpu's NVFP4 dot instead of the AVX-512 rows |
 | `STRATA_BUFFERED_LOAD=1` | the original buffered arena loader |
 | `STRATA_VERIFY_ARENA=1` | print a checksum of the loaded arena |
