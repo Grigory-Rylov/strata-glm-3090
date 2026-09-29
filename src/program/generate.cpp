@@ -1137,6 +1137,7 @@ int main(int argc, char** argv) {
         }
     }
     const bool multi_gpu = !split_devs.empty() && !split_same;
+    strata::core::Verifier::set_commit_async(!multi_gpu);   // see Verifier::set_commit_async
     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
     // split, the visible GPUs no stage runs on, in order
     int remote_dev[3] = {1, 2, 3};
@@ -3745,6 +3746,9 @@ int main(int argc, char** argv) {
                 }
                 strata::kernels::cvec_set_enabled(want);
             }
+            // the last request's final commit may still be running on the verifier's stream (set_commit_async):
+            // everything below reads, restores or zeroes the session from other streams and the host
+            cudaDeviceSynchronize();
             int64_t resume = 0;
             bool from_live = false;
             if (o.prompt_cache > 0) {
@@ -4952,6 +4956,7 @@ int main(int argc, char** argv) {
     for (int64_t t : produced) std::printf(" %lld", (long long) t);
     std::printf("\n");
     const double decode_ms = decoded > 0 ? total_ms / (double) decoded : 0.0;
+    cudaDeviceSynchronize();   // the last commit (set_commit_async) before anything reads the session
     std::printf("%-24s %lld tokens in %.1f ms  ->  %.2f tok/s\n", "decode", (long long) decoded, total_ms,
                 decode_ms > 0.0 ? 1000.0 / decode_ms : 0.0);
     if (n_prompt > 1)
