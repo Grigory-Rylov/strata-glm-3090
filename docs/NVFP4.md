@@ -81,6 +81,21 @@ First-token KL on the 8 prompts above plus one of 32K tokens; the first token ru
 | decode experts, q8_1 activations | FP32 activations | 0.00076 | 0.000085 | 0.00065 | new GPU and AVX-512 BF16 kernels |
 | prompt path w4a8 | fp16 | 0.0018 | 0.0010 | - | prompt reading -24% |
 | token embedding Q8_0 (before) | BF16 (`--embd-gguf`, now) | 0.0025 | 0.00042 | 0.0041 | 0.6 GB of host RAM |
+| RoPE: fast-math float angles (before) | the float64 table (now) | - | - | 0.0063 (also at 125K) | - |
+| prompt path: BF16 activations into BF16 projections (before) | hi + lo split, all | 0.0023 | 0.00031 | 0.0093 | - |
+| split without the hyper-connection (now) | hi + lo split, all | 0.0011 | 0.0012 | 0.0029 | the full split: -9% prompt reading |
+
+- **RoPE.** The native rope kernels computed `pos * powf(...)` with fast-math `cosf/sinf` (0.0014 rad off at 32K,
+  ~0.02 at 262K), the prompt path the same in precise float, and the session's float64 angle table was read only by
+  the non-native path. All of them read the table now (`rope_table_set`, `mrope.hpp`). `STRATA_ROPE_LEGACY=1`
+  restores the old angles for A/B.
+- **Prompt path BF16 activations.** Decode feeds FP32 x to the BF16-weight projections (router, indexer, SSM
+  alpha/beta, shared gate, PLE key/value, hyper-connection); the prompt path fed BF16. `STRATA_PREFILL_BF16X2`
+  (default 2) adds each activation's BF16 remainder as a second GEMM for all but the hyper-connection, whose
+  10240-wide activations make the split cost ~9% of prompt reading (`=1` turns it on anyway, `=0` off).
+- Found by a read-only audit with a fresh context (all checked here): the above, a FP16-saturating SwiGLU in the
+  prompt path's shared expert, `log1pf` in the non-fused GDN softplus, and a stale NVFP4 tail comment. Checked and
+  left: int8 KV group scales (the smallest V group amax on real K/V is 0.25, FP16's subnormals start at 7.8e-3).
 
 - **Token embedding.** The converter stored `embed_tokens` as Q8_0 (0.55% off per row). `tools/embd_bf16_pack.py`
   copies the checkpoint's BF16 table into its own GGUF and `--embd-gguf` reads it: mapped host memory like before

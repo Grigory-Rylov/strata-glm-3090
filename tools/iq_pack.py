@@ -347,23 +347,41 @@ def main() -> int:
             print("note: %s/experts.bin exists; the engine reads it instead of the GGUF" % out)
         return 0
     path = out / "experts.bin"
+
+    def layer_blobs(l, blob, ts):
+        parts = [model.bytes(t.name).reshape(n_expert, -1) for t in ts]
+        if ts[0].type_name == "NVFP4":
+            s = [np.frombuffer(model.bytes("blk.%d.ffn_%s_exps.scale" % (l, r)).tobytes(), dtype=np.float32)
+                 for r in ROLES]
+            tail = np.zeros((n_expert, NVFP4_TAIL // 4), dtype=np.float32)
+            tail[:, 0], tail[:, 1], tail[:, 2] = s[0], s[1], s[2]
+            if not np.isfinite(tail).all() or (tail[:, :3] <= 0).any():
+                return None
+            parts.append(tail.view(np.uint8))
+        chunk = np.concatenate(parts, axis=1)              # (n_expert, blob): gate | up | down [| tail] per expert
+        assert chunk.shape == (n_expert, blob)
+        return chunk
+
     if path.exists() and path.stat().st_size == offset:
-        print("experts.bin exists with the right size; not rewritten")
-        return 0
+        # the size alone would keep another checkpoint's experts of the same geometry: compare the first, middle and
+        # last layers' first and last blobs (their scale tails included) with this GGUF
+        same = True
+        with open(path, "rb") as f:
+            for l, gt, dt, off, blob, ts in (layout[0], layout[len(layout) // 2], layout[-1]):
+                chunk = layer_blobs(l, blob, ts)
+                for e in (0, n_expert - 1):
+                    f.seek(off + e * blob)
+                    same = same and chunk is not None and f.read(blob) == chunk[e].tobytes()
+        if same:
+            print("experts.bin exists with the right size and this GGUF's blobs; not rewritten")
+            return 0
+        print("experts.bin has the right size but other contents; rewriting it")
     with open(path, "wb") as fo:
         for l, gt, dt, off, blob, ts in layout:
-            parts = [model.bytes(t.name).reshape(n_expert, -1) for t in ts]
-            if ts[0].type_name == "NVFP4":
-                s = [np.frombuffer(model.bytes("blk.%d.ffn_%s_exps.scale" % (l, r)).tobytes(), dtype=np.float32)
-                     for r in ROLES]
-                tail = np.zeros((n_expert, NVFP4_TAIL // 4), dtype=np.float32)
-                tail[:, 0], tail[:, 1], tail[:, 2] = s[0], s[1], s[2]
-                if not np.isfinite(tail).all() or (tail[:, :3] <= 0).any():
-                    print("layer %d: a non-finite or non-positive NVFP4 scale" % l)
-                    return 1
-                parts.append(tail.view(np.uint8))
-            chunk = np.concatenate(parts, axis=1)          # (n_expert, blob): gate | up | down [| tail] per expert
-            assert chunk.shape == (n_expert, blob)
+            chunk = layer_blobs(l, blob, ts)
+            if chunk is None:
+                print("layer %d: a non-finite or non-positive NVFP4 scale" % l)
+                return 1
             fo.write(chunk.tobytes())
             if l % 8 == 0:
                 print("  layer %2d  %-8s/%-7s blob %8d  at %.2f GiB" % (l, ts[0].type_name, ts[2].type_name, blob,
