@@ -5,6 +5,7 @@
     "--native", "models/orca-nvfp4.gguf",
     "--native-dense-gguf", "models/orca-nvfp4.gguf",
     "--ple-gguf", "models/ple-fp8.gguf",
+    "--embd-gguf", "models/token-embd-bf16.gguf",
     "--expert-profile", "data/expert-profile.bin", "--expert-cache", "auto",
     "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
     "--mtp", "models/mtp/rt",

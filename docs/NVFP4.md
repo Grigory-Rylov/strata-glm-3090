@@ -80,6 +80,13 @@ First-token KL on the 8 prompts above plus one of 32K tokens; the first token ru
 | **KV int8 + Hadamard (now)** | fp16 KV | 0.0011 | 0.00038 | 0.0038 | - |
 | decode experts, q8_1 activations | FP32 activations | 0.00076 | 0.000085 | 0.00065 | new GPU and AVX-512 BF16 kernels |
 | prompt path w4a8 | fp16 | 0.0018 | 0.0010 | - | prompt reading -24% |
+| token embedding Q8_0 (before) | BF16 (`--embd-gguf`, now) | 0.0025 | 0.00042 | 0.0041 | 0.6 GB of host RAM |
+
+- **Token embedding.** The converter stored `embed_tokens` as Q8_0 (0.55% off per row). `tools/embd_bf16_pack.py`
+  copies the checkpoint's BF16 table into its own GGUF and `--embd-gguf` reads it: mapped host memory like before
+  (1.2 GiB instead of 0.6), no VRAM, decode and prompt speed unchanged, +0.2 s at start. It moved the first token
+  more than any other source here - the embedding's error rides the residual stream through every layer, where a
+  projection's error enters once.
 
 - **KV rotation.** int8 K/V now go through the 256-point Walsh-Hadamard rotation that `--kv q4_0` already used
   (queries rotated to match, the output rotated back). On real K/V/Q (`STRATA_DUMP_QKV`, 12 QSA layers, 4K tokens,
@@ -95,8 +102,8 @@ First-token KL on the 8 prompts above plus one of 32K tokens; the first token ru
   (`native_expert_grouped_f32`, an oracle: its unoptimized kernel adds ~11% GPU time). Run with `--pcie-frac 1`
   so no expert falls to the CPU pool. The q8_1 rounding costs 12x the noise at the median; the mean is one
   prompt's 0.0055.
-- Dense projections stay Q8_0 (the source is BF16): BF16 would take ~2.6 GB of VRAM (~1,000 slots) and double
-  the dense bytes read per token. Router, SSM gates, indexer, PLE and shared-expert gates are already BF16 with
+- Dense projections stay Q8_0 (the source is BF16; 0.56-0.80% off per weight): BF16 would take ~3.3 GB of VRAM
+  (~1,270 slots) and read ~7.1 GB of dense weights per round instead of ~3.8 - an estimated -15-20% decode. Router, SSM gates, indexer, PLE and shared-expert gates are already BF16 with
   FP32 activations; the GDN state, indexer keys and norms are FP32.
 
 ## CPU experts

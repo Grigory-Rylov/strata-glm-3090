@@ -19,8 +19,10 @@ Source, measurements and how it works: https://github.com/sergqwer/strata-nvfp4
 
 1. **`prepare-model.cmd`** — downloads
    [jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4](https://huggingface.co/jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4)
-   (126 GB) and converts it into `models\`, the n-gram (PLE) table kept in FP8 exactly as Qwen ships it. It takes
-   a while; if it stops, run it again and it resumes.
+   (126 GB) and converts it into `models\`, the n-gram (PLE) table kept in FP8 and the token embedding in BF16
+   exactly as Qwen ships them. It takes a while; if it stops, run it again and it resumes. Coming from an older
+   release: run it again too - it adds only `models\token-embd-bf16.gguf` (1.3 GB; the checkpoint must still be in
+   `models\checkpoint`).
 2. **`start-server.cmd`** — loads the model and serves it on **http://127.0.0.1:8080**:
    - a chat page at `http://127.0.0.1:8080/`
    - OpenAI API at `/v1/chat/completions`, Anthropic API at `/v1/messages` (Claude Code can point at it)
