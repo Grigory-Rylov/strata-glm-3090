@@ -16,7 +16,7 @@ OUT = REPO / "dist" / "strata-nvfp4"
 CUDA = pathlib.Path(os.environ["CUDA_PATH"])
 CUDA_BIN = CUDA / "bin" / "x64" if (CUDA / "bin" / "x64" / "cublas64_13.dll").exists() else CUDA / "bin"
 LLAMA = REPO / "third_party" / "llama.cpp"
-VERSION = "0.1.24-nvfp4.1"
+VERSION = "0.1.24-nvfp4.2"
 
 if OUT.exists():
     shutil.rmtree(OUT)
