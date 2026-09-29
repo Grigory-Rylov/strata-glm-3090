@@ -10,52 +10,50 @@ Strata itself keeps the 63 GiB of routed experts in RAM, caches the most-used on
 the CPU and over PCIe in parallel with the GPU, and decodes with an MTP draft head. Everything about that design is
 upstream's; the original README is kept as [README.upstream.md](README.upstream.md).
 
+## How it differs from upstream Strata
+
+- **Runs an NVFP4 checkpoint** (ModelOpt, 4.5-bit experts with calibrated scales) instead of Strata's Q2/Q3 quants:
+  lossless repack, per-expert FP32 scales kept and applied to each projection's output.
+- **Nothing is rounded coarser than the checkpoint where it can be avoided:** the n-gram (PLE) table in its shipped
+  FP8 (upstream reads it as IQ4_NL, 8% off per row), the token embedding in its shipped BF16, RoPE angles from a
+  float64 table in every kernel (upstream's fast-math angles were ~0.02 rad off at 262K), FP32-exact inputs to the
+  prompt path's BF16 projections (router, indexer, gates), int8 KV behind a Hadamard rotation.
+- **An int8 (W4A8) prompt path for Blackwell:** llama.cpp builds NVFP4 MMQ as FP4 x FP4 on sm_120; this keeps
+  8-bit activations - 16x smaller error per product - at 86% of its speed.
+- **AVX-512 NVFP4 kernels** for the CPU share of the experts (1.8-3.7x ggml-cpu).
+- **Faster start:** experts read unbuffered into the pinned arena on their own thread, beside everything else -
+  ~8 s to the first token from a PCIe 5 drive.
+- **Tuned for NVFP4's larger experts** (PCIe share, prompt chunks up to 32K, fused scale passes, a verify commit
+  that overlaps the draft) and the fine-tune's own abliterated MTP draft head.
+- **Fixes:** a scale fold that left NVFP4 hidden activations in FP16's subnormals (2-12% expert error), and the
+  batched verify path skipping the query rotation of rotated KV caches.
+
+Each change was measured - first-token KL against a reference, and interleaved speed A/B runs;
+[docs/NVFP4.md](docs/NVFP4.md) has the numbers, and everything that was tried and dropped.
+
 ## Measured
 
 RTX 5090 (32 GB, PCIe 5 x16), Ryzen 9 9950X3D, 128 GB DDR5-5600, Samsung 9100 PRO, Windows 11, CUDA 13.3.
-262,144-token context, KV cache int8, large pages on.
+262,144-token context, KV cache int8, large pages on. The machine is also a desktop: runs vary by ~5%.
 
 | | |
 | --- | ---: |
-| Writes answers, short chat | ~117 tokens/s |
-| Writes answers, 32K context | ~124 tokens/s |
-| Reads a 32K prompt | ~5,200 tokens/s (time to first token 7.5 s) |
-| Start to ready | ~10 s (63 GiB of experts read at ~11 GiB/s) |
+| Writes answers, short chat | ~115 tokens/s |
+| Writes answers, 32K context | ~120 tokens/s |
+| Reads a 32K prompt | ~5,000 tokens/s |
+| Start to the first token | ~8 s (63 GiB of experts read at ~10 GiB/s) |
 
-Prompt precision, first-token KL divergence against the FP16 reference over 8 prompts (1K-8K tokens):
+Where precision was still being lost, first-token KL divergence from the more exact variant (8 prompts of 1K-8K
+tokens plus one of 32K; two runs of the same configuration differ by a median 0.000007):
 
-| prompt path | KL mean | top-1 agreement | prompt speed (4-8K) |
-| --- | ---: | ---: | ---: |
-| `w4a8` (default): int8 tensor cores, 8-bit activations | 0.0018 | 8/8 | 2,503 tok/s |
-| `w4a4`: Blackwell FP4 x FP4 | 0.0080 | 7/8 | 2,904 tok/s |
-| `fp16`: dequantize + FP16 GEMM (reference) | — | — | 1,905 tok/s |
-| noise floor (same FP16 path, other chunking) | 0.00023 | 8/8 | |
-
-Method, per-product error measurements and everything that was tried and dropped: [docs/NVFP4.md](docs/NVFP4.md).
-
-## What this fork adds
-
-- **NVFP4 routed experts end to end.** `tools/nvfp4_convert.py` repacks the ModelOpt checkpoint into a GGUF with
-  llama.cpp's own converter (lossless; each expert's `weight_scale_2` kept), and `tools/iq_pack.py` writes each
-  expert blob with a 16-byte tail `{s_gate, s_up, s_down, 0}`. CPU pool, GPU decode, FP16 and MMQ prompt paths all
-  read it; each global scale multiplies its own projection's FP32 output, as llama.cpp applies `.scale`.
-- **W4A8 prompt path for Blackwell.** llama.cpp's MMQ builds NVFP4 only as FP4 x FP4 on sm_120, rounding the
-  activations to 4 bits too. `src/prefill/mmq_nvfp4_w4a8.cu` compiles its int8 path for this GPU instead: 16x
-  smaller error per product (0.46% vs 7.2% on real activations) at 86% of the FP4 speed. `STRATA_PREFILL_NVFP4`
-  switches between `w4a8`, `w4a4` and `fp16`.
-- **The n-gram (PLE) table as shipped.** Qwen stores the 51.2e9-value table in FP8 E4M3; Strata read it only as
-  IQ4_NL, 8.1% off per row. `tools/ple_fp8_pack.py` keeps the FP8 bytes unchanged and the engine reads either format.
-  The IQ4_NL table moved the first token's distribution by KL 0.0026 on average - more than the whole W4A8 prompt
-  path - at the same speed (the table is read from the SSD, 16 rows a token).
-- **AVX-512 NVFP4 rows for the CPU pool** (`src/kernels/cpu/nvfp4_avx512.cpp`): each 64-value block decoded once
-  per verify window, same arithmetic as ggml-cpu (1.8x at one token, 3.7x at seven).
-- **Loading.** `experts.bin` is read unbuffered straight into the pinned arena by 16 readers while another thread
-  registers it with CUDA one layer ahead: 19 s to 5.6 s from a PCIe 5 drive.
-- **Tuned for NVFP4's larger experts:** 25% of the cache misses go over PCIe (was 55%; +13% decode short, +17% at
-  32K), and prompt chunks go up to 32,768 tokens (+47% prompt speed at 32K).
-- **The abliterated MTP head.** `tools/mtp_extract.py` takes the draft head from the fine-tune itself, not from the
-  original model, so the drafts match the model that verifies them.
-- Parity tests for every new kernel and diagnostics for comparing prompt paths (below).
+| source | KL mean | at 32K | now |
+| --- | ---: | ---: | --- |
+| RoPE: fast-math float angles | - | 0.0063 | float64 table |
+| token embedding stored as Q8_0 | 0.0025 | 0.0041 | BF16 as shipped (`--embd-gguf`) |
+| prompt path: BF16-rounded activations into BF16 projections | 0.0023 | 0.0093 | hi + lo split (0.0029 left: not the hyper-connection) |
+| n-gram table as IQ4_NL | 0.0026 | - | FP8 as shipped |
+| int8 KV without rotation (vs fp16 KV) | 0.0017 | 0.0068 | rotated: 0.0011 / 0.0038 |
+| prompt path W4A8 (vs FP16 activations) | 0.0018 | - | default; `fp16` is 24% slower |
 
 ## Build (Windows)
 
@@ -85,11 +83,14 @@ hf download jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4 --
 :: 2. the n-gram (PLE) table, 51.2 GB: its FP8 bytes copied as they are (read from the SSD, never loaded into RAM)
 .venv\Scripts\python tools\ple_fp8_pack.py --model models\orca-nvfp4 --out models\ple-fp8.gguf
 
-:: 3. GGUF (NVFP4 experts, Q8_0/BF16 dense) and the pack (experts.bin 63 GiB, tokenizer)
+:: 3. the token embedding, 1.3 GB: BF16 as shipped (the GGUF below stores it as Q8_0)
+.venv\Scripts\python tools\embd_bf16_pack.py --model models\orca-nvfp4 --out models\token-embd-bf16.gguf
+
+:: 4. GGUF (NVFP4 experts, Q8_0/BF16 dense) and the pack (experts.bin 63 GiB, tokenizer)
 .venv\Scripts\python tools\nvfp4_convert.py --model models\orca-nvfp4 --outfile models\orca-nvfp4.gguf
 .venv\Scripts\python tools\iq_pack.py --gguf models\orca-nvfp4.gguf --out packs\orca-nvfp4
 
-:: 4. the fine-tune's own MTP draft head
+:: 5. the fine-tune's own MTP draft head
 .venv\Scripts\python tools\mtp_extract.py --model models\orca-nvfp4 --out mtp-orca
 .venv\Scripts\python tools\mtp_pack.py --src mtp-orca --experts q2_0 --out mtp-orca\mtp-q2_0.gguf
 .venv\Scripts\python tools\mtp_rt.py --gguf mtp-orca\mtp-q2_0.gguf --out mtp-orca\rt
@@ -104,7 +105,7 @@ One-shot:
 
 ```bat
 build\strata.exe --pack packs\orca-nvfp4 --native models\orca-nvfp4.gguf --native-dense-gguf models\orca-nvfp4.gguf ^
-  --ple-gguf models\ple-fp8.gguf ^
+  --ple-gguf models\ple-fp8.gguf --embd-gguf models\token-embd-bf16.gguf ^
   --mtp mtp-orca\rt --spec 4 --spec-min-p 0.5 --prefill auto ^
   --expert-profile data\expert-profile.bin --expert-cache auto ^
   --max-context 262144 --kv int8 --tokens-file prompt.txt --max-new 256
@@ -161,6 +162,11 @@ either way - CUDA pins it for the GPU's copies.
 | | |
 | --- | --- |
 | `STRATA_PREFILL_NVFP4=w4a8\|w4a4\|fp16` | prompt path precision (default `w4a8`) |
+| `--embd-gguf PATH` | the token embedding from this GGUF (BF16 from `tools/embd_bf16_pack.py`) |
+| `STRATA_PREFILL_BF16X2=2\|1\|0` | exact inputs to the prompt path's BF16 projections: all but the hyper-connection (default), all (~9% slower prompt reading), off |
+| `STRATA_KV_ROT=0` | int8 K/V without the Hadamard rotation (A/B) |
+| `STRATA_ROPE_LEGACY=1` | the old float fast-math RoPE angles (A/B) |
+| `STRATA_COMMIT_SYNC=1` | the verify commit waits for its graph again (A/B) |
 | `--pcie-frac F` | share of cache misses fetched over PCIe (NVFP4 default 0.25) |
 | `STRATA_NO_LARGEPAGES=1` | 4 KB pages even when large pages are allowed (A/B) |
 | `STRATA_NO_NVFP4_512=1` | CPU pool on ggml-cpu's NVFP4 dot instead of the AVX-512 rows |
@@ -182,8 +188,9 @@ either way - CUDA pins it for the GPU's copies.
 
 - Built and measured on Windows with one sm_120 GPU only; the MMQ and AVX-512 paths assume a Blackwell card and an
   AVX-512 CPU (both fall back where the code allows, but other setups are untested).
-- Decode is GPU-bound on this box; the attention, hyper-connection and dense Q8_0 kernels are close to the card's
-  bandwidth, so there is little left there without lower-precision weights.
+- A decode round (~21 ms) is the GPU running back to back, ~4.6 ms of it pulling the PCIe share of the experts
+  and ~3.4 ms waiting for the CPU's share, which reads DRAM at ~55 of the ~65 GB/s this platform does. More VRAM
+  for the expert cache or more memory bandwidth are what would move it; docs/NVFP4.md lists what was tried.
 - The model is an abliterated fine-tune: it does not refuse. What it is used for is on whoever runs it.
 
 ## License

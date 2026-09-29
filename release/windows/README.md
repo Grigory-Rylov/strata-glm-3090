@@ -12,7 +12,7 @@ Source, measurements and how it works: https://github.com/sergqwer/strata-nvfp4
 - **RAM:** 96 GB or more (the experts take 63 GiB, pinned, while the model runs); measured with 128 GB.
 - **CPU:** any x86-64 with AVX2; AVX-512 (Zen 4/5) is used automatically for the CPU share of the experts.
 - **Disk:** ~300 GB free while the model is prepared, ~170 GB afterwards. The start reads 63 GiB, so the fastest
-  NVMe drive you have is the right place for this folder (~10 s to start from PCIe 5, ~20 s from PCIe 4).
+  NVMe drive you have is the right place for this folder (~8 s to start from PCIe 5, ~15 s from PCIe 4).
 - **Python 3.11 or newer** on PATH (the scripts make their own virtual environments here).
 
 ## Two steps
@@ -27,15 +27,15 @@ Source, measurements and how it works: https://github.com/sergqwer/strata-nvfp4
    - a chat page at `http://127.0.0.1:8080/`
    - OpenAI API at `/v1/chat/completions`, Anthropic API at `/v1/messages` (Claude Code can point at it)
 
-First start after a reboot is slower while Windows reads the files; later starts take ~10-20 s.
+First start after a reboot is slower while Windows reads the files; later starts take ~8-15 s.
 
 ## Measured (RTX 5090, Ryzen 9 9950X3D, 128 GB DDR5-5600, 262K context)
 
 | | |
 | --- | ---: |
-| Writes answers, short chat | ~117 tokens/s |
-| Writes answers, 32K context | ~124 tokens/s |
-| Reads a 32K prompt | ~5,200 tokens/s |
+| Writes answers, short chat | ~115 tokens/s |
+| Writes answers, 32K context | ~120 tokens/s |
+| Reads a 32K prompt | ~5,000 tokens/s |
 
 ## Settings
 
