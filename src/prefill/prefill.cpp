@@ -1129,9 +1129,20 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                                             (p0 + s.page_size - 1) / s.page_size, s, m.cs);
                         pt.mark(kPfQsa, cs);
                     }
-                    if (st.kv_q4) {   // Q4_0 KV (kv_q4.hpp): rotated K and V, the queries below too, the output back
+                    // Diagnostics: STRATA_DUMP_QKV=dir - the first chunk's K, V and Q (after RoPE, before any rotation)
+                    // of every QSA layer, dir/qkv<i>.f32 = {int64 T} K[T,2,256] V[T,2,256] Q[T,24,256]
+                    static const char* dump_qkv = std::getenv("STRATA_DUMP_QKV");
+                    std::vector<float> qkv_host;
+                    if (dump_qkv && p0 == 0) {
+                        qkv_host.resize((size_t) T * (2 + 2 + 24) * 256);
+                        cudaMemcpyAsync(qkv_host.data(), m.Kc, (size_t) T * 512 * 4, cudaMemcpyDeviceToHost, m.cs);
+                        cudaMemcpyAsync(qkv_host.data() + T * 512, m.Vc, (size_t) T * 512 * 4, cudaMemcpyDeviceToHost, m.cs);
+                    }
+                    if (st.kv_rot) {   // rotated K and V (kv_q4.hpp), the queries below too, the output back
                         strata::kernels::fwht256_inplace_cuda(m.Kc, T * 2, m.cs);
                         strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
+                    }
+                    if (st.kv_q4) {
                         strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
                                                       &st.host, staged ? &m.stage : nullptr);
                     } else {
@@ -1142,7 +1153,18 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     split_q(m.Qf, m.q, T, m.cs);
                     rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
                     rope(m.q, T, 24, 256, 6144, p0, (float) strata::kernels::qsa_freq_base(), m.cs);
-                    if (st.kv_q4) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
+                    if (!qkv_host.empty()) {
+                        cudaMemcpyAsync(qkv_host.data() + T * 1024, m.q, (size_t) T * 24 * 256 * 4, cudaMemcpyDeviceToHost, m.cs);
+                        cudaStreamSynchronize(m.cs);
+                        const std::string path = std::string(dump_qkv) + "/qkv" + std::to_string(qsa_index) + ".f32";
+                        if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+                            const int64_t t64 = T;
+                            std::fwrite(&t64, sizeof t64, 1, f);
+                            std::fwrite(qkv_host.data(), sizeof(float), qkv_host.size(), f);
+                            std::fclose(f);
+                        }
+                    }
+                    if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
                     rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
                     rope(m.q_idx, T, 4, 128, 512, p0, (float) strata::kernels::qsa_freq_base(), m.cs);
                     // the indexer appends, token by token; then scores + selection for many queries at once:
@@ -1282,7 +1304,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                                                    m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
                                                                    s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
                         }
-                    if (st.kv_q4) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
+                    if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                     pt.mark(kPfQsa, cs);
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
                     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;

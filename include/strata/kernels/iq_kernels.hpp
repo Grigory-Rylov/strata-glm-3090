@@ -57,5 +57,10 @@ size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream);
+/// The same for NVFP4 experts with FP32 activations: token ent_tok[e]'s input is row ent_tok[e] of `x` (n_embd
+/// floats), and the SwiGLU hidden stays FP32 (no q8_1 rounding of either).
+void native_expert_grouped_f32(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                               const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
+                               int64_t cap_entries, const float* x, void* scratch, float* out, void* stream);
 
 }  // namespace strata::kernels

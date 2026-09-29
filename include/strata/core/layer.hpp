@@ -209,6 +209,9 @@ struct QsaState {
     uint16_t* v_scale = nullptr;
     /// PR #21: Q4_0 KV with Walsh-Hadamard rotation (qsa_set_kv_q4, kv_q4.hpp): 144 B per cell and head
     bool kv_q4 = false;
+    /// K and V stored after the Walsh-Hadamard rotation, the queries rotated to match and the output rotated
+    /// back: always for Q4_0, for INT8 by qsa_set_kv_int8_rotate (spreads outlier channels over the scale groups)
+    bool kv_rot = false;
     uint8_t* k_q4 = nullptr;
     uint8_t* v_q4 = nullptr;
     int32_t* page_table = nullptr;   ///< (n_pages,) logical page -> physical page (-1: not resident, streamed)
@@ -274,6 +277,7 @@ uint64_t qsa_kv_host_bytes();
 void qsa_set_kv_int8(bool enabled);
 bool qsa_kv_int8();
 /// PR #21: store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
+void qsa_set_kv_int8_rotate(bool enabled);
 void qsa_set_kv_q4(bool enabled);
 bool qsa_kv_q4();
 /// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4).

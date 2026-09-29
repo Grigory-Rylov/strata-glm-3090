@@ -68,6 +68,37 @@ alone. `tools/ple_fp8_pack.py` copies the FP8 bytes into a GGUF (I8, `strata.ple
 It costs 22 GB more disk and nothing else: the table stays on the SSD (16 page reads a token either way; a row is
 160 B instead of 90) and the row cache grows from ~95 to ~160 MB. Prompt reading speed was unchanged.
 
+## Where precision is still lost (audit, 2026-09-29)
+
+First-token KL on the 8 prompts above plus one of 32K tokens; the first token runs through the decode path
+(a verify window), so it sees the decode arithmetic and the KV cache. Noise floor: the same configuration twice.
+
+| source | vs | KL mean | median | 32K | cost of the exact version |
+| --- | --- | ---: | ---: | ---: | --- |
+| noise (same config twice) | - | 0.00012 | 0.000007 | 0 | - |
+| KV int8 (before) | fp16 KV | 0.0017 | 0.00034 | 0.0068 | 1,189 expert slots at 262K, decode -12% (116.5 -> 102.7 tok/s) |
+| **KV int8 + Hadamard (now)** | fp16 KV | 0.0011 | 0.00038 | 0.0038 | - |
+| decode experts, q8_1 activations | FP32 activations | 0.00076 | 0.000085 | 0.00065 | new GPU and AVX-512 BF16 kernels |
+| prompt path w4a8 | fp16 | 0.0018 | 0.0010 | - | prompt reading -24% |
+
+- **KV rotation.** int8 K/V now go through the 256-point Walsh-Hadamard rotation that `--kv q4_0` already used
+  (queries rotated to match, the output rotated back). On real K/V/Q (`STRATA_DUMP_QKV`, 12 QSA layers, 4K tokens,
+  dense attention of the last 512 queries) the attention output error drops from 0.306% to 0.265%; same memory,
+  decode speed unchanged. `STRATA_KV_ROT=0` stores them unrotated.
+- **Bug found on the way:** the batched verify path (`qb`, windows of 2+ tokens) never rotated its queries, which
+  is why upstream kept `--kv q4_0` off that path. With rotation it scored `<q, Hk>`: coherent text, but MTP
+  acceptance fell from 2.5 to 2.2 tokens a round. Fixed in `verify.cpp`.
+- **k8v4 (int8 K, q4_0 V) is not worth it here.** Only 12 of 48 layers keep K/V, so int8 at 262K is ~3.1 GiB;
+  V in 4 bits would free ~0.7 GiB = ~270 expert slots, and 270 fewer slots measured no change in rounds per
+  second (47.7 vs 47.5). Its attention output error is 3.15% (10x int8's); `--kv q4_0` is 3.89%.
+- **Decode activations.** `STRATA_DECODE_A16=1` computes the GPU's NVFP4 experts with FP32 activations
+  (`native_expert_grouped_f32`, an oracle: its unoptimized kernel adds ~11% GPU time). Run with `--pcie-frac 1`
+  so no expert falls to the CPU pool. The q8_1 rounding costs 12x the noise at the median; the mean is one
+  prompt's 0.0055.
+- Dense projections stay Q8_0 (the source is BF16): BF16 would take ~2.6 GB of VRAM (~1,000 slots) and double
+  the dense bytes read per token. Router, SSM gates, indexer, PLE and shared-expert gates are already BF16 with
+  FP32 activations; the GDN state, indexer keys and norms are FP32.
+
 ## CPU experts
 
 `src/kernels/cpu/nvfp4_avx512.cpp` computes the CPU pool's NVFP4 rows in 512-bit lanes: each 64-value

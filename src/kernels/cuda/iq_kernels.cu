@@ -443,6 +443,78 @@ __global__ void __launch_bounds__(256) native_down_kernel(const unsigned long lo
     }
 }
 
+// ---------------------------------------------------------------- NVFP4 against FP32 activations
+// The q8_1 path above rounds the expert input and the SwiGLU hidden to int8 per 32 values; these read both as FP32.
+// Weights exact (E2M1 x UE4M3, as dq_nvfp4), FP32 products and sums.  STRATA_DECODE_A16 (verify.cpp).
+__device__ __forceinline__ float nvfp4_row_dot_f32(const uint8_t* row, const float* __restrict__ x, int nb, int lane,
+                                                   const float* lut) {
+    float s = 0.0f;
+    for (int k = lane; k < nb * 4; k += 32) {                 // block k / 4, sub-block k % 4: 16 values
+        const block_nvfp4* b = (const block_nvfp4*) row + (k >> 2);
+        const int is = k & 3;
+        const uint32_t q0 = (uint32_t) get_int_b4(b->qs, 2 * is), q1 = (uint32_t) get_int_b4(b->qs, 2 * is + 1);
+        const float4* xs = (const float4*) (x + (size_t) (k >> 2) * 64 + is * 16);
+        const float4 x0 = xs[0], x1 = xs[1], x2 = xs[2], x3 = xs[3];   // byte j: value j (low nibble), j + 8 (high)
+        float a = lut[q0 & 15] * x0.x + lut[(q0 >> 8) & 15] * x0.y + lut[(q0 >> 16) & 15] * x0.z + lut[(q0 >> 24) & 15] * x0.w;
+        a += lut[q1 & 15] * x1.x + lut[(q1 >> 8) & 15] * x1.y + lut[(q1 >> 16) & 15] * x1.z + lut[(q1 >> 24) & 15] * x1.w;
+        a += lut[(q0 >> 4) & 15] * x2.x + lut[(q0 >> 12) & 15] * x2.y + lut[(q0 >> 20) & 15] * x2.z + lut[q0 >> 28] * x2.w;
+        a += lut[(q1 >> 4) & 15] * x3.x + lut[(q1 >> 12) & 15] * x3.y + lut[(q1 >> 20) & 15] * x3.z + lut[q1 >> 28] * x3.w;
+        s += ue4m3_to_f32_half(b->d[is]) * a;
+    }
+    return warp_sum(s);
+}
+
+__global__ void __launch_bounds__(256) nvfp4_gu_f32_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                           const int32_t* __restrict__ grp_start,
+                                                           const int32_t* __restrict__ n_groups,
+                                                           const int32_t* __restrict__ ent_tok,
+                                                           const float* __restrict__ x, NativeExpertLayout L,
+                                                           float* __restrict__ gate, float* __restrict__ up) {
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    __shared__ float lut[16];
+    if (threadIdx.x < 16) lut[threadIdx.x] = (float) kvalues_fp4[threadIdx.x];
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * GU_ROWS + warp;
+    if (row >= 2 * L.n_ff) return;
+    const bool is_up = row >= L.n_ff;
+    const int r = is_up ? row - (int) L.n_ff : row;
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const uint8_t* wr = blob + (is_up ? L.up_off : 0) + (size_t) r * L.gu_row;
+    const float* tail = (const float*) (blob + L.tail_off);
+    const float scale = is_up ? tail[1] : tail[0];
+    const int nb = (int) (L.n_embd / 64);
+    for (int e = grp_start[g]; e < grp_start[g + 1]; ++e) {
+        const float s = nvfp4_row_dot_f32(wr, x + (size_t) ent_tok[e] * L.n_embd, nb, lane, lut);
+        if (lane == 0) (is_up ? up : gate)[(size_t) e * L.n_ff + r] = s * scale;
+    }
+}
+
+__global__ void __launch_bounds__(256) nvfp4_down_f32_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                             const int32_t* __restrict__ grp_start,
+                                                             const int32_t* __restrict__ n_groups,
+                                                             const int32_t* __restrict__ ent_dst,
+                                                             const float* __restrict__ h, NativeExpertLayout L,
+                                                             float* __restrict__ out) {
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    __shared__ float lut[16];
+    if (threadIdx.x < 16) lut[threadIdx.x] = (float) kvalues_fp4[threadIdx.x];
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r = blockIdx.x * 8 + warp;
+    if (r >= L.n_embd) return;
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const uint8_t* wr = blob + L.down_off + (size_t) r * L.d_row;
+    const float sd = ((const float*) (blob + L.tail_off))[2];
+    const int nb = (int) (L.n_ff / 64);
+    for (int e = grp_start[g]; e < grp_start[g + 1]; ++e) {
+        const float s = nvfp4_row_dot_f32(wr, h + (size_t) e * L.n_ff, nb, lane, lut);
+        if (lane == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s * sd;
+    }
+}
+
 // ---------------------------------------------------------------- q8_1 (quantize.cu)
 __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, long long n) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
@@ -840,6 +912,28 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
     }
     check("native_expert_grouped/down");
+}
+
+void native_expert_grouped_f32(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                               const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
+                               int64_t cap_entries, const float* x, void* scratch, float* out, void* stream) {
+    if (cap_groups <= 0 || cap_entries <= 0) return;
+    if (L.gu_type != 40 || L.d_type != 40 || L.tail_off == 0) {
+        std::fprintf(stderr, "native_expert_grouped_f32: NVFP4 experts only (types %d/%d)\n", L.gu_type, L.d_type);
+        std::exit(1);
+    }
+    cudaStream_t s = (cudaStream_t) stream;
+    const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
+    float* gate = (float*) scratch;
+    float* up = (float*) ((uint8_t*) scratch + fa);
+    float* h = (float*) ((uint8_t*) scratch + 2 * fa);
+    const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) cap_groups);
+    nvfp4_gu_f32_kernel<<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, x, L, gate, up);
+    const long long nh = (long long) cap_entries * L.n_ff;
+    swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+    const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) cap_groups);
+    nvfp4_down_f32_kernel<<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, h, L, out);
+    check("native_expert_grouped_f32");
 }
 
 }  // namespace strata::kernels
