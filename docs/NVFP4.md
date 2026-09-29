@@ -78,3 +78,21 @@ instead of 25. `STRATA_VERIFY_ARENA=1` prints a checksum of the loaded arena; bo
 Decode A/B, 300 tokens, 262K context (median of 2): pipelined per-layer registration 103.5 tok/s, whole-arena
 registration 103.2; ggml-cpu's NVFP4 rows 105.3 (the pool is DRAM-bound, so the kernel above moves its time by
 2-3% and the decode rate not at all).
+
+## Tuning measured on this machine (after the fixes above)
+
+Kept:
+- **PCIe share 0.25** (was 0.55): the copy kernel fetching the PCIe share was 40% of GPU kernel time and sits on
+  the GPU's critical path. Decode 103 -> 117 tok/s short, 105 -> 124 at 32K.
+- **Prefill auto chunks up to 32768**: a 32K prompt reads at 5201 tok/s instead of 3535 (TTFT 10.1 -> 7.5 s).
+- **Large pages** once the account holds SeLockMemoryPrivilege (needs a fresh logon): the CPU pool holds
+  ~7.5 ms/round where 4 KB pages wandered 7.4-11; decode itself is GPU-bound, so the rate barely moves.
+
+Tried and dropped (no gain, or worse):
+- DMA copies for the PCIe share (`--pcie-mode dma`) at 0.25 and 0.40: ~32 rounds/s either way at 32K.
+- `--spec 5/6`, `--spec-min-p 0.3/0.7`: longer windows accept more but cost more; 0.3 is 15% slower.
+- More pool workers (23, 31) or other prefetch distances: the pool sits at ~55 GB/s from DDR5-5600.
+- An expert profile ranked by this model's own routing (6 prompts x 1000 tokens): it covered 69% of the
+  traced routing against 40% for the shipped profile, but missed MORE on held-out prompts (CPU experts per layer
+  5.3 vs 4.0 short, 10.8 vs 6.6 at 32K) - it fits the traces; the shipped profile generalises.
+- A q4_0 / q8_0 MTP head: tools/mtp_pack.py writes them, but the drafter only runs Q2_0 experts.
