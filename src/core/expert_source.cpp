@@ -724,6 +724,9 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     if (try_direct) {
         std::atomic<int> ready{0};
         std::thread reg([&] { a->register_slices(ready); });
+        // The readers wait for each slice's registration EVEN ON LARGE PAGES: reading while cudaHostRegister runs on
+        // the same slice corrupted the arena (measured 2026-09-30, WDDM, 2 MB pages: STRATA_VERIFY_ARENA gave a
+        // different wrong checksum on every run, 11.8 vs 10.2 GiB/s). The ~0.9 s it would save is not available.
         st = load_experts_direct(path, a->data(), loff, lbytes, /*threads=*/16, /*chunk=*/8u << 20, &ready);
         if (!st.ok) ready.store((int) n_layers);        // a refused read: let the registration thread finish
         reg.join();
