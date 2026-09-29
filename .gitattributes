@@ -5,3 +5,4 @@ bench/prompts/** -text
 *.sh text eol=lf
 *.bat text eol=crlf
 release/windows/*.cmd text eol=crlf
+release/*.cmd text eol=crlf

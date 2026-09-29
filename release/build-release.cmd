@@ -1,0 +1,18 @@
+@echo off
+rem Builds the portable release engine (STRATA_PORTABLE=ON, sm_120a) into build-release\.
+rem release/make_windows_bundle.py runs it before taking the engine, so a bundle never ships a stale exe.
+setlocal
+set "ROOT=%~dp0.."
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" (echo build-release: vswhere.exe not found - install the VS 2022 Build Tools & exit /b 1)
+"%VSWHERE%" -latest -products * -property installationPath > "%TEMP%\strata-vs-path.txt" || exit /b 1
+set /p VS=<"%TEMP%\strata-vs-path.txt"
+if not defined VS (echo build-release: no Visual Studio installation found & exit /b 1)
+call "%VS%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1 || exit /b 1
+if not exist "%ROOT%\build-release\CMakeCache.txt" (
+  cmake -G Ninja -S "%ROOT%" -B "%ROOT%\build-release" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON ^
+        -DSTRATA_BUILD_TESTS=OFF -DSTRATA_PORTABLE=ON -DCMAKE_CUDA_ARCHITECTURES=120a ^
+        "-DSTRATA_GGML_DIR=%ROOT%\third_party\llama.cpp" || exit /b 1
+)
+cmake --build "%ROOT%\build-release" --target strata -j 16 || exit /b 1
+exit /b 0

@@ -193,6 +193,17 @@ either way - CUDA pins it for the GPU's copies.
   for the expert cache or more memory bandwidth are what would move it; docs/NVFP4.md lists what was tried.
 - The model is an abliterated fine-tune: it does not refuse. What it is used for is on whoever runs it.
 
+## Releasing
+
+```bat
+python release\make_windows_bundle.py      :: clean tree only; builds build-release\ itself, zips, SHA-256
+git push origin HEAD:main
+python release\publish.py --title "Strata NVFP4 v... - what changed" --notes notes.md   :: --dry-run first
+```
+
+`publish.py` names this repository in every `gh` call (a clone's gh default can point at upstream) and refuses a
+zip whose `engine\BUILD.json` is not the pushed HEAD, this version and a clean tree.
+
 ## License
 
 MIT, as upstream ([LICENSE](LICENSE), copyright Niko1221 and the Strata contributors). llama.cpp / ggml code compiled
