@@ -98,6 +98,9 @@ ENGINE_REQUEST = re.compile(
     r"(?P<gen>\d+) generated in (?P<gen_ms>[\d.]+) ms \((?P<tg>[\d.]+) tok/s\)")
 
 
+_echo_started = False     # one tail of the engine log per process, whatever the engine restarts
+
+
 def echo_requests(log_path: str, offset: int) -> None:
     """STRATA_REQUEST_LINES=1: one stdout line per finished request, from the engine's own summary in its log.
 
@@ -191,7 +194,9 @@ class StrataEngine:
         if log:
             threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), args, loading),
                              daemon=True).start()
-            if os.environ.get("STRATA_REQUEST_LINES"):
+            global _echo_started
+            if os.environ.get("STRATA_REQUEST_LINES") and not _echo_started:   # once: restart() re-runs __init__
+                _echo_started = True
                 threading.Thread(target=echo_requests, args=(log, os.path.getsize(log)), daemon=True).start()
         self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)

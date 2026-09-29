@@ -69,7 +69,7 @@ public:
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
-    int64_t vocab() const { return n_vocab_; }
+    int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
     /// parameters would otherwise be baked forever - so this can change between requests freely.
