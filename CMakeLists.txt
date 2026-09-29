@@ -583,6 +583,9 @@ if(STRATA_NATIVE_EXPERTS)
     target_link_libraries(native_expert_parity PRIVATE strata_kernels strata_kernels_cpu strata_artifact CUDA::cudart)
     add_executable(nvfp4_expert_gpu_parity src/kernels/nvfp4_expert_gpu_parity.cpp)
     target_link_libraries(nvfp4_expert_gpu_parity PRIVATE strata_kernels ggml-base CUDA::cudart)
+    # the FP8 PLE table (tools/ple_fp8_pack.py) through PleTable vs the checkpoint's own values
+    add_executable(ple_fp8_parity src/kernels/ple_fp8_parity.cpp)
+    target_link_libraries(ple_fp8_parity PRIVATE strata_kernels CUDA::cudart)
   endif()
 endif()
 

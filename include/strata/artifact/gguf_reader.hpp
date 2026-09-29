@@ -89,6 +89,8 @@ inline const char* ggml_type_name(uint32_t t) {
         return "IQ2_S";
     case 23:
         return "IQ4_XS";
+    case 24:
+        return "I8";
     case 30:
         return "BF16";
     case 34:
@@ -196,6 +198,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 29:   // IQ1_M
         elems = 256;
         bytes = 56;
+        return true;
+    case 24:   // I8: raw bytes (the FP8 PLE table of tools/ple_fp8_pack.py)
+        elems = 1;
+        bytes = 1;
         return true;
     case 40:   // NVFP4: 64 values = 4 UE4M3 sub-block scales + 32 bytes of E2M1 codes
         elems = 64;
