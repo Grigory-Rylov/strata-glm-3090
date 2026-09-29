@@ -1,0 +1,18 @@
+{
+  "exe": "engine/strata.exe",
+  "args": [
+    "--pack", "models/pack",
+    "--native", "models/orca-nvfp4.gguf",
+    "--native-dense-gguf", "models/orca-nvfp4.gguf",
+    "--ple-gguf", "models/ple/IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+    "--expert-profile", "data/expert-profile.bin", "--expert-cache", "auto",
+    "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
+    "--mtp", "models/mtp/rt",
+    "--max-context", "262144", "--kv", "int8"
+  ],
+  "cwd": ".",
+  "tokenizer": "models/pack/tokenizer",
+  "model_name": "qwen3.8-flash-next-uncensored-nvfp4",
+  "log": "strata.log",
+  "host": "127.0.0.1"
+}
