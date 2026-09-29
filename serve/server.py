@@ -1381,6 +1381,8 @@ def make_handler(svc: Service):
                     self._openai(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
+                elif path == "/v1/messages/count_tokens":
+                    self._count_tokens(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:
@@ -1485,6 +1487,14 @@ def make_handler(svc: Service):
             except ValueError as e:                          # the engine's ERR after the stream started: the
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+
+        def _count_tokens(self, req):
+            """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
+            read for the same request, rendered and tokenized - the model does not run."""
+            req = svc.with_shared(req, "anthropic")
+            messages, tools, kw = anthropic_to_messages(req)
+            prompt = svc.template.render(messages, tools=tools, **kw)
+            self._json(200, {"input_tokens": len(svc.tok.encode(prompt, parse_special=True))})
 
         def _anthropic(self, req):
             req = svc.with_shared(req, "anthropic")
