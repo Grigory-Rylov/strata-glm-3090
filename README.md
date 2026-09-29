@@ -31,6 +31,16 @@ upstream's; the original README is kept as [README.upstream.md](README.upstream.
 Each change was measured - first-token KL against a reference, and interleaved speed A/B runs;
 [docs/NVFP4.md](docs/NVFP4.md) has the numbers, and everything that was tried and dropped.
 
+## Requirements
+
+- **GPU:** RTX 5090, 32 GB (sm_120). The engine fills it: dense weights and the 262K KV cache first, then ~19 GB of
+  cached experts (~7,500). A card with less VRAM caches fewer experts and decodes slower.
+- **RAM:** 96 GB minimum, measured with 128 GB. A run holds ~69 GiB of physical RAM - 63 GiB of it the pinned
+  expert arena - and ~98 GiB of commit charge (under WDDM the GPU's allocations count too), so keep the pagefile on.
+- **Disk:** ~200 GB for the model files: GGUF 74 GB, expert pack 70 GB, n-gram table 51 GB, embedding 1.3 GB,
+  MTP head 0.8 GB. ~340 GB while preparing them (the 135 GB checkpoint and the MTP intermediates can go afterwards).
+  Use the fastest NVMe drive you have: every start reads 63 GiB.
+
 ## Measured
 
 RTX 5090 (32 GB, PCIe 5 x16), Ryzen 9 9950X3D, 128 GB DDR5-5600, Samsung 9100 PRO, Windows 11, CUDA 13.3.

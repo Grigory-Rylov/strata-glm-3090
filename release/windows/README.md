@@ -9,10 +9,12 @@ Source, measurements and how it works: https://github.com/sergqwer/strata-nvfp4
   VRAM runs with a smaller expert cache and decodes slower. Other GPU generations are not supported by this build.
 - **Driver:** NVIDIA 580 or newer (CUDA 13). The CUDA runtime is inside `strata.exe` and cuBLAS is in `engine\`,
   so no CUDA toolkit is needed.
-- **RAM:** 96 GB or more (the experts take 63 GiB, pinned, while the model runs); measured with 128 GB.
+- **RAM:** 96 GB or more; measured with 128 GB. A run holds ~69 GiB of physical RAM (63 GiB of it the pinned
+  experts) and ~98 GiB of commit charge (Windows counts the GPU's allocations too): leave the pagefile on.
 - **CPU:** any x86-64 with AVX2; AVX-512 (Zen 4/5) is used automatically for the CPU share of the experts.
-- **Disk:** ~300 GB free while the model is prepared, ~170 GB afterwards. The start reads 63 GiB, so the fastest
-  NVMe drive you have is the right place for this folder (~8 s to start from PCIe 5, ~15 s from PCIe 4).
+- **Disk:** ~340 GB free while the model is prepared, ~200 GB afterwards (delete `models\checkpoint`, 135 GB, and
+  `models\mtp\tensors` once `prepare-model.cmd` is done). The start reads 63 GiB, so the fastest NVMe drive you
+  have is the right place for this folder (~8 s to start from PCIe 5, ~15 s from PCIe 4).
 - **Python 3.11 or newer** on PATH (the scripts make their own virtual environments here).
 
 ## Two steps
