@@ -77,7 +77,8 @@ public:
         return false;
 #endif
     }
-    void start(int job, uint64_t off, uint64_t bytes, uint8_t* dst) {
+    /// high: a read the current layer waits for (served before every low-priority prefetch piece)
+    void start(int job, uint64_t off, uint64_t bytes, uint8_t* dst, bool high = true) {
         const uint64_t a0 = off / 4096 * 4096, len = (off - a0 + bytes + 4095) / 4096 * 4096;
         const int parts = kParts * std::max(1, nd_ - 0) + (nd_ > 1 ? 2 : 0);   // one drive: 4; two: 10 (6 + 4)
         const uint64_t piece = (len / (uint64_t) parts + 4095) / 4096 * 4096;
@@ -91,13 +92,13 @@ public:
                 int d = 0;   // each piece to the drive whose queue (with it) drains first
                 for (int x = 1; x < nd_; ++x)
                     if ((queued_[x].load() + (double) pl) / gbps_[x] < (queued_[d].load() + (double) pl) / gbps_[d]) d = x;
-                q_[d].push_back({a0 + at, pl, dst + at, job});
+                (high ? q_[d] : lq_[d]).push_back({a0 + at, pl, dst + at, job});
                 queued_[d].fetch_add((long long) pl);
                 ++reads_[d];
             }
             left_[job].store(n, std::memory_order_release);
         }
-        cv_.notify_all();
+        for (int x = 0; x < nd_; ++x) cv_[x].notify_all();
     }
     bool wait(int job) {
         while (left_[job].load(std::memory_order_acquire) > 0) std::this_thread::yield();
@@ -108,7 +109,7 @@ public:
     int drives() const { return nd_; }
     void close() {
         { std::lock_guard<std::mutex> g(mu_); quit_ = true; }
-        cv_.notify_all();
+        for (auto& c : cv_) c.notify_all();
         for (auto& t : th_) t.join();
         th_.clear();
     }
@@ -118,21 +119,22 @@ private:
     void loop(int d) {
 #if defined(_WIN32)
         HANDLE h = CreateFileW(path_[d].c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, nullptr);
+        LARGE_INTEGER fs{};
+        if (h != INVALID_HANDLE_VALUE) GetFileSizeEx(h, &fs);
         for (;;) {
             Piece p{};
             {
                 std::unique_lock<std::mutex> g(mu_);
-                cv_.wait(g, [&] { return quit_ || !q_[d].empty(); });
-                if (quit_ && q_[d].empty()) break;
-                p = q_[d].front();
-                q_[d].pop_front();
+                cv_[d].wait(g, [&] { return quit_ || !q_[d].empty() || !lq_[d].empty(); });
+                if (quit_ && q_[d].empty() && lq_[d].empty()) break;
+                auto& q = !q_[d].empty() ? q_[d] : lq_[d];
+                p = q.front();
+                q.pop_front();
             }
             OVERLAPPED ov{};
             ov.Offset = (DWORD) p.off;
             ov.OffsetHigh = (DWORD) (p.off >> 32);
             DWORD got = 0;
-            LARGE_INTEGER fs{};
-            if (h != INVALID_HANDLE_VALUE) GetFileSizeEx(h, &fs);
             // the last blob's aligned window runs past the end of the file: only the bytes up to it must arrive
             const uint64_t need = std::min<uint64_t>(p.len, (uint64_t) fs.QuadPart > p.off ? (uint64_t) fs.QuadPart - p.off : 0);
             const bool ok = h != INVALID_HANDLE_VALUE && ReadFile(h, p.dst, p.len, &got, &ov) && got >= need && need > 0;
@@ -154,8 +156,8 @@ private:
     long long reads_[kDrives] = {};
     std::vector<std::thread> th_;
     std::mutex mu_;
-    std::condition_variable cv_;
-    std::deque<Piece> q_[kDrives];
+    std::condition_variable cv_[kDrives];
+    std::deque<Piece> q_[kDrives], lq_[kDrives];
     std::atomic<int> left_[kJobs], bad_[kJobs];
     bool quit_ = false;
 };
@@ -567,21 +569,23 @@ struct Engine {
     }
     // Prefetch reads into RAM (reader jobs kK..2kK-1) land in the background: a layer waits only for the ones it
     // routes to, and commits the others once they have arrived.
-    void prefetch_commit(const int32_t* sel, double& wait_s) {
+    void prefetch_land(int i, double* wait_s) {   // prefetch job i: wait for it, then it is a RAM member
+        const int32_t q = pf_pair[i];
+        const auto t = std::chrono::steady_clock::now();
+        if (!reader.wait(kK + i)) { std::fprintf(stderr, "strata-glm: a prefetch read failed\n"); std::exit(1); }
+        if (wait_s) *wait_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+        tier.demote_commit(q / kNE, q % kNE, (size_t) (strata::kernels::cpu::expert_layout().blob_offset(q / kNE, q % kNE) % 4096));
+        rlru.touch(q);
+        pf_pair[i] = -1;
+        --pf_n;
+    }
+    void prefetch_commit_landed(const int32_t* sel) {   // the ones nobody waits for, once they have arrived
         for (int i = 0; i < kK; ++i) {
             const int32_t q = pf_pair[i];
-            if (q < 0) continue;
+            if (q < 0 || !reader.done(kK + i)) continue;
             bool need = false;
-            for (int j = 0; sel && j < kK; ++j) need |= sel[j] == q;
-            if (!need && !reader.done(kK + i)) continue;
-            if (need) ++pf_used;
-            const auto t = std::chrono::steady_clock::now();
-            if (!reader.wait(kK + i)) { std::fprintf(stderr, "strata-glm: a prefetch read failed\n"); std::exit(1); }
-            wait_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
-            tier.demote_commit(q / kNE, q % kNE, (size_t) (strata::kernels::cpu::expert_layout().blob_offset(q / kNE, q % kNE) % 4096));
-            rlru.touch(q);
-            pf_pair[i] = -1;
-            --pf_n;
+            for (int j = 0; j < kK; ++j) need |= sel[j] == q;
+            if (!need) prefetch_land(i, nullptr);
         }
     }
     float *p_mix = nullptr, *p_x = nullptr, *p_xn = nullptr, *p_post = nullptr, *p_comb = nullptr, *p_log = nullptr, *p_wts = nullptr;
@@ -1388,7 +1392,11 @@ struct Engine {
             }
             pf_vn = 0;
             if (pf_pending) { CK(cudaStreamWaitEvent(s, ev_pf, 0)); pf_pending = false; }
-            prefetch_commit(pj, ts.pf_wait_s);
+            int pfj[kK];   // the prefetch job already reading j's expert, or -1: it lands like a critical read
+            for (int j = 0; j < kK; ++j) {
+                pfj[j] = -1;
+                for (int i = 0; i < kK; ++i) if (pf_pair[i] == pj[j]) pfj[j] = i;
+            }
             for (int j = 0; j < kK; ++j) {   // in VRAM already
                 const int32_t r = res[(size_t) pj[j]];
                 if (r < 0) continue;
@@ -1399,7 +1407,7 @@ struct Engine {
                 ++ts.vram;
             }
             for (int j = 0; j < kK; ++j) {   // on the disk: into the RAM slot of the least recent member outside VRAM
-                if (done[j] || tier.has_copy(m, hid[j])) continue;
+                if (done[j] || tier.has_copy(m, hid[j]) || pfj[j] >= 0) continue;
                 int32_t v = rlru.tail;
                 while (v >= 0 && (res[(size_t) v] >= 0 || in_sel(v))) v = rlru.prev[(size_t) v];
                 if (v < 0) continue;   // nothing to evict: staged below through the tier's own read
@@ -1410,7 +1418,41 @@ struct Engine {
                 reader.start(j, strata::kernels::cpu::expert_layout().blob_offset(m, hid[j]), XL.bytes, d);
                 dslot[j] = d;
             }
-            // the next layer's predicted experts on the disk: read into RAM now, behind this layer's own reads
+            // the CPU's share of the RAM hits, computed from the tier while the GPU copies its own
+            int ncpu = 0, cj[kK];
+            if (cpu_share > 0 && cpux.ready()) {
+                int nram = 0;
+                for (int j = 0; j < kK; ++j) if (!done[j] && dslot[j] == nullptr && pfj[j] < 0 && tier.has_copy(m, hid[j])) ++nram;
+                cpu_acc += cpu_share * nram;
+                const int want = (int) cpu_acc;
+                cpu_acc -= want;
+                const uint8_t* cb[kK];
+                float* co[kK];
+                for (int j = kK; j-- > 0 && ncpu < want;) {
+                    if (done[j] || dslot[j] != nullptr || pfj[j] >= 0 || !tier.has_copy(m, hid[j])) continue;
+                    cj[ncpu] = j;
+                    cb[ncpu] = tier.stable_blob(m, hid[j]);
+                    co[ncpu] = cpu_rows + (size_t) j * kEmbd;
+                    done[j] = true;
+                    rlru.touch(pj[j]);
+                    ++ts.cpu;
+                    ++ncpu;
+                }
+                if (ncpu > 0) cpux.start(x_host, cb, co, ncpu);
+            }
+            for (int j = 0; j < kK; ++j) {   // in RAM: copied into a VRAM slot (it was going to the GPU anyway)
+                if (done[j] || dslot[j] != nullptr || pfj[j] >= 0) continue;
+                const uint8_t* b = tier.has_copy(m, hid[j]) ? tier.stable_blob(m, hid[j]) : tier.blob(m, hid[j]);
+                if (b == nullptr) { std::fprintf(stderr, "strata-glm: no bytes for expert %d of layer %d\n", hid[j], l); std::exit(1); }
+                const bool in_ram = tier.has_copy(m, hid[j]);
+                const int32_t sl = vram_slot(pj[j]);
+                CK(cudaMemcpyAsync(vslot[(size_t) sl], b, XL.bytes, cudaMemcpyHostToDevice, s));
+                if (!in_ram) CK(cudaStreamSynchronize(s));   // a mapped-file page, not ours to keep
+                gp[j] = (unsigned long long) vslot[(size_t) sl];
+                if (in_ram) { rlru.touch(pj[j]); ++ts.ram; } else ++ts.file;
+            }
+            prefetch_commit_landed(pj);
+            // the next layer's predicted experts on the disk (low priority), after this layer's work is queued
             if (pf) {
                 CK(cudaEventSynchronize(ev_pred));
                 const int mn = m + 1;
@@ -1429,45 +1471,21 @@ struct Engine {
                     if (d == nullptr) continue;
                     int job = 0;
                     while (pf_pair[job] >= 0) ++job;
-                    reader.start(kK + job, strata::kernels::cpu::expert_layout().blob_offset(mn, pf_ids[i]), XL.bytes, d);
+                    reader.start(kK + job, strata::kernels::cpu::expert_layout().blob_offset(mn, pf_ids[i]), XL.bytes, d, false);
                     pf_pair[job] = q;
                     pf_dst[job] = d;
                     ++pf_n;
                     ++pf_reads;
                 }
             }
-            // the CPU's share of the RAM hits, computed from the tier while the GPU copies its own
-            int ncpu = 0, cj[kK];
-            if (cpu_share > 0 && cpux.ready()) {
-                int nram = 0;
-                for (int j = 0; j < kK; ++j) if (!done[j] && dslot[j] == nullptr && tier.has_copy(m, hid[j])) ++nram;
-                cpu_acc += cpu_share * nram;
-                const int want = (int) cpu_acc;
-                cpu_acc -= want;
-                const uint8_t* cb[kK];
-                float* co[kK];
-                for (int j = kK; j-- > 0 && ncpu < want;) {
-                    if (done[j] || dslot[j] != nullptr || !tier.has_copy(m, hid[j])) continue;
-                    cj[ncpu] = j;
-                    cb[ncpu] = tier.stable_blob(m, hid[j]);
-                    co[ncpu] = cpu_rows + (size_t) j * kEmbd;
-                    done[j] = true;
-                    rlru.touch(pj[j]);
-                    ++ts.cpu;
-                    ++ncpu;
-                }
-                if (ncpu > 0) cpux.start(x_host, cb, co, ncpu);
-            }
-            for (int j = 0; j < kK; ++j) {   // in RAM: copied into a VRAM slot (it was going to the GPU anyway)
-                if (done[j] || dslot[j] != nullptr) continue;
-                const uint8_t* b = tier.has_copy(m, hid[j]) ? tier.stable_blob(m, hid[j]) : tier.blob(m, hid[j]);
-                if (b == nullptr) { std::fprintf(stderr, "strata-glm: no bytes for expert %d of layer %d\n", hid[j], l); std::exit(1); }
-                const bool in_ram = tier.has_copy(m, hid[j]);
+            for (int j = 0; j < kK; ++j) {   // this layer's experts a prefetch was already reading
+                if (pfj[j] < 0) continue;
+                ++pf_used;
+                prefetch_land(pfj[j], &ts.pf_wait_s);
                 const int32_t sl = vram_slot(pj[j]);
-                CK(cudaMemcpyAsync(vslot[(size_t) sl], b, XL.bytes, cudaMemcpyHostToDevice, s));
-                if (!in_ram) CK(cudaStreamSynchronize(s));   // a mapped-file page, not ours to keep
+                CK(cudaMemcpyAsync(vslot[(size_t) sl], tier.stable_blob(m, hid[j]), XL.bytes, cudaMemcpyHostToDevice, s));
                 gp[j] = (unsigned long long) vslot[(size_t) sl];
-                if (in_ram) { rlru.touch(pj[j]); ++ts.ram; } else ++ts.file;
+                ++ts.file;
             }
             for (int j = 0; j < kK; ++j) {   // the disk reads, as they land
                 if (dslot[j] == nullptr) continue;
