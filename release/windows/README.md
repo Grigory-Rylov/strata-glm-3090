@@ -1,6 +1,7 @@
 # Strata NVFP4 — ready-made engine for Windows
 
-Qwen3.8-Flash-Next (125B hybrid MoE), OrcaRouter's abliteration in ModelOpt NVFP4, on one GeForce RTX 50-series card.
+Qwen3.8-Flash-Next (125B hybrid MoE), OrcaRouter's abliteration in ModelOpt NVFP4, on one GeForce RTX 20, 30, 40 or 50
+card with 12 GB of VRAM or more - text and pictures.
 Source, measurements and how it works: https://github.com/sergqwer/strata-nvfp4
 
 ## What you need
@@ -54,7 +55,7 @@ First start after a reboot is slower while Windows reads the files; later starts
 
 | | |
 | --- | ---: |
-| Writes answers, short chat | ~115 tokens/s (Ukrainian or Russian too: ~110) |
+| Writes answers, short chat | ~115 tokens/s (in Cyrillic too: ~110) |
 | Writes answers, 32K context | ~120 tokens/s |
 | Reads a 32K prompt | ~5,500 tokens/s |
 

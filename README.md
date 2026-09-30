@@ -1,6 +1,7 @@
 # Strata NVFP4
 
-**Qwen3.8-Flash-Next (125B hybrid MoE) in NVFP4 on one RTX 5090 + 128 GB of RAM.** A fork of
+**Qwen3.8-Flash-Next (125B hybrid MoE) in NVFP4 on one RTX 20, 30, 40 or 50 card (12 GB of VRAM or more; built
+and measured on an RTX 5090) + 96-128 GB of RAM, text and pictures.** A fork of
 [Niko1221/Strata](https://github.com/Niko1221/Strata) that runs a ModelOpt **NVFP4** checkpoint — here
 [OrcaRouter's abliterated Flash-Next](https://huggingface.co/jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4) —
 instead of the Q2/Q3 quants Strata ships for. NVFP4 keeps the experts at 4.5 bits with calibrated scales, which is
@@ -26,7 +27,7 @@ upstream's; the original README is kept as [README.upstream.md](README.upstream.
 - **Tuned for NVFP4's larger experts** (PCIe share, prompt chunks up to 32K, fused scale passes, a verify commit
   that overlaps the draft) and the fine-tune's own abliterated MTP draft head.
 - **A draft vocabulary with Cyrillic:** the MTP draft head proposes only tokens of its subset, and upstream's held
-  142 of the vocabulary's 18,580 Cyrillic tokens - a Ukrainian answer decoded at 83 tokens/s with 1.4 tokens a round;
+  142 of the vocabulary's 18,580 Cyrillic tokens - an answer in Cyrillic decoded at 83 tokens/s with 1.4 tokens a round;
   with the whole Cyrillic script (`tools/draft_vocab.py --add cyrillic`), 109 and 2.1. English is unchanged.
   Upstream's CJK subset is one `--add cjk` away (`data/draft_vocab_en.bin` is the English/code one).
 - **Every RTX 20, 30, 40 and 50 card with 12 GB or more:** the NVFP4 path needed Blackwell only for the optional
@@ -80,7 +81,7 @@ RTX 5090 (32 GB, PCIe 5 x16), Ryzen 9 9950X3D, 128 GB DDR5-5600, Samsung 9100 PR
 
 | | |
 | --- | ---: |
-| Writes answers, short chat | ~115 tokens/s (Ukrainian or Russian too: ~110) |
+| Writes answers, short chat | ~115 tokens/s (in Cyrillic too: ~110) |
 | Writes answers, 32K context | ~120 tokens/s |
 | Reads a 32K prompt | ~5,500 tokens/s |
 | Start to the first token | ~8 s (63 GiB of experts read at ~10 GiB/s) |
