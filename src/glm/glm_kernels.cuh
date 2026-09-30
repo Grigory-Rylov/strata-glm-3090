@@ -131,6 +131,11 @@ void idx_pool_rows(const float* key, const float* gate, const bf16* ape, float* 
 /// invisible ones get -FLT_MAX
 void idx_scores_rows(const float* q, const float* w, const float* pooled, float* score, int n_pool, int H, int dim,
                      int pos0, int kpool, int T, cudaStream_t s);
+/// For queries at positions pos0..pos0+T-1 with scores [T][ld] over complete pools: sel [T][sel_ld] = every
+/// visible token while a query sees <= budget pools, else the budget top-scoring pools' tokens (by pool index)
+/// and its incomplete tail; cnt[t] = how many. On the GPU (glm_select.cu): no host round trip.
+void idx_select_rows(const float* score, int ld, int pos0, int kpool, int budget, int32_t* sel, int sel_ld, int32_t* cnt,
+                     int T, cudaStream_t s);
 /// route_topk for T tokens: logits [T][n], ids / wts [T][k]
 void route_rows(const float* logits, const float* bias, int n_expert, int k, float scaling, int32_t* ids, float* wts,
                 int T, cudaStream_t s);

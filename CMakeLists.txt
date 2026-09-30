@@ -322,7 +322,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
   # GLM-5.3-Flash NVFP4 (src/glm): its own layers over Strata's expert machinery
-  add_executable(strata-glm src/glm/glm_main.cpp src/glm/glm_kernels.cu src/glm/glm_kernels_rows.cu src/glm/glm_gemm.cu src/glm/glm_dense.cu)
+  add_executable(strata-glm src/glm/glm_main.cpp src/glm/glm_kernels.cu src/glm/glm_kernels_rows.cu src/glm/glm_gemm.cu src/glm/glm_dense.cu src/glm/glm_select.cu)
   target_link_libraries(strata-glm PRIVATE strata_engine ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
 
   if(STRATA_ENABLE_HIP)

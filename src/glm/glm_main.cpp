@@ -409,7 +409,7 @@ struct Engine {
     // buffers
     float *streams, *mix, *x, *xn, *post, *comb, *y, *tmp1, *tmp2, *tmp3, *q, *k, *v, *gf, *b, *o, *gate;
     float *q_resid, *qm, *qa, *ctx, *vo, *iq, *ik, *ig, *iw, *score, *logits, *rows, *wts;
-    int32_t *ids, *sel;
+    int32_t *ids, *sel, *sel_cnt;
     glm::bf16* emb_row;
     // experts
     std::FILE* experts = nullptr;
@@ -827,34 +827,8 @@ struct Engine {
             // some query sees more complete pools than the budget: the top ones by the indexer's score, then its tail
             gm.wmat(ly.iwp, c_xn, c_iw, kIdxH, kEmbd, T);
             idx_scores_rows(c_iq, c_iw, ly.pooled, c_score, pool_hi, kIdxH, kIdxD, pos0, kKpool, T, s);
-            std::vector<float> hs((size_t) T * pool_hi);
-            CK(cudaMemcpyAsync(hs.data(), c_score, hs.size() * sizeof(float), cudaMemcpyDeviceToHost, s));
-            CK(cudaStreamSynchronize(s));
-            std::vector<int32_t> hsel((size_t) T * kSelLd), hcnt((size_t) T);
-            std::vector<int> order;
-            max_sel = 0;
-            for (int t = 0; t < T; ++t) {
-                const int pos = pos0 + t, vp = (pos + 1) / kKpool;
-                int32_t* row = hsel.data() + (size_t) t * kSelLd;
-                int n = 0;
-                if (vp <= budget) {
-                    for (int q = 0; q < vp * kKpool; ++q) row[n++] = q;
-                } else {
-                    order.resize((size_t) vp);
-                    for (int i = 0; i < vp; ++i) order[(size_t) i] = i;
-                    const float* sc = hs.data() + (size_t) t * pool_hi;
-                    std::partial_sort(order.begin(), order.begin() + budget, order.end(),
-                                      [&](int a, int c) { return sc[a] > sc[c]; });
-                    for (int i = 0; i < budget; ++i)
-                        for (int j = 0; j < kKpool; ++j) row[n++] = order[(size_t) i] * kKpool + j;
-                }
-                for (int q = vp * kKpool; q <= pos; ++q) row[n++] = q;   // the incomplete tail
-                hcnt[(size_t) t] = n;
-                max_sel = std::max(max_sel, n);
-            }
-            CK(cudaMemcpyAsync(c_sel, hsel.data(), hsel.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s));
-            CK(cudaMemcpyAsync(c_cnt, hcnt.data(), hcnt.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s));
-            CK(cudaStreamSynchronize(s));
+            idx_select_rows(c_score, pool_hi, pos0, kKpool, budget, c_sel, kSelLd, c_cnt, T, s);
+            max_sel = kSelLd;
             sel = c_sel;
         }
         const long long ws = (long long) (kDk + kDv) * kR;
@@ -1077,7 +1051,8 @@ struct Engine {
         CK(cudaMalloc(&ids, kK * sizeof(int32_t)));
         CK(cudaMallocHost(&hid_pin, kK * sizeof(int32_t)));
         CK(cudaEventCreateWithFlags(&ev_ids, cudaEventDisableTiming));
-        CK(cudaMalloc(&sel, (size_t) (kIdxTopk + kKpool) * sizeof(int32_t) + (size_t) max_ctx * sizeof(int32_t)));
+        CK(cudaMalloc(&sel, (size_t) kSelLd * sizeof(int32_t)));
+        CK(cudaMalloc(&sel_cnt, sizeof(int32_t)));
         CK(cudaMalloc(&emb_row, kEmbd * sizeof(glm::bf16)));
 
         // the routed experts: kK device slots, fed from experts.bin
@@ -1149,31 +1124,20 @@ struct Engine {
             idx_pool(ly.ikc + (size_t) p0 * kIdxD, ly.igc + (size_t) p0 * kIdxD, ly.iape, ly.pooled + (size_t) (pos / kKpool) * kIdxD,
                      kKpool, kIdxD, s);
         }
-        // the selection: complete pools (all visible) up to the budget, then this query's incomplete tail
+        // the selection (on the GPU): every visible token up to the budget of pools, then the top-scoring pools and
+        // this query's incomplete tail
         const int n_pool = (pos + 1) / kKpool;
-        std::vector<int32_t> hsel;
-        if (n_pool <= kIdxTopk / kKpool) {
-            for (int t = 0; t <= pos; ++t) hsel.push_back(t);
-        } else {
+        const int32_t* use = nullptr;
+        if (n_pool > kIdxTopk / kKpool) {
             gemv(ly.iwp, xn, iw, kIdxH, kEmbd, 1, s);
             idx_scores(iq, iw, ly.pooled, score, n_pool, kIdxH, kIdxD, s);
-            std::vector<float> hs((size_t) n_pool);
-            CK(cudaMemcpyAsync(hs.data(), score, hs.size() * sizeof(float), cudaMemcpyDeviceToHost, s));
-            CK(cudaStreamSynchronize(s));
-            std::vector<int> order((size_t) n_pool);
-            for (int i = 0; i < n_pool; ++i) order[(size_t) i] = i;
-            std::partial_sort(order.begin(), order.begin() + kIdxTopk / kKpool, order.end(),
-                              [&](int a, int c) { return hs[(size_t) a] > hs[(size_t) c]; });
-            for (int i = 0; i < kIdxTopk / kKpool; ++i)
-                for (int j = 0; j < kKpool; ++j) hsel.push_back(order[(size_t) i] * kKpool + j);
-            for (int t = n_pool * kKpool; t <= pos; ++t) hsel.push_back(t);
+            idx_select_rows(score, n_pool, pos, kKpool, kIdxTopk / kKpool, sel, kSelLd, sel_cnt, 1, s);
+            use = sel;
         }
-        CK(cudaMemcpyAsync(sel, hsel.data(), hsel.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s));
         mla_absorb_q(qm, ly.kvb, qa, kMlaH, kDk, kDv, kR, s);
-        mla_attend(qa, ly.lat, sel, (int) hsel.size(), 1.0f / std::sqrt((float) kDk), ctx, kMlaH, kR, s);
+        mla_attend_rows(qa, ly.lat, use, sel_cnt, kSelLd, pos, kSelLd, 1.0f / std::sqrt((float) kDk), ctx, kMlaH, kR, 1, s);
         mla_value(ctx, ly.kvb, vo, kMlaH, kDk, kDv, kR, s);
         gemv(ly.wo, vo, y, kEmbd, kMlaH * kDv, 1, s);
-        CK(cudaStreamSynchronize(s));   // hsel lives on this stack frame
     }
 
     void moe(Layer& ly, int l) {
