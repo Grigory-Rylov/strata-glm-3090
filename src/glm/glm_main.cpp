@@ -413,6 +413,8 @@ struct Engine {
     float *streams, *mix, *x, *xn, *post, *comb, *y, *tmp1, *tmp2, *tmp3, *q, *k, *v, *gf, *b, *o, *gate;
     float *q_resid, *qm, *qa, *ctx, *vo, *iq, *ik, *ig, *iw, *score, *logits, *rows, *wts;
     int32_t *ids, *sel, *sel_cnt;
+    static constexpr int kMlaSplit = 16;
+    float* mla_part = nullptr;                                      // decode MLA: the key splits' partial results
     glm::bf16* emb_row;
     // experts
     std::FILE* experts = nullptr;
@@ -938,8 +940,12 @@ struct Engine {
         }
         const long long ws = (long long) (kDk + kDv) * kR;
         gm.heads16(ly.kvb, ws, false, c_qm, kMlaH * kDk, c_qa, kMlaH * kR, kR, kDk, T, kMlaH);
-        mla_attend_rows(c_qa, ly.lat, sel, c_cnt, kSelLd, pos0, max_sel, 1.0f / std::sqrt((float) kDk), c_ctx, kMlaH, kR,
-                        T, s);
+        static const bool old_mla = std::getenv("GLM_MLA_OLD") != nullptr;
+        if (old_mla)
+            mla_attend_rows(c_qa, ly.lat, sel, c_cnt, kSelLd, pos0, max_sel, 1.0f / std::sqrt((float) kDk), c_ctx, kMlaH, kR,
+                            T, s);
+        else
+            mla_attend_tc(c_qa, ly.lat, sel, c_cnt, kSelLd, pos0, 1.0f / std::sqrt((float) kDk), c_ctx, T, 1, nullptr, s);
         gm.heads16(ly.kvb + (size_t) kDk * kR, ws, true, c_ctx, kMlaH * kR, c_vo, kMlaH * kDv, kDv, kR, T, kMlaH);
         gm.wmat(ly.wo, c_vo, c_y, kEmbd, kMlaH * kDv, T);
     }
@@ -1293,6 +1299,7 @@ struct Engine {
         CK(cudaEventCreateWithFlags(&ev_ids, cudaEventDisableTiming));
         CK(cudaMalloc(&sel, (size_t) kSelLd * sizeof(int32_t)));
         CK(cudaMalloc(&sel_cnt, sizeof(int32_t)));
+        CK(cudaMalloc(&mla_part, glm::mla_tc_part_floats(1, kMlaSplit) * sizeof(float)));
         CK(cudaMalloc(&emb_row, kEmbd * sizeof(glm::bf16)));
 
         // the routed experts: kK device slots, fed from experts.bin
@@ -1375,7 +1382,14 @@ struct Engine {
             use = sel;
         }
         mla_absorb_q(qm, ly.kvb, qa, kMlaH, kDk, kDv, kR, s);
-        mla_attend_rows(qa, ly.lat, use, sel_cnt, kSelLd, pos, kSelLd, 1.0f / std::sqrt((float) kDk), ctx, kMlaH, kR, 1, s);
+        static const bool old_mla = std::getenv("GLM_MLA_OLD") != nullptr;
+        if (old_mla) {
+            mla_attend_rows(qa, ly.lat, use, sel_cnt, kSelLd, pos, kSelLd, 1.0f / std::sqrt((float) kDk), ctx, kMlaH, kR, 1, s);
+        } else {   // the keys split over blocks: 64 keys a split at least, 16 splits at most
+            const int nk = std::min(pos + 1, kSelLd);
+            const int nsplit = std::max(1, std::min(kMlaSplit, (nk + 127) / 128));
+            mla_attend_tc(qa, ly.lat, use, sel_cnt, kSelLd, pos, 1.0f / std::sqrt((float) kDk), ctx, 1, nsplit, mla_part, s);
+        }
         mla_value(ctx, ly.kvb, vo, kMlaH, kDk, kDv, kR, s);
         gemv(ly.wo, vo, y, kEmbd, kMlaH * kDv, 1, s);
     }

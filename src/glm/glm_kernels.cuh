@@ -145,6 +145,12 @@ void swiglu_rows(const float* gu, float* h, const int32_t* rb, int n, const floa
                  float lim, cudaStream_t s);
 /// wts[dst[r]] *= s_down of row r's expert (the combine then applies it)
 void scale_entry_wts(float* wts, const int32_t* dst, const int32_t* rb, int n, const float* tails, int nr, cudaStream_t s);
+/// MLA attention on tensor cores (glm_mla.cu), 64 heads x 512: ctx[t][h] over query t's keys (sel / cnt, or every
+/// position <= pos0 + t when sel is null). nsplit > 1 (decode) splits the keys over blocks and needs `part`
+/// (mla_tc_part_floats(T, nsplit) floats).
+void mla_attend_tc(const float* qa, const float* lat, const int32_t* sel, const int32_t* cnt, int sel_ld, int pos0,
+                   float scale, float* ctx, int T, int nsplit, float* part, cudaStream_t s);
+size_t mla_tc_part_floats(int T, int nsplit);
 /// route_topk for T tokens: logits [T][n], ids / wts [T][k]
 void route_rows(const float* logits, const float* bias, int n_expert, int k, float scaling, int32_t* ids, float* wts,
                 int T, cudaStream_t s);
