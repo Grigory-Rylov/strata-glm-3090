@@ -1352,7 +1352,7 @@ int main(int argc, char** argv) {
     int max_new = 16, max_ctx = 8192, chunk = 0;
     std::string routes_path, profile;
     long long vram_experts = -1;
-    double ram_gib = -1, ram_reserve_gib = 12, vram_reserve_mib = 1500;
+    double ram_gib = -1, ram_reserve_gib = 24, vram_reserve_mib = 1500;   // leave RAM for Windows and the desktop
     int rebalance_every = -1;   // -1: 16 with --policy rebalance, none with lru
     std::string policy = "lru";
     std::vector<std::string> mirrors;
@@ -1456,6 +1456,10 @@ int main(int argc, char** argv) {
         e.timing_token(std::chrono::duration<double>(std::chrono::steady_clock::now() - tf).count());
         ++steps;
         if (e.tiered && rebalance_every > 0 && steps % rebalance_every == 0) e.rebalance(rebalance_vram, rebalance_ram, false);
+        if (steps % 32 == 0) {   // the machine is also a desktop: say so when RAM runs low
+            const double avail = strata::core::available_ram_bytes() / 1073741824.0;
+            if (avail > 0 && avail < 8) std::fprintf(stderr, "strata-glm: only %.1f GiB of RAM left for Windows\n", avail);
+        }
         CK(cudaMemcpy(lg.data(), e.logits, lg.size() * sizeof(float), cudaMemcpyDeviceToHost));
     }
     const double td = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
