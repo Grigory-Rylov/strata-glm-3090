@@ -26,12 +26,15 @@ Source, measurements and how it works: https://github.com/sergqwer/strata-nvfp4
 1. **`prepare-model.cmd`** — downloads
    [jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4](https://huggingface.co/jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4)
    (126 GB) and converts it into `models\`, the n-gram (PLE) table kept in FP8 and the token embedding in BF16
-   exactly as Qwen ships them. It takes a while; if it stops, run it again and it resumes. Coming from an older
-   release: run it again too - it adds only `models\token-embd-bf16.gguf` (1.3 GB; the checkpoint must still be in
-   `models\checkpoint`).
+   exactly as Qwen ships them, and the image encoder from the checkpoint's own vision tower. It takes a while; if
+   it stops, run it again and it resumes. Coming from an older release: run it again too - it adds only what is
+   missing (`models\mmproj-f32.gguf`, 1.8 GB, and `models\token-embd-bf16.gguf`, 1.3 GB; the checkpoint must still
+   be in `models\checkpoint`).
 2. **`start-server.cmd`** — loads the model and serves it on **http://127.0.0.1:8080**:
    - a chat page at `http://127.0.0.1:8080/`
    - OpenAI API at `/v1/chat/completions`, Anthropic API at `/v1/messages` (Claude Code can point at it)
+   - pictures too: attach them in the chat page, send `image_url` parts or Anthropic image blocks. The image encoder
+     runs on the CPU (2-6 s a picture), so the graphics card keeps all its memory for the model
 
 First start after a reboot is slower while Windows reads the files; later starts take ~8-15 s.
 
@@ -83,7 +86,7 @@ per tool turn (~0.5 s).
 
 | | |
 | --- | --- |
-| `engine\` | `strata.exe`, NVIDIA cuBLAS (`cublas64_13.dll`, `cublasLt64_13.dll`), `BUILD.json` |
+| `engine\` | `strata.exe`, `strata-vision.exe` (the image encoder), NVIDIA cuBLAS (`cublas64_13.dll`, `cublasLt64_13.dll`), `BUILD.json` |
 | `serve\` | the server and its chat page |
 | `tools\`, `third_party\llama.cpp\` | the converters `prepare-model.cmd` runs (llama.cpp's at its pinned commit) |
 | `data\` | the expert-cache profile and the draft vocabulary |

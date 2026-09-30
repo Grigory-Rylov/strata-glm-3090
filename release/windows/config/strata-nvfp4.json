@@ -9,8 +9,10 @@
     "--expert-profile", "data/expert-profile.bin", "--expert-cache", "auto",
     "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
     "--mtp", "models/mtp/rt",
-    "--max-context", "262144", "--kv", "int8"
+    "--max-context", "262144", "--kv", "int8", "--vision"
   ],
+  "vision": {"exe": "engine/strata-vision.exe", "mmproj": "models/mmproj-f32.gguf", "model": "models/orca-nvfp4.gguf",
+             "gpu": false, "max_tokens": 1024},
   "cwd": ".",
   "tokenizer": "models/pack/tokenizer",
   "model_name": "qwen3.8-flash-next-uncensored-nvfp4",

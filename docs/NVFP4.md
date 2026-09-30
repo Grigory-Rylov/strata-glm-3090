@@ -168,6 +168,43 @@ Tried and dropped (no gain, or worse):
   5.3 vs 4.0 short, 10.8 vs 6.6 at 32K) - it fits the traces; the shipped profile generalises.
 - A q4_0 / q8_0 MTP head: tools/mtp_pack.py writes them, but the drafter only runs Q2_0 experts.
 
+### Images (2026-09-30)
+
+Upstream's vision path (`--vision`, the `strata-vision` helper on llama.cpp's mtmd, M-RoPE positions for image
+cells) was in the code already; it only needs an image encoder. The checkpoint ships its vision tower in BF16
+(`model.visual.*`, 333 tensors, excluded from quantization), and llama.cpp's converter at the pinned commit turns
+it into an mmproj (`Qwen4ExpVisionModel`). Two pictures (an 800x450 invoice with text and two coloured
+rectangles: 350 image tokens; a 3840x2400 photo: 1,000), each encoder variant against a reference (CPU, FP32 weights,
+attention without flash attention):
+
+| encoder | invoice | photo (worst row's cosine) | time |
+| --- | ---: | ---: | ---: |
+| **CPU, FP32 weights, FA** (now) | **0.09%** | **0.11%** (0.9999) | 1.8 s / 6.2 s |
+| CPU, BF16 weights | 1.7-2.3% | 2.4-2.5% (0.989) | 1.8-10 s |
+| GPU, BF16, FA (upstream's default) | 1.9% | **11.2%** (0.67) | 0.05 s / 0.18 s |
+| GPU, BF16, no FA | 2.1% | 3.1% (0.984) | 0.06 s / 0.21 s |
+| GPU, FP32, no FA | 0.45% | 2.1% (0.971) | 0.06 s / 0.22 s |
+| CPU, FP32, a native (AVX-512) ggml build under MSVC | 4.4% | 20.8% | 3.4 s / 21.6 s |
+
+ggml-cuda's flash attention (K and V in FP16) is what loses the photo's rows; the portable (AVX2) CPU build is exact
+to 0.1% and as fast as any other CPU variant. The native MSVC build of ggml-cpu is both wrong and slower - not used.
+
+What each costs the text, decode A/B (300 greedy tokens, 262K context, 3-4 interleaved runs each, medians):
+
+| | expert slots | decode tok/s |
+| --- | ---: | ---: |
+| text only | 7,352 | 114.9 |
+| `--vision` (the M-RoPE table), no encoder | 7,377 | 113.4 |
+| `--vision` + the CPU encoder resident in RAM | 7,363 | 115.2 |
+| `--vision` + upstream's GPU encoder (served, 3 answers each) | 6,684-6,805 | ~95-107 (text: ~120) |
+
+The CPU encoder costs nothing: the engine is idle while a picture is encoded. Two changes to `strata-vision` make it
+so: on the CPU it hides the GPU from itself (a CUDA build opened a context there, 0.4-0.7 GB, 150-260 slots), and
+it skips the warm-up at 1,024 tokens (that only reserves GPU buffers; on the CPU it delayed the engine's start by
+~6 s). The release builds it CPU-only (`release/build-vision.cmd`, 4.9 MB). Answers checked: the invoice's text
+exactly, the left rectangle blue and the right red (the image cells' 2-D positions are right), the photo described
+correctly, in English and Ukrainian, through the OpenAI and the Anthropic API.
+
 ### Upstream 0.1.28 merged (2026-09-30)
 
 Upstream's 0.1.25-0.1.28 came in with a merge: the draft layer's prompt pass in batches (E-9), the hyper-connection

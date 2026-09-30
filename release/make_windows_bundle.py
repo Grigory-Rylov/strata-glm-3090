@@ -5,7 +5,8 @@
 1. Refuses a working tree with uncommitted changes (BUILD.json names the commit the engine was built from;
    --allow-dirty for a local try, marked "dirty" there and refused by release/publish.py).
 2. Builds the portable engine itself (release/build-release.cmd: STRATA_PORTABLE=ON, sm_120a, build-release/) and
-   checks with a ninja dry run that the engine is current - a bundle once shipped the previous release's engine.
+   the image encoder (release/build-vision.cmd: CPU only, build-vision-cpu/), and checks with ninja dry runs that
+   both are current - a bundle once shipped the previous release's engine.
 3. Assembles dist/strata-nvfp4: that engine, cuBLAS from %CUDA_PATH%, the part of llama.cpp the converter imports,
    and the bundle's own files (README, scripts, config) from release/windows/.
 4. Zips it to dist/strata-nvfp4-v<VERSION>-windows-x64.zip and writes its SHA-256 beside it.
@@ -28,6 +29,7 @@ LLAMA = REPO / "third_party" / "llama.cpp"
 VERSION = "0.1.28-nvfp4.1"
 ZIP = REPO / "dist" / ("strata-nvfp4-v%s-windows-x64.zip" % VERSION)
 ENGINE = REPO / "build-release" / "strata.exe"
+VISION = REPO / "build-vision-cpu" / "bin" / "strata-vision.exe"
 allow_dirty = "--allow-dirty" in sys.argv[1:]
 
 
@@ -41,14 +43,16 @@ if dirty and not allow_dirty:
     sys.exit("make_windows_bundle: the working tree has uncommitted changes - commit them first "
              "(or --allow-dirty for a local try):\n" + dirty)
 
-# 2. the engine built from this tree, now
-print("building the portable engine (release/build-release.cmd) ...", flush=True)
-if subprocess.run(["cmd", "/c", str(REPO / "release" / "build-release.cmd")]).returncode != 0:
-    sys.exit("make_windows_bundle: the release build failed")
-# ninja itself says whether the target is current (a dry run after the build must have nothing to do)
-dry = subprocess.run(["ninja", "-C", str(REPO / "build-release"), "-n", "strata"], capture_output=True, text=True)
-if not ENGINE.exists() or dry.returncode != 0 or "no work to do" not in dry.stdout:
-    sys.exit("make_windows_bundle: build-release/strata.exe is not current after the build:\n" + dry.stdout[-2000:])
+# 2. the engine and the image encoder built from this tree, now
+for script, build, target, exe in (("build-release.cmd", "build-release", "strata", ENGINE),
+                                   ("build-vision.cmd", "build-vision-cpu", "strata-vision", VISION)):
+    print("building %s (release/%s) ..." % (target, script), flush=True)
+    if subprocess.run(["cmd", "/c", str(REPO / "release" / script)]).returncode != 0:
+        sys.exit("make_windows_bundle: release/%s failed" % script)
+    # ninja itself says whether the target is current (a dry run after the build must have nothing to do)
+    dry = subprocess.run(["ninja", "-C", str(REPO / build), "-n", target], capture_output=True, text=True)
+    if not exe.exists() or dry.returncode != 0 or "no work to do" not in dry.stdout:
+        sys.exit("make_windows_bundle: %s is not current after the build:\n%s" % (exe, dry.stdout[-2000:]))
 
 if OUT.exists():
     shutil.rmtree(OUT)
@@ -61,13 +65,14 @@ def cp(src, dst):
     shutil.copy2(src, dst)
 
 
-# engine: the portable build and the cuBLAS it links (the CUDA runtime is static)
+# engine: the portable build and the cuBLAS it links (the CUDA runtime is static), and the image encoder
 cp(ENGINE, OUT / "engine" / "strata.exe")
+cp(VISION, OUT / "engine" / "strata-vision.exe")
 for dll in ("cublas64_13.dll", "cublasLt64_13.dll"):
     cp(CUDA_BIN / dll, OUT / "engine" / dll)
 (OUT / "engine" / "BUILD.json").write_text(json.dumps({
     "version": VERSION, "source": "release", "archs": [120], "ptx": False, "cuda": CUDA.name.lstrip("v"),
-    "vision": "none", "portable": True, "fork": "https://github.com/sergqwer/strata-nvfp4",
+    "vision": "cpu", "portable": True, "fork": "https://github.com/sergqwer/strata-nvfp4",
     "commit": git("rev-parse", "--short", "HEAD"), "dirty": bool(dirty),
     "engine_sha256": hashlib.sha256(ENGINE.read_bytes()).hexdigest()}, indent=1) + "\n")
 

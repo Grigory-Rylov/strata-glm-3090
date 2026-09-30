@@ -29,6 +29,10 @@ upstream's; the original README is kept as [README.upstream.md](README.upstream.
   142 of the vocabulary's 18,580 Cyrillic tokens - a Ukrainian answer decoded at 83 tokens/s with 1.4 tokens a round;
   with the whole Cyrillic script (`tools/draft_vocab.py --add cyrillic`), 109 and 2.1. English is unchanged.
   Upstream's CJK subset is one `--add cjk` away (`data/draft_vocab_en.bin` is the English/code one).
+- **Images on the CPU, from the checkpoint's own vision tower:** the encoder (`strata-vision`, FP32 weights) runs in
+  RAM, so the expert cache keeps all its VRAM and text decodes as fast as without images; a picture takes 2-6 s.
+  Upstream's GPU encoder took ~1.6 GB of VRAM (~600 cached experts, 10-20% of decode speed in served runs here) and, measured
+  against an FP32 reference, was up to 11% off (ggml-cuda's FP16 flash attention); this one is 0.1% off.
 - **Fixes:** a scale fold that left NVFP4 hidden activations in FP16's subnormals (2-12% expert error), and the
   batched verify path skipping the query rotation of rotated KV caches.
 - **Merged with upstream Strata 0.1.28** (its batched draft-layer prompt pass, fused hyper-connection prompt kernels,
@@ -49,8 +53,8 @@ Each change was measured - first-token KL against a reference, and interleaved s
   Windows and the usual apps on top, RAM + pagefile should be ~140 GB or more: **a pagefile of at least 32 GB with
   128 GB of RAM, 64 GB with 96 GB**. Set a fixed minimum rather than relying on a system-managed file to grow in
   time. Too small, and the start fails with an allocation error.
-- **Disk:** ~200 GB for the model files: GGUF 74 GB, expert pack 70 GB, n-gram table 51 GB, embedding 1.3 GB,
-  MTP head 0.8 GB. ~340 GB while preparing them (the 135 GB checkpoint and the MTP intermediates can go afterwards).
+- **Disk:** ~200 GB for the model files: GGUF 74 GB, expert pack 70 GB, n-gram table 51 GB, image encoder 1.8 GB,
+  embedding 1.3 GB, MTP head 0.8 GB. ~340 GB while preparing them (the 135 GB checkpoint and the MTP intermediates can go afterwards).
   Use the fastest NVMe drive you have: every start reads 63 GiB.
 
 ## Measured
@@ -139,6 +143,13 @@ OpenAI-compatible server: save the same arguments as a config (`{"exe": "build/s
 
 `--native` and `--native-dense-gguf` both point at the GGUF: `--native` alone would take the PLE file for a second
 shard of the same model.
+
+**Images:** the image encoder comes from the checkpoint (`convert_hf_to_gguf.py <checkpoint> --mmproj --outtype f32`,
+1.8 GB) and is built with `release\build-vision.cmd` (CPU only). The engine takes `--vision`, the config a
+`"vision": {"exe": "build-vision-cpu/bin/strata-vision.exe", "mmproj": "models/mmproj-f32.gguf", "model":
+"models/orca-nvfp4.gguf", "gpu": false, "max_tokens": 1024}` entry; then OpenAI `image_url` parts and Anthropic
+image blocks (a screenshot pasted into Claude Code) work. The encoder uses one thread per core while it runs; the
+engine is idle then.
 
 ## Claude Code
 
