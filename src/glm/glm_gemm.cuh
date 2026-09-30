@@ -27,6 +27,13 @@ public:
     void heads16(const bf16* W, long long w_stride, bool transW, const float* X, int ldx, float* Y, int ldy, int Nd,
                     int Kd, int T, int H);
     cublasHandle_t handle() const { return h_; }
+    void release() {   // the activation splits and the FP8 scratch (the prompt is done)
+        if (hi_) cudaFree(hi_);
+        if (lo_) cudaFree(lo_);
+        if (wbuf_) cudaFree(wbuf_);
+        hi_ = lo_ = wbuf_ = nullptr;
+        cap_ = wcap_ = 0;
+    }
 
 private:
     void split(const float* X, int rows, int cols, int ldx);   // X -> hi_, lo_ (packed rows of cols)

@@ -768,17 +768,18 @@ struct Engine {
         for (size_t i = 0; i < np; ++i) rank[(size_t) order[i]] = (int32_t) i;
         tier.rerank(rank);
         const size_t nv = vslot.size();
-        std::vector<int32_t> in, out;
+        std::vector<int32_t> in, out;   // out: slots - the empty ones, then those of the coldest residents
         for (size_t i = 0; i < nv; ++i) if (res[(size_t) order[i]] < 0) in.push_back(order[i]);
-        for (size_t i = np; i-- > nv;) if (res[(size_t) order[i]] >= 0) out.push_back(order[i]);   // coldest first
+        for (size_t sl = 0; sl < nv; ++sl) if (slot_pair[sl] < 0) out.push_back((int32_t) sl);
+        for (size_t i = np; i-- > nv;) if (res[(size_t) order[i]] >= 0) out.push_back(res[(size_t) order[i]]);
         const size_t moves = std::min<size_t>({in.size(), out.size(), (size_t) std::max(0LL, max_vram)});
         std::vector<std::pair<int32_t, int32_t>> from_file;
         std::vector<int32_t> file_slot;
         long long demoted = 0, from_ram = 0;
         for (size_t j = 0; j < moves; ++j) {
-            const int32_t o = out[j], i = in[j], s = res[(size_t) o];
-            res[(size_t) o] = -1;
-            if (!tier.has_copy(o / kNE, o % kNE))
+            const int32_t s = out[j], o = slot_pair[(size_t) s], i = in[j];
+            if (o >= 0) res[(size_t) o] = -1;
+            if (o >= 0 && !tier.has_copy(o / kNE, o % kNE))
                 if (uint8_t* d = tier.demote_begin(o / kNE, o % kNE)) {
                     CK(cudaMemcpy(d, vslot[(size_t) s], XL.bytes, cudaMemcpyDeviceToHost));
                     tier.demote_commit(o / kNE, o % kNE);
@@ -826,6 +827,39 @@ struct Engine {
         }
     }
 
+    // After the prompt: its buffers (and the staging slots LRU decode does not use) back to the expert tier.
+    void release_prompt() {
+        if (chunk == 0) return;
+        CK(cudaStreamSynchronize(s));
+        for (float* q : {c_streams, c_mix, c_x, c_xn, c_y, c_post, c_comb, c_t1, c_t2, c_t3, c_q, c_k, c_v, c_gf, c_b, c_o,
+                         c_gate, c_qr, c_qm, c_qa, c_ctx, c_vo, c_iq, c_iw, c_score, c_rows, c_wts, m_gu, m_h})
+            if (q) cudaFree(q);
+        for (int32_t* q : {c_ids, c_sel, c_cnt, c_grp_start, c_ngroups, c_ent_dst, c_ent_tok, m_src, m_dst, m_bounds, m_ident,
+                           b_start[0], b_start[1], b_ng[0], b_ng[1], b_dst[0], b_dst[1], b_tok[0], b_tok[1], m_rb[0], m_rb[1]})
+            if (q) cudaFree(q);
+        for (void* q : {(void*) c_grp_ptr, (void*) c_emb, c_xscratch, (void*) layer_slots, (void*) m_xq, (void*) m_hq,
+                        (void*) b_ptr[0], (void*) b_ptr[1], (void*) m_tails[0], (void*) m_tails[1]})
+            if (q) cudaFree(q);
+        gm.release();
+        if (lru && stage) { cudaFree(stage); stage = nullptr; }
+        chunk = 0;
+    }
+    // new VRAM slots from what is free now (empty: rebalance and the LRU fill them first)
+    void grow_vram_tier(double vram_reserve_mib) {
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+        const size_t keep = (size_t) (vram_reserve_mib * 1048576.0);
+        long long added = 0;
+        constexpr int kBlock = 32;
+        while (fr > keep + (size_t) kBlock * XL.bytes) {
+            uint8_t* q = nullptr;
+            if (cudaMalloc(&q, (size_t) kBlock * XL.bytes) != cudaSuccess) { (void) cudaGetLastError(); break; }
+            for (int j = 0; j < kBlock; ++j) { vslot.push_back(q + (size_t) j * XL.bytes); slot_pair.push_back(-1); }
+            added += kBlock;
+            fr -= (size_t) kBlock * XL.bytes;
+        }
+        if (added > 0) std::fprintf(stderr, "strata-glm: the prompt's buffers freed: %lld more VRAM slots (%zu)\n", added, vslot.size());
+    }
     void init_chunk(int T, bool whole_layer) {   // whole_layer: no tiers, each layer's 288 experts read at once
         chunk = T;
         gm.init(s, (size_t) T * kMlaH * kR);   // the widest split: the MLA context rows (64 x 512)
@@ -997,6 +1031,8 @@ struct Engine {
             mmq_ctx->run(dn, s);
             glm::scale_entry_wts(c_wts, m_dst + r0, m_rb[h], nb, m_tails[h], nr, s);
             CK(cudaEventRecord(ev_done[h], s));
+            static const bool serial = std::getenv("GLM_MMQ_SYNC") != nullptr;   // debugging: no overlap at all
+            if (serial) { CK(cudaStreamSynchronize(s)); CK(cudaStreamSynchronize(pcs)); }
         }
         ring_pos += disk.size();
     }
@@ -1738,6 +1774,10 @@ int main(int argc, char** argv) {
     }
     const double tp = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (nsys_env && std::atoi(nsys_env) == 2) CK(cudaProfilerStop());
+    if (e.tiered && chunk > 0) {
+        e.release_prompt();
+        e.grow_vram_tier(vram_reserve_mib);
+    }
     if (e.tiered) {   // the prompt said which experts this conversation uses: the tiers follow it
         const double ps = (double) (e.ts.vram + e.ts.ram + e.ts.file);
         if (ps > 0)
