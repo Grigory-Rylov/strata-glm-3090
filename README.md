@@ -1,7 +1,7 @@
 # Strata NVFP4
 
 **Qwen3.8-Flash-Next (125B hybrid MoE) in NVFP4 on one RTX 20, 30, 40 or 50 card (12 GB of VRAM or more; built
-and measured on an RTX 5090) + 96-128 GB of RAM, text and pictures.** A fork of
+and measured on an RTX 5090) + 64 GB of RAM or more, text and pictures.** A fork of
 [Niko1221/Strata](https://github.com/Niko1221/Strata) that runs a ModelOpt **NVFP4** checkpoint — here
 [OrcaRouter's abliterated Flash-Next](https://huggingface.co/jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4) —
 instead of the Q2/Q3 quants Strata ships for. NVFP4 keeps the experts at 4.5 bits with calibrated scales, which is
@@ -30,6 +30,10 @@ upstream's; the original README is kept as [README.upstream.md](README.upstream.
   142 of the vocabulary's 18,580 Cyrillic tokens - an answer in Cyrillic decoded at 83 tokens/s with 1.4 tokens a round;
   with the whole Cyrillic script (`tools/draft_vocab.py --add cyrillic`), 109 and 2.1. English is unchanged.
   Upstream's CJK subset is one `--add cjk` away (`data/draft_vocab_en.bin` is the English/code one).
+- **64 GB of RAM is enough:** with less than 96 GB installed, RAM holds only the experts the engine reads from it -
+  those outside VRAM first, then the part of VRAM's the prompt path borrows - pinned, as far as the free RAM goes
+  (6 GB stay free); the rest is read from `experts.bin` when needed, unbuffered. The whole 63 GiB arena needed
+  96 GB. On an RTX 5090 decode is as fast as with the arena; a 32K prompt waits 9.3 s instead of 5.7.
 - **Every RTX 20, 30, 40 and 50 card with 12 GB or more:** the NVFP4 path needed Blackwell only for the optional
   FP4 x FP4 prompt path, which falls back; the release carries code for all four generations, each one's own path
   tested on the 5090 (built as its PTX, the host answering as that card: `STRATA_EMULATE_CC`).
@@ -63,13 +67,25 @@ Each change was measured - first-token KL against a reference, and interleaved s
   \* On the RTX 5090 with the smaller card's VRAM budget (`--vram-reserve-mib`); a real card's own compute and PCIe
   make it slower. 12 GB at 262144 and 8 GB cards at any context stop with *no VRAM is left for the expert cache*.
 
-- **RAM:** 96 GB minimum, measured with 128 GB. A run holds ~69 GiB of physical RAM - 63 GiB of it the pinned
-  expert arena.
+- **RAM:** 64 GB minimum. With 96 GB or more the engine pins all 63 GiB of experts (~69 GiB of physical RAM in
+  all, measured with 128 GB). With less, the low-RAM mode starts by itself (`--low-ram`; `--no-low-ram` turns it
+  off): RAM holds the experts outside VRAM first, then VRAM's borrowed tail, up to the free RAM minus 6 GiB; the
+  rest is read from the file when needed. With 64 GB and an RTX 5090 a run holds ~54 GiB:
+
+  | 64 GB of RAM (measured*) with | decode | a 32K prompt: to the first token |
+  | --- | ---: | ---: |
+  | RTX 5090, 32 GB | 112-118 tok/s, as with 96+ GB (after 32K: 72) | 9.3 s (96+ GB: 5.7 s) |
+  | a 24 GB card | 86-90 tok/s (96+ GB: 95) | |
+  | a 16 GB card | 54-56 tok/s (96+ GB: 67) | |
+
+  \* On the RTX 5090 + 128 GB PC with 59-62 GiB of RAM locked away (the rest as on a 64 GB PC whose Windows uses
+  6 GB) and, for the smaller cards, their VRAM budget (`--vram-reserve-mib`).
+
 - **Pagefile:** Windows lets all processes together commit at most RAM + pagefile, and the engine commits ~98 GiB
-  (the 69 GiB above plus what WDDM reserves for the GPU's allocations; nothing of the model is ever paged out). With
-  Windows and the usual apps on top, RAM + pagefile should be ~140 GB or more: **a pagefile of at least 32 GB with
-  128 GB of RAM, 64 GB with 96 GB**. Set a fixed minimum rather than relying on a system-managed file to grow in
-  time. Too small, and the start fails with an allocation error.
+  with all experts pinned, ~70-85 GiB in the low-RAM mode (the pinned RAM plus what WDDM reserves for the GPU's
+  allocations; nothing of the model is ever paged out). With Windows and the usual apps on top: **a pagefile of at
+  least 32 GB with 128 GB of RAM, 64 GB with 96 GB, 48 GB with 64 GB**. Set a fixed minimum rather than relying on a
+  system-managed file to grow in time. Too small, and the start fails with an allocation error.
 - **Disk:** ~200 GB for the model files: GGUF 74 GB, expert pack 70 GB, n-gram table 51 GB, image encoder 1.8 GB,
   embedding 1.3 GB, MTP head 0.8 GB. ~340 GB while preparing them (the 135 GB checkpoint and the MTP intermediates can go afterwards).
   Use the fastest NVMe drive you have: every start reads 63 GiB.
@@ -228,6 +244,11 @@ either way - CUDA pins it for the GPU's copies.
 | `STRATA_EMULATE_CC=75\|86\|89` | tests: answer as that generation (with an engine built as its PTX, `86-virtual`) |
 | `STRATA_QSA_WARP=1\|select\|attn` | the pre-sm_80 QSA kernels on any card, as RTX 20 runs them (A/B) |
 | `--vram-reserve-mib N` | VRAM left unused (default 700); a smaller card's budget on a bigger one |
+| `--low-ram` / `--no-low-ram` | the low-RAM mode on / off (default: on with less than 96 GB installed) |
+| `--ram-budget GIB` | the low-RAM mode with at most GIB of pinned expert copies |
+| `STRATA_RAM_RESERVE_GIB=6` | RAM the low-RAM mode leaves free |
+| `STRATA_EMULATE_RAM_GIB=64` | tests: the low-RAM rule answers as a PC with that much RAM |
+| `STRATA_TIER_STATS=1`, `STRATA_TIER_VERIFY=1` | at exit: how many expert reads came from the file; every pinned copy checked against it |
 
 ## Tests
 

@@ -22,12 +22,24 @@ Source, measurements and how it works: https://github.com/sergqwer/strata-nvfp4
 
 - **Driver:** NVIDIA 580 or newer (CUDA 13). The CUDA runtime is inside `strata.exe` and cuBLAS is in `engine\`,
   so no CUDA toolkit is needed.
-- **RAM:** 96 GB or more; measured with 128 GB. A run holds ~69 GiB of physical RAM (63 GiB of it the pinned
-  experts).
-- **Pagefile:** at least **32 GB with 128 GB of RAM, 64 GB with 96 GB** (System > About > Advanced system settings >
-  Performance > Advanced > Virtual memory; set a fixed initial size). Windows allows all programs together to reserve
-  only RAM + pagefile, and the engine reserves ~98 GiB (Windows counts the GPU's memory too); nothing of the model is
-  actually written to the pagefile. Too small, and the start fails with an allocation error.
+- **RAM:** 64 GB or more. With 96 GB or more all 63 GiB of experts stay in RAM (~69 GiB in all); with less, the
+  engine keeps only the ones it reads from RAM (those the graphics card does not hold) and reads the rest from the
+  file - by itself, 6 GB stay free for Windows. `--no-low-ram` in the config turns that off, `--low-ram` forces it.
+
+  | 64 GB of RAM (measured*) with | decode | a 32K prompt: to the first token |
+  | --- | ---: | ---: |
+  | RTX 5090, 32 GB | 112-118 tok/s, as with 96+ GB (after 32K: 72) | 9.3 s (96+ GB: 5.7 s) |
+  | a 24 GB card | 86-90 tok/s (96+ GB: 95) | |
+  | a 16 GB card | 54-56 tok/s (96+ GB: 67) | |
+
+  \* On the RTX 5090 + 128 GB PC with 59-62 GiB of RAM locked away (the rest as on a 64 GB PC whose Windows uses
+  6 GB) and, for the smaller cards, their VRAM budget (`--vram-reserve-mib`).
+
+- **Pagefile:** at least **32 GB with 128 GB of RAM, 64 GB with 96 GB, 48 GB with 64 GB** (System > About >
+  Advanced system settings > Performance > Advanced > Virtual memory; set a fixed initial size). Windows allows all
+  programs together to reserve only RAM + pagefile, and the engine reserves ~70-98 GiB (Windows counts the GPU's
+  memory too); nothing of the model is actually written to the pagefile. Too small, and the start fails with an
+  allocation error.
 - **CPU:** any x86-64 with AVX2; AVX-512 (Zen 4/5) is used automatically for the CPU share of the experts.
 - **Disk:** ~340 GB free while the model is prepared, ~200 GB afterwards (delete `models\checkpoint`, 135 GB, and
   `models\mtp\tensors` once `prepare-model.cmd` is done). The start reads 63 GiB, so the fastest NVMe drive you

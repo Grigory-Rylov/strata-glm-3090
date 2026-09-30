@@ -168,6 +168,58 @@ Tried and dropped (no gain, or worse):
   5.3 vs 4.0 short, 10.8 vs 6.6 at 32K) - it fits the traces; the shipped profile generalises.
 - A q4_0 / q8_0 MTP head: tools/mtp_pack.py writes them, but the drafter only runs Q2_0 experts.
 
+### 64 GB of RAM (2026-09-30)
+
+The resident arena holds all 24,576 experts (63.3 GiB pinned, ~69 GiB of physical RAM for the run), including the
+~7,400 the VRAM cache holds a second time, so a 64 GB PC could not run the pack. `TieredExpertSource` keeps pinned
+host copies only where the engine reads them - the experts outside VRAM (the CPU and the PCIe share compute them on
+every token), ranked by the profile, then VRAM's own experts from its last slot back (the prompt path borrows the
+cache from its end and refills it afterwards; a 32K chunk borrows ~5,300 slots) - up to the free RAM minus
+`STRATA_RAM_RESERVE_GIB` (6), and maps `experts.bin` for the rest:
+
+- a blob outside the tier is read **unbuffered** into pinned memory wherever the engine streams many (the startup's
+  VRAM fill, the prompt path's stager, the lent slots' refill): copying them through the mapped file pulled its
+  pages into the working set, Windows began trimming, and decode after a 32K prompt fell from 72 to 33 tok/s;
+- decode prefetches the few a layer computes on the CPU at `begin_layer`, buffered (the OS cache keeps them in RAM
+  nobody else uses), and trims any mapped page it handed out;
+- the adaptive tier's swaps keep it in balance: an expert leaving VRAM without a host copy is copied back from its
+  VRAM slot (D2H, before the slot is refilled) into a spare slot, or into the least-ranked member's; the expert that
+  moved into VRAM gives its slot back once its copy has landed.
+
+On by itself below 96 GB installed (`--low-ram` / `--no-low-ram`; `--ram-budget` caps it). Measured against the
+arena on the 128 GB PC, 300 greedy tokens:
+
+| | decode tok/s | RAM | commit |
+| --- | ---: | ---: | ---: |
+| the arena | 119-122 | 67-69 GiB | 97 GiB |
+| upstream's `--mmap-experts` (all experts through the OS cache) | 45 | | |
+| upstream's `--mmap-experts --resident-cpu-experts` (static cache only) | 87 | | 78 GiB |
+| the tier, whole budget, the same cache slots | 108 vs the arena's 109 | | |
+| the tier, 48 GiB | 114 | 52 GiB | 82 GiB |
+| the tier, 40 GiB (1,713 experts from the file) | 100 | 45 GiB | 74 GiB |
+
+A 64 GB PC, emulated: a ballast process locks 59-62 GiB in large pages so that 57.6 GiB stay available (a 64 GB
+PC whose Windows uses 6), `STRATA_EMULATE_RAM_GIB=64` for the automatic rule:
+
+| | RTX 5090 | 24 GB card (131K) | 16 GB card (64K) |
+| --- | ---: | ---: | ---: |
+| experts in RAM / outside VRAM | 17,085 / 17,085 + 1,966 of VRAM's | 18,987 / 19,292 | 19,083 / 22,028 |
+| decode, 600 tokens after a 60-token prompt | 112-118 tok/s (96+ GB: 112-122) | 86-90 (96+ GB: 95) | 54-56 (96+ GB: 67) |
+| a 32K prompt: read / refill / first token | 5,635 tok/s / 1.8 s / 9.3 s (arena: 5,725 / - / 5.7 s) | | |
+| decode after 32K | 70-74 tok/s (arena 77) | | |
+| peak RAM (the engine) | 53-54 GiB | 54 GiB | 53-55 GiB |
+
+With the server and the CPU image encoder beside it (the tray's setup), 57.6 GiB available before the start: ready
+in 20 s, a picture read correctly, a 31.5K-token document, the lowest free RAM 3.3 GiB. Large pages were refused
+there (the ballast had fragmented RAM), so these ran on 4 KB pages; the first run right after locking the ballast
+was slower while Windows reorganized memory, the later ones steady.
+
+Correct to the bit: with the PCIe share off and a static cache, the arena and a 38 GiB tier (2,677 experts from the
+file) generate the same 302 tokens; `STRATA_TIER_VERIFY` found all 14,602 pinned copies - including those copied
+back from VRAM - equal to the file; first-token KL to the arena with a 44 GiB tier mean 0.0007 (noise). With the
+PCIe share on the outputs part after ~30 tokens: file-backed experts cannot be DMA'd, so the CPU computes them
+where the GPU would have, rounding differently. The arena path is unchanged: KL 0 to the previous release.
+
 ### Other GPUs: RTX 20, 30 and 40 (2026-09-30)
 
 Nothing on the NVFP4 path needs Blackwell except the optional `w4a4` (FP4 x FP4 MMA, sm_120a), and that already
