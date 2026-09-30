@@ -118,7 +118,7 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // (nvfp4_avx512_parity). STRATA_NO_NVFP4_512 falls back to ggml-cpu.
     static const bool nvfp4_512 = cpu_avx512_ok() && std::getenv("STRATA_NO_NVFP4_512") == nullptr;
     if (f.gu_type == kNvfp4Type && nvfp4_512 && nvfp4_512_fits(n)) {
-        nvfp4_512_gu_rows(blob, f.gu_row, f.up_off, n, act, nt, ff, r0, r1, sg, su);
+        nvfp4_512_gu_rows(blob, f.gu_row, f.up_off, n, act, nt, ff, r0, r1, sg, su, f.swiglu_limit);
         return;
     }
     const ggml_vec_dot_t dot = traits(f.gu_type)->vec_dot;
@@ -131,6 +131,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
             dot(n, &u, 0, ur, 0, act[t], 0, 1);
             g *= sg;
             u *= su;
+            if (f.swiglu_limit > 0.f) {
+                g = std::min(g, f.swiglu_limit);
+                u = std::min(std::max(u, -f.swiglu_limit), f.swiglu_limit);
+            }
             ff[t][r] = (g / (1.f + std::exp(-g))) * u;
         }
     }

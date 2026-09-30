@@ -91,6 +91,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     L.offset.assign((size_t) n_layers, ~0ull);
     L.bytes.assign((size_t) n_layers, 0);
     L.max_blob = 0;
+    float swiglu_limit = 0.f;   // from the header (GLM-5.3-Flash: 10); none = Qwen's plain SwiGLU
     std::string line;
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') {
@@ -100,6 +101,13 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                 // default, so the header wins.
                 const size_t at = line.find("(n_expert ");
                 if (at != std::string::npos) L.n_expert = std::atoll(line.c_str() + at + 10);
+                // another architecture's widths (GLM-5.3-Flash: n_embd 4096, n_ff 2048); none = Qwen's H and FF
+                const size_t ae = line.find("n_embd ");
+                if (ae != std::string::npos) L.n_embd = std::atoll(line.c_str() + ae + 7);
+                const size_t af = line.find("n_ff ");
+                if (af != std::string::npos) L.n_ff = std::atoll(line.c_str() + af + 5);
+                const size_t al = line.find("swiglu_limit ");
+                if (al != std::string::npos) swiglu_limit = (float) std::atof(line.c_str() + al + 13);
             }
             continue;
         }
@@ -111,7 +119,8 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             return false;
         }
         NativeFmt f;
-        if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
+        if (!native_fmt((int) gt, (int) dt, L.n_embd, L.n_ff, f, err)) return false;
+        f.swiglu_limit = swiglu_limit;
         if (f.bytes != blob) {
             err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);

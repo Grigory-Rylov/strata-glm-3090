@@ -18,6 +18,8 @@ namespace strata::kernels::cpu {
 struct ExpertLayout {
     bool native = false;
     int64_t n_layers = 0, n_expert = NE;
+    /// the experts' widths: from the pack header ("n_embd E", "n_ff F"); Qwen's H and FF when it has none
+    int64_t n_embd = H, n_ff = FF;
     std::vector<NativeFmt> fmt;           ///< per layer (native packs)
     std::vector<uint64_t> offset, bytes;  ///< per layer: where its 512 blobs start, bytes per blob
     /// Plan v0.3 P6: per layer, the absolute offsets of the gate / up / down tensors in the model's shard 1, so

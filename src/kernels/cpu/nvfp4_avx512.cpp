@@ -13,6 +13,7 @@
 #define GGML_COMMON_IMPL_CPP
 #include "ggml-common.h"
 
+#include <algorithm>
 #include <immintrin.h>
 
 #include <cmath>
@@ -112,14 +113,18 @@ inline void row_dot(const uint8_t* row, const Acts& a, float* res) {
 
 template <int NT>
 void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, const Acts& a, float* const* ff, int r0, int r1,
-             float sg, float su) {
+             float sg, float su, float lim) {
     float g[NT], u[NT];
     for (int r = r0; r < r1; ++r) {
         row_dot<NT>(blob + (size_t) r * gu_row, a, g);
         row_dot<NT>(blob + up_off + (size_t) r * gu_row, a, u);
         for (int t = 0; t < NT; ++t) {
-            const float gs = g[t] * sg;
-            ff[t][r] = (gs / (1.f + std::exp(-gs))) * (u[t] * su);
+            float gs = g[t] * sg, us = u[t] * su;
+            if (lim > 0.f) {   // GLM-5.3-Flash's clamped SwiGLU
+                gs = std::min(gs, lim);
+                us = std::min(std::max(us, -lim), lim);
+            }
+            ff[t][r] = (gs / (1.f + std::exp(-gs))) * us;
         }
     }
 }
@@ -150,18 +155,18 @@ inline void slices(int nt, F&& run) {
 }
 
 void nvfp4_512_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
-                       float* const* ff, int r0, int r1, float s_gate, float s_up) {
+                       float* const* ff, int r0, int r1, float s_gate, float s_up, float lim) {
     slices(nt, [&](int t0, int w) {
         const Acts a(act + t0, w, n / QK_NVFP4);
         float* const* f = ff + t0;
         switch (w) {
-            case 1: gu_rows<1>(blob, gu_row, up_off, a, f, r0, r1, s_gate, s_up); break;
-            case 2: gu_rows<2>(blob, gu_row, up_off, a, f, r0, r1, s_gate, s_up); break;
-            case 3: gu_rows<3>(blob, gu_row, up_off, a, f, r0, r1, s_gate, s_up); break;
-            case 4: gu_rows<4>(blob, gu_row, up_off, a, f, r0, r1, s_gate, s_up); break;
-            case 5: gu_rows<5>(blob, gu_row, up_off, a, f, r0, r1, s_gate, s_up); break;
-            case 6: gu_rows<6>(blob, gu_row, up_off, a, f, r0, r1, s_gate, s_up); break;
-            default: gu_rows<7>(blob, gu_row, up_off, a, f, r0, r1, s_gate, s_up); break;
+            case 1: gu_rows<1>(blob, gu_row, up_off, a, f, r0, r1, s_gate, s_up, lim); break;
+            case 2: gu_rows<2>(blob, gu_row, up_off, a, f, r0, r1, s_gate, s_up, lim); break;
+            case 3: gu_rows<3>(blob, gu_row, up_off, a, f, r0, r1, s_gate, s_up, lim); break;
+            case 4: gu_rows<4>(blob, gu_row, up_off, a, f, r0, r1, s_gate, s_up, lim); break;
+            case 5: gu_rows<5>(blob, gu_row, up_off, a, f, r0, r1, s_gate, s_up, lim); break;
+            case 6: gu_rows<6>(blob, gu_row, up_off, a, f, r0, r1, s_gate, s_up, lim); break;
+            default: gu_rows<7>(blob, gu_row, up_off, a, f, r0, r1, s_gate, s_up, lim); break;
         }
     });
 }

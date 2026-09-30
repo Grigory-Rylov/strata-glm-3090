@@ -13,10 +13,13 @@
 
 namespace strata::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
-inline constexpr size_t kNativeActBytes = 4096;
-/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
-inline constexpr size_t kNativeHBytes = 1024;
+/// Bytes of the largest quantized activation any native layer uses: up to 7K values as Q8_K (4096 of GLM-5.3-Flash:
+/// 16 x 292 = 4,672; 2560 of Qwen3.8-Flash-Next: 10 x 292).
+inline constexpr size_t kNativeActBytes = 8192;
+/// Bytes of the largest quantized down activation: up to ~3.5K values (2048 as Q8_K: 8 x 292 = 2,336; 640 as Q8_0).
+inline constexpr size_t kNativeHBytes = 4096;
+/// The widest expert intermediate (n_ff) a native layer may have: GLM-5.3-Flash's 2048 (Qwen3.8-Flash-Next: 640).
+inline constexpr int kMaxFF = 2048;
 
 /// One layer's native expert geometry.
 struct NativeFmt {
@@ -32,6 +35,7 @@ struct NativeFmt {
     /// projection's FP32 output: gate * s_gate, up * s_up, down * s_down. Do not fold s_down into up: the hidden
     /// drops to ~1e-5 and its q8 block scale becomes an FP16 subnormal (expert error 2-12% instead of 1.1%).
     size_t tail_off = 0;
+    float swiglu_limit = 0.0f;   ///< GLM-5.3-Flash: gate <= limit, up in [-limit, limit] (after the scales); 0 = none
 };
 constexpr int kNvfp4Type = 40;
 constexpr size_t kNvfp4Tail = 16;

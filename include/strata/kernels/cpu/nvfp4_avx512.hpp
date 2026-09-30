@@ -18,7 +18,7 @@ bool nvfp4_512_fits(int n);
 /// and u are the raw NVFP4 dot products of gate row r and up row r (at `up_off`) with activation t (Q8_0, `n` values).
 /// `s_gate` / `s_up` are the expert's global scales from its blob tail.
 void nvfp4_512_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
-                       float* const* ff, int r0, int r1, float s_gate, float s_up);
+                       float* const* ff, int r0, int r1, float s_gate, float s_up, float swiglu_limit = 0.0f);
 
 /// Plain rows [r0, r1) of an NVFP4 matrix (`row_bytes` apart) against `nt` Q8_0 activations of `n` values, times
 /// `scale` (the down matrix's s_down).

@@ -47,6 +47,7 @@ struct NativeExpertLayout {
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob
     size_t tail_off = 0;                // NVFP4: {s_gate, s_up, s_down, 0} at the blob's end; 0 = none
+    float swiglu_limit = 0.0f;          // GLM-5.3-Flash: gate <= limit, up in [-limit, limit]; 0 = none (Qwen)
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 

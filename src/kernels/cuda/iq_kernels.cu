@@ -413,11 +413,15 @@ __global__ void __launch_bounds__(256) native_gu_kernel(const unsigned long long
 }
 
 __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
-                                      long long n) {
+                                      long long n, float lim) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float g = gate[i];
-    h[i] = (g / (1.0f + __expf(-g))) * up[i];
+    float g = gate[i], u = up[i];
+    if (lim > 0.0f) {   // GLM-5.3-Flash's clamp (transformers: gate.clamp(max=lim), up.clamp(-lim, lim))
+        g = fminf(g, lim);
+        u = fminf(fmaxf(u, -lim), lim);
+    }
+    h[i] = (g / (1.0f + __expf(-g))) * u;
 }
 
 template<int TD>
@@ -911,7 +915,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     check("native_expert_grouped/gu");
     const long long nh = (long long) cap_entries * L.n_ff;
-    swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+    swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh, L.swiglu_limit);
     quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
     const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) cap_groups);
     switch (L.d_type) {
@@ -940,7 +944,7 @@ void native_expert_grouped_f32(const NativeExpertLayout& L, const unsigned long 
     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) cap_groups);
     nvfp4_gu_f32_kernel<<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, x, L, gate, up);
     const long long nh = (long long) cap_entries * L.n_ff;
-    swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+    swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh, L.swiglu_limit);
     const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) cap_groups);
     nvfp4_down_f32_kernel<<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, h, L, out);
     check("native_expert_grouped_f32");
