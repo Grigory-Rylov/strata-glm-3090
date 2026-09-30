@@ -168,6 +168,58 @@ Tried and dropped (no gain, or worse):
   5.3 vs 4.0 short, 10.8 vs 6.6 at 32K) - it fits the traces; the shipped profile generalises.
 - A q4_0 / q8_0 MTP head: tools/mtp_pack.py writes them, but the drafter only runs Q2_0 experts.
 
+### Other GPUs: RTX 20, 30 and 40 (2026-09-30)
+
+Nothing on the NVFP4 path needs Blackwell except the optional `w4a4` (FP4 x FP4 MMA, sm_120a), and that already
+falls back: `w4a8` is ggml's int8 MMQ with Blackwell hidden from it (`mmq_nvfp4_w4a8.cu`), which runs from sm_75;
+decode's NVFP4 experts use `__dp4a` and a software FP8 scale decode. The release was built for `120a` only. It is now
+built for `75-real;86-real;89-real;120a-real` (114 MB instead of 44), and the engine names a card it has no code for
+instead of failing at its first kernel. CMake turns `120` into `120a` as ggml's own CMake does.
+
+Tested on the RTX 5090 alone: an engine built as PTX for an older architecture (`86-virtual`) runs through the
+driver's JIT with `__CUDA_ARCH__` = 860 in every kernel, and `STRATA_EMULATE_CC=86` makes the host side answer as
+that card does (compute capability for ggml's MMQ configs and the QSA kernels' choice, shared memory per block:
+64 KB on Turing). cuBLAS is the one part not covered - it runs the 5090's kernels; upstream makes the same calls on
+RTX 20.
+
+| test | sm_75 | sm_86 | sm_89 |
+| --- | --- | --- | --- |
+| `mmq_nvfp4_parity` (w4a8 vs a double reference, T = 1-300) | identical to sm_120a | identical | identical |
+| `nvfp4_expert_gpu_parity` (decode experts) | identical, worst 1.160% | identical | identical |
+| `w4a4` requested | falls back to w4a8 | falls back | falls back |
+| first-token KL vs the sm_120a release, 9 prompts | mean 0.0034, max 0.027 | mean 0.0003, max 0.0012 | mean 0.0005, median 0 |
+| top-1 | 9/9 | 9/9 | 9/9 |
+
+sm_86 and sm_89 are at the noise floor (several prompts bit-identical). Turing's 1-8K prompts are too; its 32K
+prompt is not, and the cause is the same on the 5090 itself: `STRATA_QSA_WARP=1` (the pre-sm_80 QSA selection and
+prompt attention, FP32 FMAs instead of 3xTF32 and FP16 MMA) gives KL 0.029 at 32K there as well. Either kernel alone
+stays at the floor (selection 0.004, attention 0.006):
+
+| prompt | Turing's QSA kernels | control: another summation order (`STRATA_PROMPT_ATTN_V1`) |
+| --- | ---: | ---: |
+| 16K | 0.0004 | 0.0003 |
+| 32K | 0.029 | 0.005 |
+| 125K | 0.023 | 0.008 |
+
+So on RTX 20 long prompts land 3-6x further from the RTX 30+ result than an FP32-level change does, with the same
+top token; which of the two is nearer the exact function is open (both are FP32-level by design). The four-arch
+release on the 5090 against the 120a-only build: two prompts bit-identical, KL max 0.0007 (the run-to-run noise:
+the slot count follows the free VRAM at start).
+
+VRAM: the fixed part is ~7.6 GiB at 32K context and ~11 GiB at 262K (dense weights, KV, draft head, prompt
+buffers); the rest caches experts. Measured on the 5090 with each card's budget (`--vram-reserve-mib` = 700 MiB +
+the difference; a ballast process instead does not work under WDDM, which moves an idle process's VRAM to RAM):
+
+| budget | 262144 | 131072 | 65536 | 32768 |
+| --- | --- | --- | --- | --- |
+| 24 GB | 4,415 slots, 84 tok/s | 5,158, 95 | | |
+| 16 GB | 1,309, 61 | 2,051, 65 | 2,422, 67 | |
+| 12 GB | does not fit | | 869, 57 | 1,055, 59 |
+| 8 GB | | | | does not fit |
+
+Decode falls toward what the CPU pool alone carries (~57 tok/s on this CPU and DDR5-5600); a real card's own speed
+and PCIe generation come on top.
+
 ### Images (2026-09-30)
 
 Upstream's vision path (`--vision`, the `strata-vision` helper on llama.cpp's mtmd, M-RoPE positions for image

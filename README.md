@@ -29,6 +29,9 @@ upstream's; the original README is kept as [README.upstream.md](README.upstream.
   142 of the vocabulary's 18,580 Cyrillic tokens - a Ukrainian answer decoded at 83 tokens/s with 1.4 tokens a round;
   with the whole Cyrillic script (`tools/draft_vocab.py --add cyrillic`), 109 and 2.1. English is unchanged.
   Upstream's CJK subset is one `--add cjk` away (`data/draft_vocab_en.bin` is the English/code one).
+- **Every RTX 20, 30, 40 and 50 card with 12 GB or more:** the NVFP4 path needed Blackwell only for the optional
+  FP4 x FP4 prompt path, which falls back; the release carries code for all four generations, each one's own path
+  tested on the 5090 (built as its PTX, the host answering as that card: `STRATA_EMULATE_CC`).
 - **Images on the CPU, from the checkpoint's own vision tower:** the encoder (`strata-vision`, FP32 weights) runs in
   RAM, so the expert cache keeps all its VRAM and text decodes as fast as without images; a picture takes 2-6 s.
   Upstream's GPU encoder took ~1.6 GB of VRAM (~600 cached experts, 10-20% of decode speed in served runs here) and, measured
@@ -44,8 +47,21 @@ Each change was measured - first-token KL against a reference, and interleaved s
 
 ## Requirements
 
-- **GPU:** RTX 5090, 32 GB (sm_120). The engine fills it: dense weights and the 262K KV cache first, then ~19 GB of
-  cached experts (~7,500). A card with less VRAM caches fewer experts and decodes slower.
+- **GPU:** an RTX 20, 30, 40 or 50 card with 12 GB of VRAM or more (the release has code for sm_75, 86, 89 and
+  120a). Built and measured on an RTX 5090, 32 GB: dense weights and the 262K KV cache first, then ~19 GB of cached
+  experts (~7,400). The other generations were tested on the 5090 through their own code paths (docs/NVFP4.md,
+  "Other GPUs"). A card with less VRAM caches fewer experts and decodes slower; lower `--max-context` with it:
+
+  | card's VRAM | `--max-context` | expert slots | decode, measured* |
+  | --- | ---: | ---: | ---: |
+  | 32 GB (RTX 5090) | 262144 | 7,352 | 111 tok/s |
+  | 24 GB (RTX 3090 / 4090) | 131072 | 5,158 | 95 tok/s |
+  | 16 GB (RTX 4080 / 5080 / 4060 Ti 16 GB) | 65536 | 2,422 | 67 tok/s |
+  | 12 GB (RTX 3060 12 GB / 4070) | 32768 | 1,055 | 59 tok/s |
+
+  \* On the RTX 5090 with the smaller card's VRAM budget (`--vram-reserve-mib`); a real card's own compute and PCIe
+  make it slower. 12 GB at 262144 and 8 GB cards at any context stop with *no VRAM is left for the expert cache*.
+
 - **RAM:** 96 GB minimum, measured with 128 GB. A run holds ~69 GiB of physical RAM - 63 GiB of it the pinned
   expert arena.
 - **Pagefile:** Windows lets all processes together commit at most RAM + pagefile, and the engine commits ~98 GiB
@@ -208,6 +224,9 @@ either way - CUDA pins it for the GPU's copies.
 | `STRATA_DUMP_FIRST_LOGITS=file` | write the first generated token's logits (compare prompt paths) |
 | `STRATA_DUMP_MOE_INPUT=file`, `STRATA_DUMP_MOE_LAYER=l` | dump one layer's real MoE input rows |
 | `STRATA_REQUEST_LINES=1` | `serve.server` echoes one summary line per request to stdout |
+| `STRATA_EMULATE_CC=75\|86\|89` | tests: answer as that generation (with an engine built as its PTX, `86-virtual`) |
+| `STRATA_QSA_WARP=1\|select\|attn` | the pre-sm_80 QSA kernels on any card, as RTX 20 runs them (A/B) |
+| `--vram-reserve-mib N` | VRAM left unused (default 700); a smaller card's budget on a bigger one |
 
 ## Tests
 

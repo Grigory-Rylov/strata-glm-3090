@@ -74,6 +74,9 @@ if(STRATA_ENABLE_CUDA)
         "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")
     endif()
   endforeach()
+  # RTX 50's FP4 MMA (the W4A4 prompt path) exists only in the arch-specific target: 120 -> 120a, as ggml's own
+  # CMake does (its CUDA backend is off here), so "75;86;89;120" builds every card with its full feature set
+  list(TRANSFORM CMAKE_CUDA_ARCHITECTURES REPLACE "^(12[0-9])(-real|-virtual)?$" "\\1a\\2")
   message(STATUS "Strata: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
   set(_strata_gpu_runtime_target CUDA::cudart)
   set(_strata_gpu_blas_target CUDA::cublas)
@@ -495,7 +498,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_test(NAME cvec_parity COMMAND cvec_parity)
 
   # Plan v0.3 P3: native MMVQ for 1..8 tokens (bitwise selftest + --bench timing); synthetic data, no model.
-  if(STRATA_BUILD_TESTS)
+  # bench/micro is not in the published tree: its targets only where the sources are
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/native_mmvq_multi.cpp")
   add_executable(native_mmvq_multi bench/micro/native_mmvq_multi.cpp)
   target_include_directories(native_mmvq_multi PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(native_mmvq_multi PRIVATE strata_kernels ${_strata_gpu_runtime_target})
@@ -742,7 +746,7 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
 endif()
 
-if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS)
+if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/hit_cpu_order_parity.cu")
   add_executable(hit_cpu_order_parity bench/micro/hit_cpu_order_parity.cu)
   target_link_libraries(hit_cpu_order_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
 endif()

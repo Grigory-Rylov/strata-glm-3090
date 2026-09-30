@@ -5,8 +5,20 @@ Source, measurements and how it works: https://github.com/sergqwer/strata-nvfp4
 
 ## What you need
 
-- **GPU:** GeForce RTX 50-series (Blackwell, sm_120). Built and measured on an RTX 5090 (32 GB); a card with less
-  VRAM runs with a smaller expert cache and decodes slower. Other GPU generations are not supported by this build.
+- **GPU:** GeForce RTX 20, 30, 40 or 50 with 12 GB of VRAM or more. Built and measured on an RTX 5090 (32 GB); the
+  other generations' code paths were tested on it too. With less VRAM, lower `--max-context` in
+  `config\strata-nvfp4.json` (the engine says so when it does not fit):
+
+  | card's VRAM | `--max-context` | expert slots | decode, measured* |
+  | --- | ---: | ---: | ---: |
+  | 32 GB (RTX 5090) | 262144 | 7,352 | 111 tok/s |
+  | 24 GB (RTX 3090 / 4090) | 131072 | 5,158 | 95 tok/s |
+  | 16 GB (RTX 4080 / 5080 / 4060 Ti 16 GB) | 65536 | 2,422 | 67 tok/s |
+  | 12 GB (RTX 3060 12 GB / 4070) | 32768 | 1,055 | 59 tok/s |
+
+  \* On the RTX 5090 with the smaller card's VRAM budget (`--vram-reserve-mib`); a real card's own compute and PCIe
+  make it slower. 12 GB at 262144 and 8 GB cards at any context stop with *no VRAM is left for the expert cache*.
+
 - **Driver:** NVIDIA 580 or newer (CUDA 13). The CUDA runtime is inside `strata.exe` and cuBLAS is in `engine\`,
   so no CUDA toolkit is needed.
 - **RAM:** 96 GB or more; measured with 128 GB. A run holds ~69 GiB of physical RAM (63 GiB of it the pinned

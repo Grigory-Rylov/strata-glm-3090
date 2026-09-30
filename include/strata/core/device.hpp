@@ -28,10 +28,13 @@ struct DeviceInfo {
     int multi_processor_count = 0;
 };
 
-// Throws when there is no CUDA device.  The engine targets sm_120 specifically and must say so rather than
-// run slowly on something else: `CMakeLists.txt` already refuses to COMPILE for another architecture, and
-// this is the matching check at run time (a binary can be carried to a different machine).
+// Throws when there is no CUDA device, or one below compute capability 7.5 (what `CMakeLists.txt` also refuses
+// to compile for).  STRATA_EMULATE_CC answers for another generation (strata/core/emulate.hpp).
 DeviceInfo device_info(int ordinal = 0);
+
+/// "" when this build has device code for the current device, else CUDA's error: a build for other GPUs would
+/// otherwise fail at its first kernel launch, with nothing that names the cause.
+std::string device_code_error();
 
 class CudaError : public std::runtime_error {
 public:

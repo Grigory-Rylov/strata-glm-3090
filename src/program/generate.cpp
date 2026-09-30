@@ -51,6 +51,8 @@
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/device.hpp"
+#include "strata/core/emulate.hpp"
 #ifndef NOMINMAX
 #define NOMINMAX   // gguf_reader.hpp includes windows.h
 #endif
@@ -1397,6 +1399,22 @@ int main(int argc, char** argv) {
         } catch (const std::exception& e) {
             std::fprintf(stderr, "strata generate: reading the model's expert shape from %s: %s\n",
                          o.native_preset.c_str(), e.what());
+            return 1;
+        }
+    }
+    {   // the card, and whether this build has code for it (RTX 20/30/40/50: CMAKE_CUDA_ARCHITECTURES 75;86;89;120a),
+        // before the 63 GiB arena starts loading
+        int dev = 0;
+        cudaDeviceProp p{};
+        if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess)
+            std::fprintf(stderr, "strata generate: GPU %d: %s, compute capability %d.%d%s\n", dev, p.name,
+                         strata::cc_major_of(p.major), strata::cc_minor_of(p.minor),
+                         strata::emulated_cc() ? " (STRATA_EMULATE_CC: a test mode, the card is emulated)" : "");
+        const std::string e = strata::core::device_code_error();
+        if (!e.empty()) {
+            std::fprintf(stderr, "strata generate: this engine has no code for %s (sm_%d%d): %s - it is built for "
+                                 "RTX 20/30/40/50 (sm_75, 86, 89, 120); a newer card needs a newer release\n",
+                         p.name, p.major, p.minor, e.c_str());
             return 1;
         }
     }

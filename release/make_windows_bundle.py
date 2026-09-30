@@ -4,9 +4,9 @@
 
 1. Refuses a working tree with uncommitted changes (BUILD.json names the commit the engine was built from;
    --allow-dirty for a local try, marked "dirty" there and refused by release/publish.py).
-2. Builds the portable engine itself (release/build-release.cmd: STRATA_PORTABLE=ON, sm_120a, build-release/) and
-   the image encoder (release/build-vision.cmd: CPU only, build-vision-cpu/), and checks with ninja dry runs that
-   both are current - a bundle once shipped the previous release's engine.
+2. Builds the portable engine itself (release/build-release.cmd: STRATA_PORTABLE=ON, sm_75/86/89/120a,
+   build-release/) and the image encoder (release/build-vision.cmd: CPU only, build-vision-cpu/), and checks with
+   ninja dry runs that both are current - a bundle once shipped the previous release's engine.
 3. Assembles dist/strata-nvfp4: that engine, cuBLAS from %CUDA_PATH%, the part of llama.cpp the converter imports,
    and the bundle's own files (README, scripts, config) from release/windows/.
 4. Zips it to dist/strata-nvfp4-v<VERSION>-windows-x64.zip and writes its SHA-256 beside it.
@@ -71,7 +71,7 @@ cp(VISION, OUT / "engine" / "strata-vision.exe")
 for dll in ("cublas64_13.dll", "cublasLt64_13.dll"):
     cp(CUDA_BIN / dll, OUT / "engine" / dll)
 (OUT / "engine" / "BUILD.json").write_text(json.dumps({
-    "version": VERSION, "source": "release", "archs": [120], "ptx": False, "cuda": CUDA.name.lstrip("v"),
+    "version": VERSION, "source": "release", "archs": [75, 86, 89, 120], "ptx": False, "cuda": CUDA.name.lstrip("v"),
     "vision": "cpu", "portable": True, "fork": "https://github.com/sergqwer/strata-nvfp4",
     "commit": git("rev-parse", "--short", "HEAD"), "dirty": bool(dirty),
     "engine_sha256": hashlib.sha256(ENGINE.read_bytes()).hexdigest()}, indent=1) + "\n")
