@@ -520,6 +520,72 @@ struct Engine {
     // A RAM hit is copied into VRAM anyway, so it lands in a VRAM slot (RAM keeps its copy: evicting from VRAM
     // is free); a disk hit is read anyway, so it lands in a RAM slot (of the least recent member outside VRAM).
     bool lru = true;
+    // exclusive tiers (default with lru): a RAM hit moving to VRAM gives its RAM slot back (at the next layer, once
+    // its copy has run), and an expert leaving VRAM without a RAM copy is written back (D2H: the idle direction)
+    bool excl = false;   // --ram-exclusive
+    std::vector<int32_t> pending_free;                               // RAM copies of experts that moved to VRAM
+    long long writebacks = 0;
+    // a few free VRAM slots: a new expert takes one at once; the LRU victim that replaces it in the pool is written
+    // back on `wb` (the D2H direction, beside the H2D copies), and the slot is reused once that copy has run
+    static constexpr int kVPool = 16, kWbEv = 64;
+    std::deque<std::pair<int32_t, int>> vfree;                       // (slot, writeback event or -1)
+    cudaStream_t wb = nullptr;
+    cudaEvent_t wb_ev[kWbEv] = {};
+    int wb_next = 0;
+    void evict_one(const int32_t* pj) {   // the least recent occupied slot outside pj into the pool
+        int32_t sl = vlru.tail;
+        while (sl >= 0) {
+            const int32_t q = slot_pair[(size_t) sl];
+            bool sel = false;
+            for (int j = 0; pj && j < kK; ++j) sel |= pj[j] == q;
+            if (!sel) break;
+            sl = vlru.prev[(size_t) sl];
+        }
+        if (sl < 0) return;
+        vlru.remove(sl);
+        const int32_t v = slot_pair[(size_t) sl];
+        int ev = -1;
+        if (v >= 0) {
+            res[(size_t) v] = -1;
+            slot_pair[(size_t) sl] = -1;
+            if (!tier.has_copy(v / kNE, v % kNE)) {
+                if (tier.spares() == 0) {
+                    const int32_t r = pj ? ram_victim(pj) : rlru.tail;
+                    if (r >= 0) { tier.promote_done(r / kNE, r % kNE); rlru.remove(r); }
+                }
+                if (uint8_t* d = tier.demote_begin(v / kNE, v % kNE)) {
+                    CK(cudaMemcpyAsync(d, vslot[(size_t) sl], XL.bytes, cudaMemcpyDeviceToHost, wb));
+                    ev = wb_next;
+                    wb_next = (wb_next + 1) % kWbEv;
+                    CK(cudaEventRecord(wb_ev[ev], wb));
+                    tier.demote_commit(v / kNE, v % kNE);
+                    rlru.touch(v);
+                    ++writebacks;
+                }
+            }
+        }
+        vfree.emplace_back(sl, ev);
+    }
+    void refill_pool() {
+        if (!(lru && excl)) return;
+        if (!wb) {
+            CK(cudaStreamCreateWithFlags(&wb, cudaStreamNonBlocking));
+            for (auto& ev : wb_ev) CK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+        }
+        vfree.clear();
+        while ((int) vfree.size() < kVPool) evict_one(nullptr);
+        CK(cudaStreamSynchronize(wb));
+    }
+    int32_t ram_victim(const int32_t* pj) {   // the least recent RAM member outside VRAM and this layer's selection
+        int32_t v = rlru.tail;
+        while (v >= 0) {
+            bool sel = false;
+            for (int j = 0; j < kK; ++j) sel |= pj[j] == v;
+            if (res[(size_t) v] < 0 && !sel) break;
+            v = rlru.prev[(size_t) v];
+        }
+        return v;
+    }
     Lru vlru, rlru;                                                  // over VRAM slots; over pairs (RAM members)
     DiskReader reader;
     std::vector<std::string> mirrors;                                // identical copies of experts.bin (--mirror)
@@ -809,18 +875,23 @@ struct Engine {
             std::fprintf(stderr, "strata-glm: rebalance: %s\n", err.c_str());
             std::exit(1);
         }
-        // RAM: the pairs ranked right after VRAM's (lru, inclusive: from the top) that it does not hold, hottest first
+        // RAM: the pairs ranked right after VRAM's (lru inclusive: from the top) that it does not hold, hottest first
+        if (lru && excl)   // exclusive: VRAM's experts give their RAM copies back first
+            for (size_t sl = 0; sl < nv; ++sl)
+                if (slot_pair[sl] >= 0 && tier.has_copy(slot_pair[sl] / kNE, slot_pair[sl] % kNE))
+                    tier.promote_done(slot_pair[sl] / kNE, slot_pair[sl] % kNE);
+        pending_free.clear();
         std::vector<std::pair<int32_t, int32_t>> want;
-        const size_t cap = (size_t) tier.tier_slots(), r0 = lru ? 0 : nv;
+        const size_t cap = (size_t) tier.tier_slots(), r0 = lru && !excl ? 0 : nv;
         for (size_t i = r0; i < std::min(np, r0 + cap) && (long long) want.size() < max_ram; ++i) {
             const int32_t p = order[i];
-            if ((lru || res[(size_t) p] < 0) && !tier.has_copy(p / kNE, p % kNE)) want.emplace_back(p / kNE, p % kNE);
+            if (((lru && !excl) || res[(size_t) p] < 0) && !tier.has_copy(p / kNE, p % kNE)) want.emplace_back(p / kNE, p % kNE);
         }
         const int64_t admitted = want.empty() ? 0 : tier.admit_from_file(want, 16, err);
         const float f = (float) std::pow(0.5, (double) heat_tokens / kHalfLife);
         for (float& h : heat) h *= f;
         heat_tokens = 0;
-        if (lru) lru_rebuild(order);
+        if (lru) { lru_rebuild(order); refill_pool(); }
         if (verbose) {
             const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             std::fprintf(stderr, "strata-glm: rebalance: VRAM %zu in (%lld from RAM, %zu from disk; %lld moved back to "
@@ -1422,10 +1493,34 @@ struct Engine {
             for (int j = 0; j < kK; ++j) pj[j] = m * kNE + hid[j];
             auto in_sel = [&](int32_t p) { for (int j = 0; j < kK; ++j) if (pj[j] == p) return true; return false; };
             // a VRAM slot for p: the least recent one outside this layer's selection
-            auto vram_slot = [&](int32_t p) {
+            auto vram_slot = [&](int32_t p) -> int32_t {
+                if (excl && wb) {
+                    if (vfree.empty()) evict_one(pj);
+                    const auto [f, ev] = vfree.front();
+                    vfree.pop_front();
+                    if (ev >= 0) CK(cudaStreamWaitEvent(s, wb_ev[ev], 0));   // its previous expert is written back
+                    slot_pair[(size_t) f] = p;
+                    res[(size_t) p] = f;
+                    vlru.touch(f);
+                    evict_one(pj);   // the pool stays full
+                    return f;
+                }
                 int32_t sl = vlru.tail;
                 while (sl >= 0 && slot_pair[(size_t) sl] >= 0 && in_sel(slot_pair[(size_t) sl])) sl = vlru.prev[(size_t) sl];
-                if (slot_pair[(size_t) sl] >= 0) res[(size_t) slot_pair[(size_t) sl]] = -1;
+                const int32_t vv = slot_pair[(size_t) sl];
+                if (excl && vv >= 0 && !tier.has_copy(vv / kNE, vv % kNE)) {   // write it back before the slot is reused
+                    if (tier.spares() == 0) {
+                        const int32_t v = ram_victim(pj);
+                        if (v >= 0) { tier.promote_done(v / kNE, v % kNE); rlru.remove(v); }
+                    }
+                    if (uint8_t* d = tier.demote_begin(vv / kNE, vv % kNE)) {
+                        CK(cudaMemcpyAsync(d, vslot[(size_t) sl], XL.bytes, cudaMemcpyDeviceToHost, s));
+                        tier.demote_commit(vv / kNE, vv % kNE);
+                        rlru.touch(vv);
+                        ++writebacks;
+                    }
+                }
+                if (vv >= 0) res[(size_t) vv] = -1;
                 slot_pair[(size_t) sl] = p;
                 res[(size_t) p] = sl;
                 vlru.touch(sl);
@@ -1442,6 +1537,9 @@ struct Engine {
             }
             pf_vn = 0;
             if (pf_pending) { CK(cudaStreamWaitEvent(s, ev_pf, 0)); pf_pending = false; }
+            for (const int32_t q : pending_free)   // their copies to VRAM ran before this layer's router
+                if (res[(size_t) q] >= 0 && tier.has_copy(q / kNE, q % kNE)) { tier.promote_done(q / kNE, q % kNE); rlru.remove(q); }
+            pending_free.clear();
             int pfj[kK];   // the prefetch job already reading j's expert, or -1: it lands like a critical read
             for (int j = 0; j < kK; ++j) {
                 pfj[j] = -1;
@@ -1499,7 +1597,7 @@ struct Engine {
                 CK(cudaMemcpyAsync(vslot[(size_t) sl], b, XL.bytes, cudaMemcpyHostToDevice, s));
                 if (!in_ram) CK(cudaStreamSynchronize(s));   // a mapped-file page, not ours to keep
                 gp[j] = (unsigned long long) vslot[(size_t) sl];
-                if (in_ram) { rlru.touch(pj[j]); ++ts.ram; } else ++ts.file;
+                if (in_ram) { rlru.touch(pj[j]); ++ts.ram; if (excl) pending_free.push_back(pj[j]); } else ++ts.file;
             }
             prefetch_commit_landed(pj);
             // the next layer's predicted experts on the disk (low priority), after this layer's work is queued
@@ -1536,6 +1634,7 @@ struct Engine {
                 CK(cudaMemcpyAsync(vslot[(size_t) sl], tier.stable_blob(m, hid[j]), XL.bytes, cudaMemcpyHostToDevice, s));
                 gp[j] = (unsigned long long) vslot[(size_t) sl];
                 ++ts.file;
+                if (excl) pending_free.push_back(pj[j]);
             }
             for (int j = 0; j < kK; ++j) {   // the disk reads, as they land
                 if (dslot[j] == nullptr) continue;
@@ -1550,6 +1649,7 @@ struct Engine {
                 CK(cudaMemcpyAsync(vslot[(size_t) sl], dslot[j] + pad, XL.bytes, cudaMemcpyHostToDevice, s));
                 gp[j] = (unsigned long long) vslot[(size_t) sl];
                 ++ts.file;
+                if (excl) pending_free.push_back(pj[j]);
             }
             if (pf) {   // the next layer's predicted RAM experts into VRAM, on cs, behind all of this layer's copies
                 const int mn = m + 1;
@@ -1699,7 +1799,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> mirrors;
     double cpu_share = 0;
     int cpu_threads = 14;
-    bool no_prefetch = false, dense_bf16 = false, prompt_f32 = false;
+    bool no_prefetch = false, dense_bf16 = false, prompt_f32 = false, ram_exclusive = false;
     int pf_copies = 0, pf_reads = 4;
     long long rebalance_vram = 32, rebalance_ram = 64;
     for (int i = 1; i < argc; ++i) {
@@ -1728,6 +1828,7 @@ int main(int argc, char** argv) {
         else if (a == "--pf-reads") pf_reads = std::atoi(next().c_str());
         else if (a == "--dense-bf16") dense_bf16 = true;
         else if (a == "--prompt-f32") prompt_f32 = true;
+        else if (a == "--ram-exclusive") ram_exclusive = true;
         else if (a == "--rebalance-moves") { rebalance_vram = std::atoll(next().c_str()); rebalance_ram = 2 * rebalance_vram; }
         else { std::fprintf(stderr, "strata-glm: unknown argument %s\n", a.c_str()); return 2; }
     }
@@ -1755,6 +1856,7 @@ int main(int argc, char** argv) {
     e.max_ctx = max_ctx;
     e.dense_fp8 = !dense_bf16;
     e.lru = policy == "lru";
+    e.excl = ram_exclusive;
     e.mirrors = mirrors;
     e.cpu_share = cpu_share;
     e.cpu_threads = cpu_threads;
@@ -1850,6 +1952,7 @@ int main(int argc, char** argv) {
         for (int d = 0; d < e.reader.drives(); ++d) std::fprintf(stderr, "%s drive %d: %lld", d ? "," : ";", d, e.reader.reads(d));
         std::fprintf(stderr, ")\n");
     }
+    if (e.excl && steps > 0) std::fprintf(stderr, "strata-glm: exclusive tiers: %.1f writebacks a token\n", (double) e.writebacks / steps);
     if (e.prefetch && e.pf_reads > 0)
         std::fprintf(stderr, "strata-glm: prefetch: %lld disk reads for the next layer, %.1f%% of them routed there; "
                              "%lld copies RAM -> VRAM, %.1f%% routed there\n", e.pf_reads, 100.0 * e.pf_used / e.pf_reads,
