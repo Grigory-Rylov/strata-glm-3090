@@ -173,6 +173,9 @@ def dsa(x, w: W, p, cfg):
     return o @ w.t(p + "o_proj.weight").t()
 
 
+MARGINS = {}
+
+
 def moe(x, w: W, p, cfg, layer):
     T = x.shape[0]
     lim = cfg["swiglu_limit"]
@@ -180,6 +183,8 @@ def moe(x, w: W, p, cfg, layer):
     scores = torch.sigmoid(logits)
     choice = scores + w.t(p + "gate.e_score_correction_bias")
     top = choice.topk(cfg["num_experts_per_tok"], dim=-1).indices                    # [T, 8]
+    s9 = choice.topk(cfg["num_experts_per_tok"] + 1, dim=-1).values
+    MARGINS[layer] = (s9[:, -2] - s9[:, -1]).cpu().numpy()                           # 8th minus 9th choice
     wt = scores.gather(1, top)
     wt = wt / (wt.sum(-1, keepdim=True) + 1e-20) * cfg["routed_scaling_factor"]
     out = torch.zeros_like(x)
@@ -254,6 +259,7 @@ def main() -> int:
           [round(v, 3) for v in top5.values.tolist()]))), flush=True)
     if a.dump_dir:
         np.save(pathlib.Path(a.dump_dir) / "routes.npy", np.stack([routes[l] for l in sorted(routes)]))
+        np.save(pathlib.Path(a.dump_dir) / "margins.npy", np.stack([MARGINS[l] for l in sorted(MARGINS)]))
     return 0
 
 

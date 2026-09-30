@@ -1825,12 +1825,12 @@ uint8_t* TieredExpertSource::demote_begin(int64_t layer, int64_t expert) {
     return base_ + (uint64_t) s * stride_;
 }
 
-void TieredExpertSource::demote_commit(int64_t layer, int64_t expert) {
+void TieredExpertSource::demote_commit(int64_t layer, int64_t expert, size_t pad) {
     if (layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return;
     const size_t i = idx(layer, expert);
     if (pending_[i] < 0) return;
     slot_of_[i] = pending_[i];
-    host_[i] = base_ + (uint64_t) pending_[i] * stride_;
+    host_[i] = base_ + (uint64_t) pending_[i] * stride_ + pad;
     pending_[i] = -1;
     if (!rank_.empty()) {
         heap_.emplace_back(i < rank_.size() ? rank_[i] : INT32_MAX, (int32_t) i);
@@ -1860,6 +1860,60 @@ void TieredExpertSource::promote_done(int64_t layer, int64_t expert) {
     host_[i] = nullptr;
     free_.push_back(slot_of_[i]);
     slot_of_[i] = -1;
+}
+
+void TieredExpertSource::rerank(std::vector<int32_t> rank) {
+    rank_ = std::move(rank);
+    heap_.clear();
+    for (size_t p = 0; p < host_.size(); ++p)
+        if (slot_of_[p] >= 0 && host_[p] != nullptr) heap_.emplace_back(p < rank_.size() ? rank_[p] : INT32_MAX, (int32_t) p);
+    std::make_heap(heap_.begin(), heap_.end());
+}
+
+int64_t TieredExpertSource::admit_from_file(const std::vector<std::pair<int32_t, int32_t>>& pairs, int threads,
+                                            std::string& err) {
+#if defined(_WIN32)
+    // the slots first (demote_begin is not thread-safe), then the reads in parallel straight into them
+    std::vector<std::pair<int32_t, int32_t>> go;
+    std::vector<uint8_t*> dst;
+    for (const auto& p : pairs) {
+        if (p.first < 0 || p.second < 0 || p.first >= n_layers_ || p.second >= n_expert_) continue;
+        uint8_t* d = demote_begin(p.first, p.second);
+        if (d == nullptr) continue;
+        go.push_back(p);
+        dst.push_back(d);
+    }
+    if (go.empty()) return 0;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    std::vector<uint8_t> ok(go.size(), 0);
+    std::atomic<size_t> next{0};
+    auto worker = [&] {
+        HANDLE h = open_unbuffered(path_);
+        if (h == INVALID_HANDLE_VALUE) return;
+        for (size_t j; (j = next.fetch_add(1)) < go.size();)
+            ok[j] = read_blob_window(h, file_offset(go[j].first, go[j].second), lay.blob_bytes(go[j].first), dst[j]) ? 1 : 0;
+        CloseHandle(h);
+    };
+    std::vector<std::thread> pool;
+    for (int t = 1; t < std::max(1, threads); ++t) pool.emplace_back(worker);
+    worker();
+    for (auto& t : pool) t.join();
+    int64_t n = 0;
+    for (size_t j = 0; j < go.size(); ++j) {
+        if (ok[j]) {
+            demote_commit(go[j].first, go[j].second, (size_t) (file_offset(go[j].first, go[j].second) % kSector));
+            ++n;
+        } else {
+            demote_abort(go[j].first, go[j].second);
+        }
+    }
+    if (n < (int64_t) go.size()) err = "TieredExpertSource: " + std::to_string(go.size() - (size_t) n) + " reads failed";
+    return n;
+#else
+    (void) pairs; (void) threads;
+    err = "TieredExpertSource: the low-RAM tier is Windows-only for now";
+    return 0;
+#endif
 }
 
 }  // namespace strata::core

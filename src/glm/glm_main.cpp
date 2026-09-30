@@ -1,32 +1,253 @@
-// src/glm/glm_main.cpp - strata-glm, M1: GLM-5.3-Flash NVFP4 decoded one token at a time, correct before fast.
+// src/glm/glm_main.cpp - strata-glm: GLM-5.3-Flash NVFP4 on one GPU, its routed experts in VRAM, RAM and on disk.
 //
 //   strata-glm --pack <dir from tools/glm_pack.py> --tokens <ids> [--max-new N] [--max-context C]
-//              [--dump-dir d] [--dump-logits f]
+//              [--chunk T] [--profile P [--vram-experts N] [--ram-gib G] [--ram-reserve-gib R]]
+//              [--dump-dir d] [--dump-logits f] [--routes f]
 //
 // Dense weights are read from the checkpoint's safetensors (the pack's dense.txt says where) into VRAM as BF16
-// (the leading dense MLP layers decoded from NVFP4 to FP32). Each MoE layer's 8 routed experts are read from the
-// pack's experts.bin and computed by Strata's NVFP4 expert kernel with FP32 activations (native_expert_grouped_f32).
+// (the leading dense MLP layers decoded from NVFP4 to FP32). Each MoE layer's 8 routed experts are computed by
+// Strata's NVFP4 expert kernel with FP32 activations (native_expert_grouped_f32). With --profile (tools/
+// glm_profile.py) the hottest experts live in VRAM, the next ones in pinned RAM (TieredExpertSource) and the rest
+// are read from the pack's experts.bin as they are routed; without it every expert is read from the file.
 // --dump-dir writes, at the last prompt token, every layer's output streams (l%02d.f32) - what tools/glm_ref.py
 // --dump-dir writes - and --dump-logits the next token's logits.
 #include "glm_gemm.cuh"
 #include "glm_kernels.cuh"
+#include "strata/core/expert_cache.hpp"
+#include "strata/core/expert_source.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
 #include <cuda_runtime.h>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
+
+// Unbuffered reads of experts.bin into 4 KiB-aligned destinations (the RAM tier's slots). A blob is split into
+// kParts pieces so a single expert keeps several requests in flight; the blob lands at dst + offset % 4096. With
+// identical copies on several drives (--mirror) each blob goes to the drive whose queue drains first at its speed.
+class DiskReader {
+public:
+    static constexpr int kParts = 4, kJobs = 16, kDrives = 4;
+    ~DiskReader() { close(); }
+    /// paths: identical copies of experts.bin; gbps: each one's read rate (GB/s), for the balance
+    bool open(const std::vector<std::string>& paths, const std::vector<double>& gbps, int threads) {
+#if defined(_WIN32)
+        nd_ = (int) std::min<size_t>(paths.size(), kDrives);
+        for (int d = 0; d < nd_; ++d) {
+            const int n = MultiByteToWideChar(CP_UTF8, 0, paths[(size_t) d].c_str(), -1, nullptr, 0);
+            path_[d].assign((size_t) std::max(n, 1), L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, paths[(size_t) d].c_str(), -1, path_[d].data(), n);
+            gbps_[d] = d < (int) gbps.size() ? gbps[(size_t) d] : 1.0;
+            queued_[d].store(0);
+            for (int t = 0; t < threads; ++t) th_.emplace_back([this, d] { loop(d); });
+        }
+        for (int i = 0; i < kJobs; ++i) { left_[i].store(0); bad_[i].store(0); }
+        return nd_ > 0;
+#else
+        (void) paths; (void) gbps; (void) threads;
+        return false;
+#endif
+    }
+    void start(int job, uint64_t off, uint64_t bytes, uint8_t* dst) {
+        const uint64_t a0 = off / 4096 * 4096, len = (off - a0 + bytes + 4095) / 4096 * 4096;
+        const int parts = kParts * std::max(1, nd_ - 0) + (nd_ > 1 ? 2 : 0);   // one drive: 4; two: 10 (6 + 4)
+        const uint64_t piece = (len / (uint64_t) parts + 4095) / 4096 * 4096;
+        int n = 0;
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            bad_[job].store(0);
+            left_[job].store(1 << 30);   // held until every piece is queued
+            for (uint64_t at = 0; at < len; at += piece, ++n) {
+                const uint32_t pl = (uint32_t) std::min(piece, len - at);
+                int d = 0;   // each piece to the drive whose queue (with it) drains first
+                for (int x = 1; x < nd_; ++x)
+                    if ((queued_[x].load() + (double) pl) / gbps_[x] < (queued_[d].load() + (double) pl) / gbps_[d]) d = x;
+                q_[d].push_back({a0 + at, pl, dst + at, job});
+                queued_[d].fetch_add((long long) pl);
+                ++reads_[d];
+            }
+            left_[job].store(n, std::memory_order_release);
+        }
+        cv_.notify_all();
+    }
+    bool wait(int job) {
+        while (left_[job].load(std::memory_order_acquire) > 0) std::this_thread::yield();
+        return bad_[job].load() == 0;
+    }
+    long long reads(int d) const { return reads_[d]; }
+    int drives() const { return nd_; }
+    void close() {
+        { std::lock_guard<std::mutex> g(mu_); quit_ = true; }
+        cv_.notify_all();
+        for (auto& t : th_) t.join();
+        th_.clear();
+    }
+
+private:
+    struct Piece { uint64_t off; uint32_t len; uint8_t* dst; int job; };
+    void loop(int d) {
+#if defined(_WIN32)
+        HANDLE h = CreateFileW(path_[d].c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, nullptr);
+        for (;;) {
+            Piece p{};
+            {
+                std::unique_lock<std::mutex> g(mu_);
+                cv_.wait(g, [&] { return quit_ || !q_[d].empty(); });
+                if (quit_ && q_[d].empty()) break;
+                p = q_[d].front();
+                q_[d].pop_front();
+            }
+            OVERLAPPED ov{};
+            ov.Offset = (DWORD) p.off;
+            ov.OffsetHigh = (DWORD) (p.off >> 32);
+            DWORD got = 0;
+            const bool ok = h != INVALID_HANDLE_VALUE && ReadFile(h, p.dst, p.len, &got, &ov) && got == p.len;
+            if (!ok) bad_[p.job].store(1);
+            queued_[d].fetch_sub((long long) p.len);
+            left_[p.job].fetch_sub(1, std::memory_order_acq_rel);
+        }
+        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+#endif
+    }
+    int nd_ = 0;
+    std::wstring path_[kDrives];
+    double gbps_[kDrives] = {};
+    std::atomic<long long> queued_[kDrives];
+    long long reads_[kDrives] = {};
+    std::vector<std::thread> th_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<Piece> q_[kDrives];
+    std::atomic<int> left_[kJobs], bad_[kJobs];
+    bool quit_ = false;
+};
+
+// The CPU's share of a decode layer's RAM experts: Strata's NVFP4 rows (AVX-512, activations as q8) straight from
+// the pinned tier, while the GPU copies its own share over PCIe. Work units are blocks of rows, gate/up first,
+// then (after the last gate/up block quantizes every expert's hidden) down; the workers spin between layers.
+class CpuExperts {
+public:
+    static constexpr int kMax = 8, kGuRows = 64, kDownRows = 128;
+    ~CpuExperts() { stop(); }
+    void init(int threads, const strata::kernels::cpu::NativeFmt& f) {
+        f_ = f;
+        act_.resize(f.act_bytes + 64);
+        for (int e = 0; e < kMax; ++e) { ff_[e].assign((size_t) f.n_ff, 0.f); hq_[e].resize(f.h_bytes + 64); }
+        for (int t = 0; t < threads; ++t) th_.emplace_back([this] { loop(); });
+    }
+    bool ready() const { return !th_.empty(); }
+    /// starts the n experts (blobs in host memory) on x (n_embd floats); out[e] holds each one's output after wait()
+    void start(const float* x, const uint8_t* const* blobs, float* const* out, int n) {
+        strata::kernels::cpu::native_quant_act(f_, x, act_.data());
+        n_ = n;
+        for (int e = 0; e < n; ++e) { blob_[e] = blobs[e]; out_[e] = out[e]; }
+        ua_ = (int) (f_.n_ff / kGuRows);
+        ub_ = (int) (f_.n_embd / kDownRows);
+        next_a_.store(0); done_a_.store(0); next_b_.store(0); done_b_.store(0);
+        phase_b_.store(false); finished_.store(n == 0);
+        gen_.fetch_add(1, std::memory_order_release);
+    }
+    void wait() { while (!finished_.load(std::memory_order_acquire)) std::this_thread::yield(); }
+    void stop() {
+        quit_.store(true);
+        for (auto& t : th_) t.join();
+        th_.clear();
+    }
+
+private:
+    void loop() {
+        namespace kc = strata::kernels::cpu;
+        int seen = 0;
+        for (;;) {
+            int g;
+            while ((g = gen_.load(std::memory_order_acquire)) == seen) {
+                if (quit_.load(std::memory_order_relaxed)) return;
+                std::this_thread::yield();
+            }
+            seen = g;
+            const int na = n_ * ua_, nb = n_ * ub_;
+            for (int u; (u = next_a_.fetch_add(1)) < na;) {
+                const int e = u / ua_, r0 = (u % ua_) * kGuRows;
+                const void* a = act_.data();
+                float* ff = ff_[e].data();
+                kc::native_gu_rows(f_, blob_[e], &a, 1, &ff, r0, r0 + kGuRows);
+                if (done_a_.fetch_add(1) + 1 == na) {   // the last gate/up block: every hidden is complete
+                    for (int x = 0; x < n_; ++x) kc::native_quant_h(f_, ff_[x].data(), hq_[x].data());
+                    phase_b_.store(true, std::memory_order_release);
+                }
+            }
+            while (na > 0 && !phase_b_.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (int u; (u = next_b_.fetch_add(1)) < nb;) {
+                const int e = u / ub_, r0 = (u % ub_) * kDownRows;
+                const void* h = hq_[e].data();
+                float* o = out_[e];
+                kc::native_down_rows(f_, blob_[e], &h, 1, &o, r0, r0 + kDownRows);
+                if (done_b_.fetch_add(1) + 1 == nb) finished_.store(true, std::memory_order_release);
+            }
+        }
+    }
+    strata::kernels::cpu::NativeFmt f_;
+    std::vector<std::thread> th_;
+    std::vector<uint8_t> act_;
+    std::vector<float> ff_[kMax];
+    std::vector<uint8_t> hq_[kMax];
+    const uint8_t* blob_[kMax] = {};
+    float* out_[kMax] = {};
+    int n_ = 0, ua_ = 1, ub_ = 1;
+    std::atomic<int> gen_{0}, next_a_{0}, done_a_{0}, next_b_{0}, done_b_{0};
+    std::atomic<bool> phase_b_{false}, finished_{true}, quit_{false};
+};
+
+// least recently used order over ids 0..n-1 (intrusive: most recent at head)
+struct Lru {
+    std::vector<int32_t> prev, next;
+    std::vector<uint8_t> in;
+    int32_t head = -1, tail = -1;
+    void init(size_t n) { prev.assign(n, -1); next.assign(n, -1); in.assign(n, 0); head = tail = -1; }
+    void remove(int32_t x) {
+        if (!in[(size_t) x]) return;
+        const int32_t p = prev[(size_t) x], q = next[(size_t) x];
+        (p >= 0 ? next[(size_t) p] : head) = q;
+        (q >= 0 ? prev[(size_t) q] : tail) = p;
+        in[(size_t) x] = 0;
+    }
+    void touch(int32_t x) {
+        remove(x);
+        prev[(size_t) x] = -1;
+        next[(size_t) x] = head;
+        if (head >= 0) prev[(size_t) head] = x;
+        head = x;
+        if (tail < 0) tail = x;
+        in[(size_t) x] = 1;
+    }
+};
 
 // ---- GLM-5.3-Flash (config.json; checked against it at start)
 constexpr int kLayers = 45, kDenseLead = 3, kEmbd = 4096, kHc = 4, kVocab = 154880;
@@ -155,8 +376,305 @@ struct Engine {
     void* c_xscratch = nullptr;
     glm::bf16* c_emb = nullptr;
     static constexpr int kSelLd = kIdxTopk + kKpool;
+    // ---- the expert tiers (--profile); pairs are (MoE layer = l - kDenseLead, expert), as in experts.bin
+    static constexpr int kMoe = kLayers - kDenseLead;
+    strata::core::TieredExpertSource tier;
+    bool tiered = false;
+    std::vector<int32_t> res;                                       // per pair: its VRAM slot, or -1
+    std::vector<uint8_t*> vslot;
+    std::vector<int32_t> slot_pair;                                 // per VRAM slot: its pair
+    static constexpr int kStage = 32;                               // staging slots: a layer's misses (decode: kK)
+    uint8_t* stage = nullptr;
+    unsigned long long* gp_host = nullptr;                          // pinned, kK blob pointers per MoE layer
+    struct TierStats { long long vram = 0, ram = 0, file = 0, cpu = 0; double file_wait_s = 0; } ts;
+    // what this conversation routes to: per pair, a count decayed by half every kHalfLife tokens (at each
+    // rebalance); the tiers follow it, the startup profile only breaks ties
+    static constexpr double kHalfLife = 1024;
+    std::vector<float> heat;
+    std::vector<int32_t> prior;
+    long long heat_tokens = 0;
+    // --policy lru (default): during decode VRAM caches RAM and RAM caches the disk, both least recently used.
+    // A RAM hit is copied into VRAM anyway, so it lands in a VRAM slot (RAM keeps its copy: evicting from VRAM
+    // is free); a disk hit is read anyway, so it lands in a RAM slot (of the least recent member outside VRAM).
+    bool lru = true;
+    Lru vlru, rlru;                                                  // over VRAM slots; over pairs (RAM members)
+    DiskReader reader;
+    std::vector<std::string> mirrors;                                // identical copies of experts.bin (--mirror)
+    // --cpu-share F: the fraction of a decode layer's RAM hits the CPU computes (CpuExperts) instead of the GPU
+    double cpu_share = 0, cpu_acc = 0;
+    int cpu_threads = 14;
+    CpuExperts cpux;
+    float* x_host = nullptr;                                         // pinned: the layer's normed activation
+    float* cpu_rows = nullptr;                                       // pinned: kK rows of kEmbd
+    int32_t* hid_pin = nullptr;                                      // pinned: the router's ids
+    unsigned long long* gq_host = nullptr;                           // pinned, per MoE layer: the GPU's blobs
+    int32_t* ge_host = nullptr;                                      // pinned, per MoE layer: their rows, then the count
+    int32_t* d_ent = nullptr;                                        // device: kK rows + the count
+    cudaEvent_t ev_ids = nullptr;
+    // GLM_PREDICT=1 (measurement): layer l+1's experts predicted by its own hc_pre, norm and router applied to the
+    // streams (A) as layer l's router sees them, (B) after layer l; scored against what layer l+1 then routes
+    bool predict = false;
+    bool prefetch = true;                                            // --no-prefetch: off
+    int32_t* pf_ids = nullptr;                                       // pinned: layer l+1's predicted ids
+    cudaEvent_t ev_pred = nullptr;
+    // disk reads started for the next layer: (pair, RAM slot) per reader job kK + i
+    int pf_n = 0;
+    int32_t pf_pair[kK];
+    uint8_t* pf_dst[kK];
+    long long pf_reads = 0, pf_used = 0;
+    void predict_enqueue(int l) {   // layer l's experts from the current streams, on the stream, into pf_ids
+        using namespace glm;
+        Layer& ly = L[(size_t) l];
+        gemv_bf16(ly.hc_ffn_fn, streams, p_mix, 24, kHc * kEmbd, 1, s);
+        hc_pre_finish(streams, p_mix, ly.hc_ffn_base, ly.hc_ffn_scale, kEmbd, kEps, kHcEps, kSinkhorn, p_x, p_post, p_comb, s);
+        rmsnorm(p_x, ly.post_norm, kEps, p_xn, kEmbd, 1, s);
+        gemv_bf16(ly.router, p_xn, p_log, kNE, kEmbd, 1, s);
+        route_topk(p_log, ly.router_bias, kNE, kK, kRouteScale, p_ids, p_wts, s);
+        CK(cudaMemcpyAsync(pf_ids, p_ids, kK * sizeof(int32_t), cudaMemcpyDeviceToHost, s));
+        CK(cudaEventRecord(ev_pred, s));
+    }
+    void prefetch_commit() {   // the previous layer's prefetch reads: into the RAM tier, used or not
+        for (int i = 0; i < pf_n; ++i) {
+            const int32_t q = pf_pair[i];
+            if (!reader.wait(kK + i)) { std::fprintf(stderr, "strata-glm: a prefetch read failed\n"); std::exit(1); }
+            tier.demote_commit(q / kNE, q % kNE, (size_t) (strata::kernels::cpu::expert_layout().blob_offset(q / kNE, q % kNE) % 4096));
+            rlru.touch(q);
+        }
+        pf_n = 0;
+    }
+    float *p_mix = nullptr, *p_x = nullptr, *p_xn = nullptr, *p_post = nullptr, *p_comb = nullptr, *p_log = nullptr, *p_wts = nullptr;
+    int32_t* p_ids = nullptr;
+    int32_t pred[2][kLayers][kK];
+    bool pred_ok[2][kLayers] = {};
+    long long pred_hit[2] = {}, pred_n[2] = {}, pred_miss_hit[2] = {}, pred_miss_n[2] = {};
+    void predict_init() {
+        predict = std::getenv("GLM_PREDICT") != nullptr;
+        prefetch = prefetch && tiered && lru && !predict;
+        if (!predict && !prefetch) return;
+        CK(cudaMallocHost(&pf_ids, kK * sizeof(int32_t)));
+        CK(cudaEventCreateWithFlags(&ev_pred, cudaEventDisableTiming));
+        auto buf = [&](size_t n) { float* q = nullptr; CK(cudaMalloc(&q, n * sizeof(float))); return q; };
+        p_mix = buf(32); p_x = buf(kEmbd); p_xn = buf(kEmbd); p_post = buf(4); p_comb = buf(16); p_log = buf(kNE); p_wts = buf(kK);
+        CK(cudaMalloc(&p_ids, kK * sizeof(int32_t)));
+    }
+    void predict_layer(int v, int l) {   // layer l's experts from the current streams, into pred[v][l]
+        using namespace glm;
+        if (!predict || l >= kLayers || l < kDenseLead) return;
+        Layer& ly = L[(size_t) l];
+        gemv_bf16(ly.hc_ffn_fn, streams, p_mix, 24, kHc * kEmbd, 1, s);
+        hc_pre_finish(streams, p_mix, ly.hc_ffn_base, ly.hc_ffn_scale, kEmbd, kEps, kHcEps, kSinkhorn, p_x, p_post, p_comb, s);
+        rmsnorm(p_x, ly.post_norm, kEps, p_xn, kEmbd, 1, s);
+        gemv_bf16(ly.router, p_xn, p_log, kNE, kEmbd, 1, s);
+        route_topk(p_log, ly.router_bias, kNE, kK, kRouteScale, p_ids, p_wts, s);
+        CK(cudaMemcpyAsync(pred[v][l], p_ids, kK * sizeof(int32_t), cudaMemcpyDeviceToHost, s));
+        CK(cudaStreamSynchronize(s));
+        pred_ok[v][l] = true;
+    }
+    void predict_score(int l, const int32_t* hid) {
+        if (!predict) return;
+        const int m = l - kDenseLead;
+        for (int v = 0; v < 2; ++v) {
+            if (!pred_ok[v][l]) continue;
+            for (int j = 0; j < kK; ++j) {
+                bool hit = false;
+                for (int i = 0; i < kK; ++i) hit |= pred[v][l][i] == hid[j];
+                pred_hit[v] += hit;
+                ++pred_n[v];
+                if (tiered && res[(size_t) m * kNE + (size_t) hid[j]] < 0) { pred_miss_hit[v] += hit; ++pred_miss_n[v]; }
+            }
+            pred_ok[v][l] = false;
+        }
+    }
+    void lru_rebuild(const std::vector<int32_t>& hot_first) {        // recency = the heat ranking
+        vlru.init(vslot.size());
+        rlru.init((size_t) kMoe * kNE);
+        for (size_t s = 0; s < vslot.size(); ++s) if (slot_pair[s] < 0) vlru.touch((int32_t) s);   // empty: the tail
+        for (size_t i = hot_first.size(); i-- > 0;) {                                              // the hottest last
+            const int32_t p = hot_first[i];
+            if (res[(size_t) p] >= 0) vlru.touch(res[(size_t) p]);
+            if (tier.has_copy(p / kNE, p % kNE)) rlru.touch(p);
+        }
+    }
+    // GLM_TIMING=1: per decode token, the MoE layers' expert copies (incl. waiting for the disk) and kernels
+    bool timing = false;
+    std::vector<cudaEvent_t> tev;                                   // per MoE layer: before copies, kernel, done
+    struct Timing { double tok_s = 0, copy_ms = 0, kernel_ms = 0; long long tokens = 0; } tm;
+    void timing_init() {
+        timing = std::getenv("GLM_TIMING") != nullptr;
+        if (!timing) return;
+        tev.resize((size_t) kMoe * 3);
+        for (auto& ev : tev) CK(cudaEventCreate(&ev));
+    }
+    void timing_token(double wall_s) {   // after forward() has synchronized
+        if (!timing || !tiered) return;
+        for (int m = 0; m < kMoe; ++m) {
+            float a = 0, b = 0;
+            CK(cudaEventElapsedTime(&a, tev[(size_t) m * 3], tev[(size_t) m * 3 + 1]));
+            CK(cudaEventElapsedTime(&b, tev[(size_t) m * 3 + 1], tev[(size_t) m * 3 + 2]));
+            tm.copy_ms += a;
+            tm.kernel_ms += b;
+        }
+        tm.tok_s += wall_s;
+        ++tm.tokens;
+    }
+    void note(int m, const int32_t* ids, size_t n) {
+        float* h = heat.data() + (size_t) m * kNE;
+        for (size_t i = 0; i < n; ++i) h[ids[i]] += 1.f;
+    }
 
-    void init_chunk(int T) {
+    void init_tier(const std::string& pack, const std::string& profile_path, long long vram_experts, double ram_gib,
+                   double ram_reserve_gib, double vram_reserve_mib) {
+        std::string err;
+        std::vector<std::pair<int32_t, int32_t>> profile;
+        int64_t pslots = 0;
+        if (!strata::kernels::cpu::expert_layout_load(pack, kMoe, kNE, err) || !tier.open(pack, kMoe, kNE, err) ||
+            !strata::core::read_expert_profile(profile_path, kMoe, kNE, profile, pslots, err)) {
+            std::fprintf(stderr, "strata-glm: %s\n", err.c_str());
+            std::exit(1);
+        }
+        CK(cudaMalloc(&stage, (size_t) kStage * XL.bytes));
+        CK(cudaMallocHost(&x_host, kEmbd * sizeof(float)));
+        CK(cudaMallocHost(&cpu_rows, (size_t) kK * kEmbd * sizeof(float)));
+        CK(cudaMallocHost(&gq_host, (size_t) kMoe * kK * sizeof(unsigned long long)));
+        CK(cudaMallocHost(&ge_host, (size_t) kMoe * (kK + 1) * sizeof(int32_t)));
+        CK(cudaMalloc(&d_ent, (kK + 1) * sizeof(int32_t)));
+        CK(cudaMallocHost(&gp_host, (size_t) kMoe * kK * sizeof(unsigned long long)));
+        heat.assign((size_t) kMoe * kNE, 0.f);
+        prior.assign((size_t) kMoe * kNE, INT32_MAX);
+        for (size_t r = 0; r < profile.size(); ++r) prior[(size_t) profile[r].first * kNE + (size_t) profile[r].second] = (int32_t) r;
+        // VRAM: the profile's head, as many slots as the free memory holds after the reserve
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+        const size_t keep = (size_t) (vram_reserve_mib * 1048576.0);
+        long long nv = vram_experts >= 0 ? vram_experts : (long long) (fr > keep ? (fr - keep) / XL.bytes : 0);
+        nv = std::min<long long>(nv, (long long) profile.size());
+        constexpr int kBlock = 32;   // slots per allocation: WDDM places smaller blocks more readily
+        for (long long i = 0; i < nv; i += kBlock) {
+            const long long n = std::min<long long>(kBlock, nv - i);
+            uint8_t* p = nullptr;
+            if (cudaMalloc(&p, (size_t) n * XL.bytes) != cudaSuccess) { (void) cudaGetLastError(); break; }
+            for (long long j = 0; j < n; ++j) vslot.push_back(p + (size_t) j * XL.bytes);
+        }
+        nv = (long long) vslot.size();
+        res.assign((size_t) kMoe * kNE, -1);
+        // RAM: the next pairs by rank, as many as the budget holds; the rest stay in experts.bin
+        const uint64_t avail = strata::core::available_ram_bytes();
+        const uint64_t rkeep = (uint64_t) (ram_reserve_gib * 1073741824.0);
+        uint64_t budget = avail > rkeep ? avail - rkeep : 0;
+        if (ram_gib >= 0) budget = std::min<uint64_t>(budget, (uint64_t) (ram_gib * 1073741824.0));
+        const std::vector<std::pair<int32_t, int32_t>> order(profile.begin() + nv, profile.end());
+        if (!tier.load(order, budget, 0, 16, err)) { std::fprintf(stderr, "strata-glm: %s\n", err.c_str()); std::exit(1); }
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::vector<std::pair<int32_t, int32_t>> head(profile.begin(), profile.begin() + nv);
+        slot_pair.assign(vslot.size(), -1);
+        if (!tier.stream(head, [&](size_t k, const uint8_t* b) {
+                if (cudaMemcpy(vslot[k], b, XL.bytes, cudaMemcpyHostToDevice) != cudaSuccess) return false;
+                res[(size_t) head[k].first * kNE + (size_t) head[k].second] = (int32_t) k;
+                slot_pair[k] = head[k].first * kNE + head[k].second;
+                return true;
+            }, 16, err)) {
+            std::fprintf(stderr, "strata-glm: filling the VRAM tier: %s\n", err.c_str());
+            std::exit(1);
+        }
+        tier.rerank(prior);
+        tier.set_residency(res.data());
+        tiered = true;
+        if (lru) {
+            std::vector<std::string> paths{pack + "/experts.bin"};
+            std::vector<double> gbps{10.0};
+            for (const auto& mp : mirrors) { paths.push_back(mp); gbps.push_back(7.0); }
+            reader.open(paths, gbps, 8);
+            if (cpu_share > 0) cpux.init(cpu_threads, strata::kernels::cpu::expert_layout().fmt[0]);
+            std::vector<int32_t> hot_first;
+            for (const auto& pr : profile) hot_first.push_back(pr.first * kNE + pr.second);
+            lru_rebuild(hot_first);
+        }
+        const double vs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const long long in_ram = tier.tier_members(), rest = (long long) profile.size() - nv - in_ram;
+        std::fprintf(stderr, "strata-glm: experts: %lld in VRAM (%.1f GiB, filled in %.1f s), %lld in RAM (%s), %lld in "
+                             "experts.bin\n", nv, nv * (double) XL.bytes / 1073741824.0, vs, in_ram, tier.note().c_str(),
+                     rest);
+    }
+
+    // The tiers follow the conversation: the hottest pairs by `heat` into VRAM (up to max_vram moves; an expert
+    // leaving VRAM that RAM should hold is copied back first), the next ones into RAM from the file (up to
+    // max_ram reads, each evicting the coldest member). Then the heat decays with the tokens seen since the last one.
+    void rebalance(long long max_vram, long long max_ram, bool verbose) {
+        if (!tiered) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t np = (size_t) kMoe * kNE;
+        auto tier_of = [&](int32_t p) { return res[(size_t) p] >= 0 ? 0 : tier.has_copy(p / kNE, p % kNE) ? 1 : 2; };
+        std::vector<int32_t> order(np);
+        for (size_t i = 0; i < np; ++i) order[i] = (int32_t) i;
+        std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {   // hotter; then where it is (no churn); prior
+            if (heat[(size_t) a] != heat[(size_t) b]) return heat[(size_t) a] > heat[(size_t) b];
+            const int ta = tier_of(a), tb = tier_of(b);
+            if (ta != tb) return ta < tb;
+            return prior[(size_t) a] < prior[(size_t) b];
+        });
+        std::vector<int32_t> rank(np);
+        for (size_t i = 0; i < np; ++i) rank[(size_t) order[i]] = (int32_t) i;
+        tier.rerank(rank);
+        const size_t nv = vslot.size();
+        std::vector<int32_t> in, out;
+        for (size_t i = 0; i < nv; ++i) if (res[(size_t) order[i]] < 0) in.push_back(order[i]);
+        for (size_t i = np; i-- > nv;) if (res[(size_t) order[i]] >= 0) out.push_back(order[i]);   // coldest first
+        const size_t moves = std::min<size_t>({in.size(), out.size(), (size_t) std::max(0LL, max_vram)});
+        std::vector<std::pair<int32_t, int32_t>> from_file;
+        std::vector<int32_t> file_slot;
+        long long demoted = 0, from_ram = 0;
+        for (size_t j = 0; j < moves; ++j) {
+            const int32_t o = out[j], i = in[j], s = res[(size_t) o];
+            res[(size_t) o] = -1;
+            if (!tier.has_copy(o / kNE, o % kNE))
+                if (uint8_t* d = tier.demote_begin(o / kNE, o % kNE)) {
+                    CK(cudaMemcpy(d, vslot[(size_t) s], XL.bytes, cudaMemcpyDeviceToHost));
+                    tier.demote_commit(o / kNE, o % kNE);
+                    ++demoted;
+                }
+            if (tier.has_copy(i / kNE, i % kNE)) {
+                CK(cudaMemcpy(vslot[(size_t) s], tier.stable_blob(i / kNE, i % kNE), XL.bytes, cudaMemcpyHostToDevice));
+                if (!lru) tier.promote_done(i / kNE, i % kNE);   // exclusive: VRAM holds it now, its RAM slot is a spare
+                res[(size_t) i] = s;
+                slot_pair[(size_t) s] = i;
+                ++from_ram;
+            } else {
+                from_file.emplace_back(i / kNE, i % kNE);
+                file_slot.push_back(s);
+            }
+        }
+        std::string err;
+        if (!tier.stream(from_file, [&](size_t k, const uint8_t* b) {
+                if (cudaMemcpy(vslot[(size_t) file_slot[k]], b, XL.bytes, cudaMemcpyHostToDevice) != cudaSuccess) return false;
+                const int32_t p = from_file[k].first * kNE + from_file[k].second;
+                res[(size_t) p] = file_slot[k];
+                slot_pair[(size_t) file_slot[k]] = p;
+                return true;
+            }, 16, err)) {
+            std::fprintf(stderr, "strata-glm: rebalance: %s\n", err.c_str());
+            std::exit(1);
+        }
+        // RAM: the pairs ranked right after VRAM's (lru, inclusive: from the top) that it does not hold, hottest first
+        std::vector<std::pair<int32_t, int32_t>> want;
+        const size_t cap = (size_t) tier.tier_slots(), r0 = lru ? 0 : nv;
+        for (size_t i = r0; i < std::min(np, r0 + cap) && (long long) want.size() < max_ram; ++i) {
+            const int32_t p = order[i];
+            if ((lru || res[(size_t) p] < 0) && !tier.has_copy(p / kNE, p % kNE)) want.emplace_back(p / kNE, p % kNE);
+        }
+        const int64_t admitted = want.empty() ? 0 : tier.admit_from_file(want, 16, err);
+        const float f = (float) std::pow(0.5, (double) heat_tokens / kHalfLife);
+        for (float& h : heat) h *= f;
+        heat_tokens = 0;
+        if (lru) lru_rebuild(order);
+        if (verbose) {
+            const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            std::fprintf(stderr, "strata-glm: rebalance: VRAM %zu in (%lld from RAM, %zu from disk; %lld moved back to "
+                                 "RAM), RAM %lld of %zu read in, %.2f s\n", moves, from_ram, from_file.size(), demoted,
+                         (long long) admitted, want.size(), sec);
+        }
+    }
+
+    void init_chunk(int T, bool whole_layer) {   // whole_layer: no tiers, each layer's 288 experts read at once
         chunk = T;
         gm.init(s, (size_t) T * kMlaH * kR);   // the widest split: the MLA context rows (64 x 512)
         auto buf = [&](size_t n) { float* p = nullptr; CK(cudaMalloc(&p, n * sizeof(float))); return p; };
@@ -178,8 +696,10 @@ struct Engine {
         CK(cudaMalloc(&c_ent_dst, (size_t) T * kK * sizeof(int32_t)));
         CK(cudaMalloc(&c_ent_tok, (size_t) T * kK * sizeof(int32_t)));
         CK(cudaMalloc(&c_emb, (size_t) T * kEmbd * sizeof(glm::bf16)));
-        CK(cudaMalloc(&layer_slots, (size_t) kNE * XL.bytes));
-        CK(cudaMallocHost(&layer_host, (size_t) kNE * XL.bytes));
+        if (whole_layer) {
+            CK(cudaMalloc(&layer_slots, (size_t) kNE * XL.bytes));
+            CK(cudaMallocHost(&layer_host, (size_t) kNE * XL.bytes));
+        }
         CK(cudaMalloc(&c_xscratch, strata::kernels::native_expert_scratch_bytes((int64_t) T * kK, kFF)));
         size_t fr = 0, tot = 0;
         cudaMemGetInfo(&fr, &tot);
@@ -272,38 +792,84 @@ struct Engine {
         gm.w16(ly.su, c_xn, c_t2, kFF, kEmbd, T);
         swiglu_clamp(c_t1, c_t2, c_t3, T * kFF, kSwigluLimit, s);
         gm.w16(ly.sd, c_t3, c_y, kEmbd, kFF, T);
-        // the whole layer's experts into their slots (one sequential read), the tokens grouped by expert
+        // the tokens grouped by expert
         std::vector<int32_t> hid((size_t) T * kK);
         CK(cudaMemcpyAsync(hid.data(), c_ids, hid.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, s));
-        const int m = l - kDenseLead;
-        _fseeki64(experts, (long long) m * kNE * (long long) XL.bytes, SEEK_SET);
-        if (std::fread(layer_host, 1, (size_t) kNE * XL.bytes, experts) != (size_t) kNE * XL.bytes) {
-            std::fprintf(stderr, "strata-glm: short read of layer %d's experts\n", l);
-            std::exit(1);
-        }
-        CK(cudaMemcpyAsync(layer_slots, layer_host, (size_t) kNE * XL.bytes, cudaMemcpyHostToDevice, s));
         CK(cudaStreamSynchronize(s));
+        const int m = l - kDenseLead;
         std::vector<std::vector<int32_t>> by((size_t) kNE);
         for (int i = 0; i < T * kK; ++i) by[(size_t) hid[(size_t) i]].push_back(i);
-        std::vector<unsigned long long> gp;
-        std::vector<int32_t> gs, et, ed;
-        for (int e = 0; e < kNE; ++e) {
-            if (by[(size_t) e].empty()) continue;
-            gp.push_back((unsigned long long) (layer_slots + (size_t) e * XL.bytes));
+        // one kernel over (expert, its blob on the device) groups; each writes only its own entries' rows
+        auto run = [&](const std::vector<std::pair<int, const uint8_t*>>& grp) {
+            if (grp.empty()) return;
+            std::vector<unsigned long long> gp;
+            std::vector<int32_t> gs, et, ed;
+            for (const auto& [e, blob] : grp) {
+                gp.push_back((unsigned long long) blob);
+                gs.push_back((int32_t) et.size());
+                for (const int32_t i : by[(size_t) e]) { et.push_back(i / kK); ed.push_back(i); }
+            }
             gs.push_back((int32_t) et.size());
-            for (const int32_t i : by[(size_t) e]) { et.push_back(i / kK); ed.push_back(i); }
+            const int32_t ng = (int32_t) gp.size();
+            CK(cudaMemcpyAsync(c_grp_ptr, gp.data(), gp.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice, s));
+            CK(cudaMemcpyAsync(c_grp_start, gs.data(), gs.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+            CK(cudaMemcpyAsync(c_ngroups, &ng, sizeof(int32_t), cudaMemcpyHostToDevice, s));
+            CK(cudaMemcpyAsync(c_ent_tok, et.data(), et.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+            CK(cudaMemcpyAsync(c_ent_dst, ed.data(), ed.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+            strata::kernels::native_expert_grouped_f32(XL, c_grp_ptr, c_grp_start, c_ngroups, c_ent_dst, c_ent_tok, ng,
+                                                       (int64_t) T * kK, c_xn, c_xscratch, c_rows, s);
+            CK(cudaStreamSynchronize(s));   // the host vectors above, and the staging slots are free again
+        };
+        if (!tiered) {   // the whole layer's experts into their slots (one sequential read)
+            _fseeki64(experts, (long long) m * kNE * (long long) XL.bytes, SEEK_SET);
+            if (std::fread(layer_host, 1, (size_t) kNE * XL.bytes, experts) != (size_t) kNE * XL.bytes) {
+                std::fprintf(stderr, "strata-glm: short read of layer %d's experts\n", l);
+                std::exit(1);
+            }
+            CK(cudaMemcpyAsync(layer_slots, layer_host, (size_t) kNE * XL.bytes, cudaMemcpyHostToDevice, s));
+            std::vector<std::pair<int, const uint8_t*>> all;
+            for (int e = 0; e < kNE; ++e)
+                if (!by[(size_t) e].empty()) all.emplace_back(e, layer_slots + (size_t) e * XL.bytes);
+            run(all);
+        } else {
+            // the tiers: VRAM's experts in place; RAM's copied in kStage at a time; the disk's read by the tier's
+            // threads and copied in as they arrive
+            note(m, hid.data(), hid.size());
+            std::vector<std::pair<int, const uint8_t*>> resident, batch;
+            std::vector<int> ram;
+            std::vector<std::pair<int32_t, int32_t>> disk;
+            for (int e = 0; e < kNE; ++e) {
+                if (by[(size_t) e].empty()) continue;
+                const int32_t r = res[(size_t) m * kNE + (size_t) e];
+                if (r >= 0) resident.emplace_back(e, vslot[(size_t) r]);
+                else if (tier.has_copy(m, e)) ram.push_back(e);
+                else disk.emplace_back(m, e);
+            }
+            ts.vram += (long long) resident.size();
+            ts.ram += (long long) ram.size();
+            ts.file += (long long) disk.size();
+            run(resident);
+            for (const int e : ram) {
+                uint8_t* dst = stage + batch.size() * XL.bytes;
+                CK(cudaMemcpyAsync(dst, tier.stable_blob(m, e), XL.bytes, cudaMemcpyHostToDevice, s));
+                batch.emplace_back(e, dst);
+                if ((int) batch.size() == kStage) { run(batch); batch.clear(); }
+            }
+            std::string err;
+            if (!tier.stream(disk, [&](size_t k, const uint8_t* b) {
+                    uint8_t* dst = stage + batch.size() * XL.bytes;
+                    if (cudaMemcpyAsync(dst, b, XL.bytes, cudaMemcpyHostToDevice, s) != cudaSuccess ||
+                        cudaStreamSynchronize(s) != cudaSuccess) return false;   // b is valid until this returns
+                    batch.emplace_back(disk[k].second, dst);
+                    if ((int) batch.size() == kStage) { run(batch); batch.clear(); }
+                    return true;
+                }, 16, err)) {
+                std::fprintf(stderr, "strata-glm: layer %d's experts from the disk: %s\n", l, err.c_str());
+                std::exit(1);
+            }
+            run(batch);
         }
-        gs.push_back((int32_t) et.size());
-        const int32_t ng = (int32_t) gp.size();
-        CK(cudaMemcpyAsync(c_grp_ptr, gp.data(), gp.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice, s));
-        CK(cudaMemcpyAsync(c_grp_start, gs.data(), gs.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s));
-        CK(cudaMemcpyAsync(c_ngroups, &ng, sizeof(int32_t), cudaMemcpyHostToDevice, s));
-        CK(cudaMemcpyAsync(c_ent_tok, et.data(), et.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s));
-        CK(cudaMemcpyAsync(c_ent_dst, ed.data(), ed.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s));
-        strata::kernels::native_expert_grouped_f32(XL, c_grp_ptr, c_grp_start, c_ngroups, c_ent_dst, c_ent_tok, ng,
-                                                   (int64_t) T * kK, c_xn, c_xscratch, c_rows, s);
         combine_rows_t(c_rows, c_wts, kK, c_y, kEmbd, T, s);
-        CK(cudaStreamSynchronize(s));   // the host vectors above
         if (routes) routes->push_back({l, hid});
     }
 
@@ -322,6 +888,7 @@ struct Engine {
     // T tokens at positions pos0..: the last one's next-token logits in `logits`
     void forward_chunk(const int* toks, int T, int pos0, const std::string& dump_dir) {
         using namespace glm;
+        heat_tokens += T;
         for (int t = 0; t < T; ++t)
             CK(cudaMemcpyAsync(c_emb + (size_t) t * kEmbd, embed.data() + (size_t) toks[t] * kEmbd, kEmbd * sizeof(bf16),
                                cudaMemcpyHostToDevice, s));
@@ -427,6 +994,8 @@ struct Engine {
         iq = buf(kIdxH * kIdxD); ik = buf(kIdxD); ig = buf(kIdxD); iw = buf(kIdxH); score = buf(max_ctx / kKpool + 1);
         logits = buf(kVocab); rows = buf(kK * kEmbd); wts = buf(kK);
         CK(cudaMalloc(&ids, kK * sizeof(int32_t)));
+        CK(cudaMallocHost(&hid_pin, kK * sizeof(int32_t)));
+        CK(cudaEventCreateWithFlags(&ev_ids, cudaEventDisableTiming));
         CK(cudaMalloc(&sel, (size_t) (kIdxTopk + kKpool) * sizeof(int32_t) + (size_t) max_ctx * sizeof(int32_t)));
         CK(cudaMalloc(&emb_row, kEmbd * sizeof(glm::bf16)));
 
@@ -530,16 +1099,192 @@ struct Engine {
         using namespace glm;
         gemv_bf16(ly.router, xn, tmp1, kNE, kEmbd, 1, s);
         route_topk(tmp1, ly.router_bias, kNE, kK, kRouteScale, ids, wts, s);
-        // the shared expert (BF16, clamped SwiGLU)
+        CK(cudaMemcpyAsync(hid_pin, ids, kK * sizeof(int32_t), cudaMemcpyDeviceToHost, s));
+        if (cpu_share > 0) CK(cudaMemcpyAsync(x_host, xn, kEmbd * sizeof(float), cudaMemcpyDeviceToHost, s));
+        CK(cudaEventRecord(ev_ids, s));
+        const bool pf = prefetch && l + 1 < kLayers;
+        if (pf) predict_enqueue(l + 1);
+        // the shared expert (BF16, clamped SwiGLU): the GPU runs it while the host sorts the routed ones
         gemv_bf16(ly.sg, xn, tmp1, kFF, kEmbd, 1, s);
         gemv_bf16(ly.su, xn, tmp2, kFF, kEmbd, 1, s);
         swiglu_clamp(tmp1, tmp2, tmp3, kFF, kSwigluLimit, s);
         gemv_bf16(ly.sd, tmp3, y, kEmbd, kFF, 1, s);
-        // the routed experts: read from experts.bin, computed on the GPU
+        CK(cudaEventSynchronize(ev_ids));
         int32_t hid[kK];
-        CK(cudaMemcpyAsync(hid, ids, sizeof(hid), cudaMemcpyDeviceToHost, s));
-        CK(cudaStreamSynchronize(s));
+        std::memcpy(hid, hid_pin, sizeof(hid));
+        predict_score(l, hid);
         const int m = l - kDenseLead;
+        if (tiered && lru && tier.tier_slots() > 0 && vslot.size() >= (size_t) 2 * kK) {
+            note(m, hid, kK);
+            if (routes) routes->push_back({l, std::vector<int32_t>(hid, hid + kK)});
+            if (timing) CK(cudaEventRecord(tev[(size_t) m * 3], s));
+            unsigned long long* gp = gp_host + (size_t) m * kK;
+            int32_t pj[kK];
+            for (int j = 0; j < kK; ++j) pj[j] = m * kNE + hid[j];
+            auto in_sel = [&](int32_t p) { for (int j = 0; j < kK; ++j) if (pj[j] == p) return true; return false; };
+            // a VRAM slot for p: the least recent one outside this layer's selection
+            auto vram_slot = [&](int32_t p) {
+                int32_t sl = vlru.tail;
+                while (sl >= 0 && slot_pair[(size_t) sl] >= 0 && in_sel(slot_pair[(size_t) sl])) sl = vlru.prev[(size_t) sl];
+                if (slot_pair[(size_t) sl] >= 0) res[(size_t) slot_pair[(size_t) sl]] = -1;
+                slot_pair[(size_t) sl] = p;
+                res[(size_t) p] = sl;
+                vlru.touch(sl);
+                return sl;
+            };
+            bool done[kK] = {};
+            uint8_t* dslot[kK] = {};
+            for (int i = 0; i < pf_n; ++i)
+                for (int j = 0; j < kK; ++j) if (pf_pair[i] == pj[j]) ++pf_used;
+            prefetch_commit();
+            for (int j = 0; j < kK; ++j) {   // in VRAM already
+                const int32_t r = res[(size_t) pj[j]];
+                if (r < 0) continue;
+                gp[j] = (unsigned long long) vslot[(size_t) r];
+                vlru.touch(r);
+                if (rlru.in[(size_t) pj[j]]) rlru.touch(pj[j]);
+                done[j] = true;
+                ++ts.vram;
+            }
+            for (int j = 0; j < kK; ++j) {   // on the disk: into the RAM slot of the least recent member outside VRAM
+                if (done[j] || tier.has_copy(m, hid[j])) continue;
+                int32_t v = rlru.tail;
+                while (v >= 0 && (res[(size_t) v] >= 0 || in_sel(v))) v = rlru.prev[(size_t) v];
+                if (v < 0) continue;   // nothing to evict: staged below through the tier's own read
+                tier.promote_done(v / kNE, v % kNE);   // its slot becomes the spare demote_begin takes
+                rlru.remove(v);
+                uint8_t* d = tier.demote_begin(m, hid[j]);
+                if (d == nullptr) continue;
+                reader.start(j, strata::kernels::cpu::expert_layout().blob_offset(m, hid[j]), XL.bytes, d);
+                dslot[j] = d;
+            }
+            // the next layer's predicted experts on the disk: read into RAM now, behind this layer's own reads
+            if (pf) {
+                CK(cudaEventSynchronize(ev_pred));
+                const int mn = m + 1;
+                for (int i = 0; i < kK; ++i) {
+                    const int32_t q = mn * kNE + pf_ids[i];
+                    if (res[(size_t) q] >= 0 || tier.has_copy(mn, pf_ids[i])) continue;
+                    int32_t v = rlru.tail;
+                    while (v >= 0 && (res[(size_t) v] >= 0 || in_sel(v))) v = rlru.prev[(size_t) v];
+                    if (v < 0) break;
+                    tier.promote_done(v / kNE, v % kNE);
+                    rlru.remove(v);
+                    uint8_t* d = tier.demote_begin(mn, pf_ids[i]);
+                    if (d == nullptr) continue;
+                    reader.start(kK + pf_n, strata::kernels::cpu::expert_layout().blob_offset(mn, pf_ids[i]), XL.bytes, d);
+                    pf_pair[pf_n] = q;
+                    pf_dst[pf_n] = d;
+                    ++pf_n;
+                    ++pf_reads;
+                }
+            }
+            // the CPU's share of the RAM hits, computed from the tier while the GPU copies its own
+            int ncpu = 0, cj[kK];
+            if (cpu_share > 0 && cpux.ready()) {
+                int nram = 0;
+                for (int j = 0; j < kK; ++j) if (!done[j] && dslot[j] == nullptr && tier.has_copy(m, hid[j])) ++nram;
+                cpu_acc += cpu_share * nram;
+                const int want = (int) cpu_acc;
+                cpu_acc -= want;
+                const uint8_t* cb[kK];
+                float* co[kK];
+                for (int j = kK; j-- > 0 && ncpu < want;) {
+                    if (done[j] || dslot[j] != nullptr || !tier.has_copy(m, hid[j])) continue;
+                    cj[ncpu] = j;
+                    cb[ncpu] = tier.stable_blob(m, hid[j]);
+                    co[ncpu] = cpu_rows + (size_t) j * kEmbd;
+                    done[j] = true;
+                    rlru.touch(pj[j]);
+                    ++ts.cpu;
+                    ++ncpu;
+                }
+                if (ncpu > 0) cpux.start(x_host, cb, co, ncpu);
+            }
+            for (int j = 0; j < kK; ++j) {   // in RAM: copied into a VRAM slot (it was going to the GPU anyway)
+                if (done[j] || dslot[j] != nullptr) continue;
+                const uint8_t* b = tier.has_copy(m, hid[j]) ? tier.stable_blob(m, hid[j]) : tier.blob(m, hid[j]);
+                if (b == nullptr) { std::fprintf(stderr, "strata-glm: no bytes for expert %d of layer %d\n", hid[j], l); std::exit(1); }
+                const bool in_ram = tier.has_copy(m, hid[j]);
+                const int32_t sl = vram_slot(pj[j]);
+                CK(cudaMemcpyAsync(vslot[(size_t) sl], b, XL.bytes, cudaMemcpyHostToDevice, s));
+                if (!in_ram) CK(cudaStreamSynchronize(s));   // a mapped-file page, not ours to keep
+                gp[j] = (unsigned long long) vslot[(size_t) sl];
+                if (in_ram) { rlru.touch(pj[j]); ++ts.ram; } else ++ts.file;
+            }
+            for (int j = 0; j < kK; ++j) {   // the disk reads, as they land
+                if (dslot[j] == nullptr) continue;
+                const auto t = std::chrono::steady_clock::now();
+                const bool ok = reader.wait(j);
+                ts.file_wait_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+                if (!ok) { std::fprintf(stderr, "strata-glm: reading expert %d of layer %d failed\n", hid[j], l); std::exit(1); }
+                const size_t pad = (size_t) (strata::kernels::cpu::expert_layout().blob_offset(m, hid[j]) % 4096);
+                tier.demote_commit(m, hid[j], pad);
+                rlru.touch(pj[j]);
+                const int32_t sl = vram_slot(pj[j]);
+                CK(cudaMemcpyAsync(vslot[(size_t) sl], dslot[j] + pad, XL.bytes, cudaMemcpyHostToDevice, s));
+                gp[j] = (unsigned long long) vslot[(size_t) sl];
+                ++ts.file;
+            }
+            // the GPU's groups: every expert but the CPU's, each writing its own row of `rows`
+            unsigned long long* gq = gq_host + (size_t) m * kK;
+            int32_t* ge = ge_host + (size_t) m * (kK + 1);
+            int32_t ng = 0;
+            for (int j = 0; j < kK; ++j) {
+                bool cpu = false;
+                for (int c = 0; c < ncpu; ++c) cpu |= cj[c] == j;
+                if (cpu) continue;
+                gq[ng] = gp[j];
+                ge[ng] = j;
+                ++ng;
+            }
+            ge[kK] = ng;
+            CK(cudaMemcpyAsync(grp_ptr, gq, kK * sizeof(unsigned long long), cudaMemcpyHostToDevice, s));
+            CK(cudaMemcpyAsync(d_ent, ge, (kK + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+            if (timing) CK(cudaEventRecord(tev[(size_t) m * 3 + 1], s));
+            if (ng > 0)
+                strata::kernels::native_expert_grouped_f32(XL, grp_ptr, grp_start, d_ent + kK, d_ent, ent_tok, kK, kK, xn,
+                                                           xscratch, rows, s);
+            if (ncpu > 0) {
+                cpux.wait();
+                for (int c = 0; c < ncpu; ++c)
+                    CK(cudaMemcpyAsync(rows + (size_t) cj[c] * kEmbd, cpu_rows + (size_t) cj[c] * kEmbd,
+                                       kEmbd * sizeof(float), cudaMemcpyHostToDevice, s));
+            }
+            combine_rows(rows, wts, kK, y, kEmbd, s);
+            if (timing) CK(cudaEventRecord(tev[(size_t) m * 3 + 2], s));
+            return;   // the RAM slots and cpu_rows read above are reused only after the next layer's router event
+        }
+        if (tiered) {
+            // the tiers: a VRAM slot as it is; a RAM or disk expert copied into this layer's staging slot (the
+            // disk reads were started by begin_layer and overlap the copies of the ones before them)
+            note(m, hid, kK);
+            if (routes) routes->push_back({l, std::vector<int32_t>(hid, hid + kK)});
+            tier.begin_layer(m, hid, kK);
+            if (timing) CK(cudaEventRecord(tev[(size_t) m * 3], s));
+            unsigned long long* gp = gp_host + (size_t) m * kK;
+            for (int j = 0; j < kK; ++j) {
+                const size_t pi = (size_t) m * kNE + (size_t) hid[j];
+                if (res[pi] >= 0) { gp[j] = (unsigned long long) vslot[(size_t) res[pi]]; ++ts.vram; continue; }
+                const bool in_ram = tier.has_copy(m, hid[j]);
+                const auto t = std::chrono::steady_clock::now();
+                const uint8_t* b = tier.blob(m, hid[j]);
+                if (in_ram) ++ts.ram;
+                else { ++ts.file; ts.file_wait_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count(); }
+                if (b == nullptr) { std::fprintf(stderr, "strata-glm: no bytes for expert %d of layer %d\n", hid[j], l); std::exit(1); }
+                uint8_t* dst = stage + (size_t) j * XL.bytes;
+                CK(cudaMemcpyAsync(dst, b, XL.bytes, cudaMemcpyHostToDevice, s));
+                gp[j] = (unsigned long long) dst;
+            }
+            CK(cudaMemcpyAsync(grp_ptr, gp, kK * sizeof(unsigned long long), cudaMemcpyHostToDevice, s));
+            if (timing) CK(cudaEventRecord(tev[(size_t) m * 3 + 1], s));
+            strata::kernels::native_expert_grouped_f32(XL, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, kK, kK, xn,
+                                                       xscratch, rows, s);
+            combine_rows(rows, wts, kK, y, kEmbd, s);
+            if (timing) CK(cudaEventRecord(tev[(size_t) m * 3 + 2], s));
+            return;   // the staging slots and the disk buffers are free again once the next layer's router syncs
+        }
+        // no tiers: every routed expert read from experts.bin
         for (int j = 0; j < kK; ++j) {
             const long long off = ((long long) m * kNE + hid[j]) * (long long) XL.bytes;
             _fseeki64(experts, off, SEEK_SET);
@@ -566,6 +1311,7 @@ struct Engine {
     // one token at position pos: the next token's logits in `logits`
     void forward(int token, int pos, const std::string& dump_dir) {
         using namespace glm;
+        ++heat_tokens;
         CK(cudaMemcpyAsync(emb_row, embed.data() + (size_t) token * kEmbd, kEmbd * sizeof(bf16), cudaMemcpyHostToDevice, s));
         bf16_to_f32(emb_row, x, kEmbd, s);
         for (int j = 0; j < kHc; ++j) CK(cudaMemcpyAsync(streams + (size_t) j * kEmbd, x, kEmbd * sizeof(float), cudaMemcpyDeviceToDevice, s));
@@ -579,8 +1325,10 @@ struct Engine {
             gemv_bf16(ly.hc_ffn_fn, streams, mix, 24, kHc * kEmbd, 1, s);
             hc_pre_finish(streams, mix, ly.hc_ffn_base, ly.hc_ffn_scale, kEmbd, kEps, kHcEps, kSinkhorn, x, post, comb, s);
             rmsnorm(x, ly.post_norm, kEps, xn, kEmbd, 1, s);
+            predict_layer(0, l + 1);
             if (l < kDenseLead) dense_mlp(ly); else moe(ly, l);
             hc_post(y, streams, post, comb, streams, kEmbd, s);
+            predict_layer(1, l + 1);
             if (!dump_dir.empty()) {
                 std::vector<float> h((size_t) kHc * kEmbd);
                 CK(cudaMemcpyAsync(h.data(), streams, h.size() * sizeof(float), cudaMemcpyDeviceToHost, s));
@@ -602,7 +1350,16 @@ struct Engine {
 int main(int argc, char** argv) {
     std::string pack, tokens_path, dump_dir, dump_logits;
     int max_new = 16, max_ctx = 8192, chunk = 0;
-    std::string routes_path;
+    std::string routes_path, profile;
+    long long vram_experts = -1;
+    double ram_gib = -1, ram_reserve_gib = 12, vram_reserve_mib = 1500;
+    int rebalance_every = -1;   // -1: 16 with --policy rebalance, none with lru
+    std::string policy = "lru";
+    std::vector<std::string> mirrors;
+    double cpu_share = 0;
+    int cpu_threads = 14;
+    bool no_prefetch = false;
+    long long rebalance_vram = 32, rebalance_ram = 64;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(2); } return argv[++i]; };
@@ -614,10 +1371,25 @@ int main(int argc, char** argv) {
         else if (a == "--dump-logits") dump_logits = next();
         else if (a == "--chunk") chunk = std::atoi(next().c_str());
         else if (a == "--routes") routes_path = next();
+        else if (a == "--profile") profile = next();
+        else if (a == "--vram-experts") vram_experts = std::atoll(next().c_str());
+        else if (a == "--ram-gib") ram_gib = std::atof(next().c_str());
+        else if (a == "--ram-reserve-gib") ram_reserve_gib = std::atof(next().c_str());
+        else if (a == "--vram-reserve-mib") vram_reserve_mib = std::atof(next().c_str());
+        else if (a == "--rebalance-every") rebalance_every = std::atoi(next().c_str());
+        else if (a == "--policy") policy = next();
+        else if (a == "--mirror") mirrors.push_back(next());
+        else if (a == "--cpu-share") cpu_share = std::atof(next().c_str());
+        else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
+        else if (a == "--no-prefetch") no_prefetch = true;
+        else if (a == "--rebalance-moves") { rebalance_vram = std::atoll(next().c_str()); rebalance_ram = 2 * rebalance_vram; }
         else { std::fprintf(stderr, "strata-glm: unknown argument %s\n", a.c_str()); return 2; }
     }
     if (pack.empty() || tokens_path.empty()) {
-        std::fprintf(stderr, "usage: strata-glm --pack DIR --tokens FILE [--max-new N] [--max-context C] [--dump-dir D] [--dump-logits F]\n");
+        std::fprintf(stderr, "usage: strata-glm --pack DIR --tokens FILE [--max-new N] [--max-context C] [--chunk T]\n"
+                             "                  [--profile P [--vram-experts N] [--ram-gib G] [--ram-reserve-gib R] [--vram-reserve-mib M]\n"
+                             "                   [--policy lru|rebalance] [--rebalance-every N] [--rebalance-moves M]]\n"
+                             "                  [--dump-dir D] [--dump-logits F] [--routes F]\n");
         return 2;
     }
     std::vector<int> prompt;
@@ -631,12 +1403,22 @@ int main(int argc, char** argv) {
     }
     if (prompt.empty()) { std::fprintf(stderr, "strata-glm: no tokens in %s\n", tokens_path.c_str()); return 2; }
 
+    if (policy != "lru" && policy != "rebalance") { std::fprintf(stderr, "strata-glm: --policy is lru or rebalance\n"); return 2; }
+    if (rebalance_every < 0) rebalance_every = policy == "lru" ? 0 : 16;
     Engine e;
     e.max_ctx = max_ctx;
+    e.lru = policy == "lru";
+    e.mirrors = mirrors;
+    e.cpu_share = cpu_share;
+    e.cpu_threads = cpu_threads;
+    e.prefetch = !no_prefetch;
     e.load(pack);
     std::vector<Engine::Route> routes;
     if (!routes_path.empty()) e.routes = &routes;
-    if (chunk > 0) e.init_chunk(chunk);
+    if (chunk > 0) e.init_chunk(chunk, profile.empty());
+    if (!profile.empty()) e.init_tier(pack, profile, vram_experts, ram_gib, ram_reserve_gib, vram_reserve_mib);
+    e.timing_init();
+    e.predict_init();
     const auto t0 = std::chrono::steady_clock::now();
     if (chunk > 0) {
         for (size_t i = 0; i < prompt.size(); i += (size_t) chunk) {
@@ -648,7 +1430,36 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < prompt.size(); ++i)
             e.forward(prompt[i], (int) i, i + 1 == prompt.size() ? dump_dir : std::string());
     }
-    if (!routes_path.empty()) {   // layer, then T*K ids per record
+    const double tp = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (e.tiered) {   // the prompt said which experts this conversation uses: the tiers follow it
+        const double ps = (double) (e.ts.vram + e.ts.ram + e.ts.file);
+        if (ps > 0)
+            std::fprintf(stderr, "strata-glm: prompt experts: %.1f%% VRAM, %.1f%% RAM, %.1f%% disk\n", 100 * e.ts.vram / ps,
+                         100 * e.ts.ram / ps, 100 * e.ts.file / ps);
+        e.rebalance(1LL << 40, 1LL << 40, true);
+    }
+    std::vector<float> lg(kVocab);
+    CK(cudaMemcpy(lg.data(), e.logits, lg.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    if (!dump_logits.empty())
+        if (std::FILE* f = std::fopen(dump_logits.c_str(), "wb")) { std::fwrite(lg.data(), 4, lg.size(), f); std::fclose(f); }
+    std::fprintf(stderr, "strata-glm: prompt %zu tokens in %.1f s (%.2f tok/s)\n", prompt.size(), tp, prompt.size() / tp);
+    std::vector<int> out;
+    int pos = (int) prompt.size(), steps = 0;
+    const Engine::TierStats ts0 = e.ts;
+    const auto t1 = std::chrono::steady_clock::now();
+    for (int n = 0; n < max_new && pos < max_ctx; ++n) {
+        const int tok = (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+        out.push_back(tok);
+        if (tok == 154820 || tok == 154827 || tok == 154829) break;   // eos ids (config.json)
+        const auto tf = std::chrono::steady_clock::now();
+        e.forward(tok, pos++, std::string());
+        e.timing_token(std::chrono::duration<double>(std::chrono::steady_clock::now() - tf).count());
+        ++steps;
+        if (e.tiered && rebalance_every > 0 && steps % rebalance_every == 0) e.rebalance(rebalance_vram, rebalance_ram, false);
+        CK(cudaMemcpy(lg.data(), e.logits, lg.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    }
+    const double td = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+    if (!routes_path.empty()) {   // layer, then T*K ids per record (the prompt's chunks, then each decode step)
         if (std::FILE* f = std::fopen(routes_path.c_str(), "ab")) {
             for (const auto& r : routes) {
                 const int32_t hdr[2] = {r.layer, (int32_t) r.ids.size()};
@@ -658,26 +1469,32 @@ int main(int argc, char** argv) {
             std::fclose(f);
         }
     }
-    const double tp = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    std::vector<float> lg(kVocab);
-    CK(cudaMemcpy(lg.data(), e.logits, lg.size() * sizeof(float), cudaMemcpyDeviceToHost));
-    if (!dump_logits.empty())
-        if (std::FILE* f = std::fopen(dump_logits.c_str(), "wb")) { std::fwrite(lg.data(), 4, lg.size(), f); std::fclose(f); }
-    std::fprintf(stderr, "strata-glm: prompt %zu tokens in %.1f s (%.2f tok/s)\n", prompt.size(), tp, prompt.size() / tp);
-    std::vector<int> out;
-    int pos = (int) prompt.size();
-    const auto t1 = std::chrono::steady_clock::now();
-    for (int n = 0; n < max_new && pos < max_ctx; ++n) {
-        const int tok = (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
-        out.push_back(tok);
-        if (tok == 154820 || tok == 154827 || tok == 154829) break;   // eos ids (config.json)
-        e.forward(tok, pos++, std::string());
-        CK(cudaMemcpy(lg.data(), e.logits, lg.size() * sizeof(float), cudaMemcpyDeviceToHost));
-    }
-    const double td = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
     std::printf("output :");
     for (int t : out) std::printf(" %d", t);
     std::printf("\n");
-    std::fprintf(stderr, "strata-glm: decode %zu tokens in %.1f s (%.2f tok/s)\n", out.size(), td, out.size() / td);
+    std::fprintf(stderr, "strata-glm: decode %d steps in %.1f s (%.2f tok/s)\n", steps, td, steps / td);
+    if (e.tiered && steps > 0) {
+        const double v = (double) (e.ts.vram - ts0.vram), r = (double) (e.ts.ram - ts0.ram), f = (double) (e.ts.file - ts0.file);
+        const double c = (double) (e.ts.cpu - ts0.cpu), n = v + r + f + c;
+        std::fprintf(stderr, "strata-glm: decode experts: %.1f%% VRAM, %.1f%% RAM to the GPU, %.1f%% RAM on the CPU, %.1f%% "
+                             "disk (%.1f a token, %.1f ms a token waiting for the disk", 100 * v / n, 100 * r / n, 100 * c / n,
+                     100 * f / n, f / steps, 1e3 * (e.ts.file_wait_s - ts0.file_wait_s) / steps);
+        for (int d = 0; d < e.reader.drives(); ++d) std::fprintf(stderr, "%s drive %d: %lld", d ? "," : ";", d, e.reader.reads(d));
+        std::fprintf(stderr, ")\n");
+    }
+    if (e.prefetch && e.pf_reads > 0)
+        std::fprintf(stderr, "strata-glm: prefetch: %lld disk reads for the next layer, %.1f%% of them routed there\n",
+                     e.pf_reads, 100.0 * e.pf_used / e.pf_reads);
+    if (e.predict)
+        for (int v = 0; v < 2; ++v)
+            std::fprintf(stderr, "strata-glm: prediction %s: %.1f%% of the routed experts, %.1f%% of those outside VRAM\n",
+                         v ? "(B) after layer l" : "(A) at layer l's router", 100.0 * e.pred_hit[v] / std::max(1LL, e.pred_n[v]),
+                         100.0 * e.pred_miss_hit[v] / std::max(1LL, e.pred_miss_n[v]));
+    if (e.timing && e.tm.tokens > 0) {
+        const double n = (double) e.tm.tokens, tok = 1e3 * e.tm.tok_s / n;
+        std::fprintf(stderr, "strata-glm: a decode token %.1f ms: expert copies (with the disk waits) %.1f, expert kernels "
+                             "%.1f, the rest (dense layers, routers, syncs) %.1f\n", tok, e.tm.copy_ms / n,
+                     e.tm.kernel_ms / n, tok - (e.tm.copy_ms + e.tm.kernel_ms) / n);
+    }
     return 0;
 }

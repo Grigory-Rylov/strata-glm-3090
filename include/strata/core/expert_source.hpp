@@ -494,13 +494,20 @@ public:
     const uint8_t* stable_blob(int64_t layer, int64_t expert);
     /// Per pair (layer * n_expert + expert): the profile's rank, 0 = most routed.  Without it nothing is evicted.
     void set_rank(std::vector<int32_t> rank) { rank_ = std::move(rank); }
+    /// A new ranking for a tier already loaded: the eviction order is rebuilt from the members.
+    void rerank(std::vector<int32_t> rank);
+    /// Reads `pairs` from the file into the tier, `threads` at a time, each into a spare slot or the slot of the
+    /// member ranked lowest below it (demote_begin).  Returns how many landed; a pair ranked below every member
+    /// stays file-backed.
+    int64_t admit_from_file(const std::vector<std::pair<int32_t, int32_t>>& pairs, int threads, std::string& err);
     /// The residency table (per pair: a VRAM slot, or < 0): begin_layer prefetches only what the CPU computes.
     void set_residency(const int32_t* host_res) { res_ = host_res; }
     /// A slot for an expert leaving VRAM without a host copy: a spare, else the least-ranked member's (which
     /// becomes file-backed now).  Null: it stays file-backed.  blob() keeps returning the file until demote_commit.
     /// Call it for every swap of a batch before reading any promoted expert's bytes (stable_blob).
     uint8_t* demote_begin(int64_t layer, int64_t expert);
-    void demote_commit(int64_t layer, int64_t expert);
+    /// `pad`: where the blob starts in the slot (a sector-aligned read of it lands at its file offset % 4096)
+    void demote_commit(int64_t layer, int64_t expert, size_t pad = 0);
     /// The copy back failed: the slot returns to the spares and the expert stays file-backed.
     void demote_abort(int64_t layer, int64_t expert);
     /// An expert now resident in VRAM: its host copy (if any) becomes a spare slot.
