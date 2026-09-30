@@ -39,9 +39,9 @@ First start after a reboot is slower while Windows reads the files; later starts
 
 | | |
 | --- | ---: |
-| Writes answers, short chat | ~115 tokens/s |
+| Writes answers, short chat | ~115 tokens/s (Ukrainian or Russian too: ~110) |
 | Writes answers, 32K context | ~120 tokens/s |
-| Reads a 32K prompt | ~5,000 tokens/s |
+| Reads a 32K prompt | ~5,500 tokens/s |
 
 ## Settings
 

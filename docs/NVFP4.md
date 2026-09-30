@@ -168,6 +168,29 @@ Tried and dropped (no gain, or worse):
   5.3 vs 4.0 short, 10.8 vs 6.6 at 32K) - it fits the traces; the shipped profile generalises.
 - A q4_0 / q8_0 MTP head: tools/mtp_pack.py writes them, but the drafter only runs Q2_0 experts.
 
+### Upstream 0.1.28 merged (2026-09-30)
+
+Upstream's 0.1.25-0.1.28 came in with a merge: the draft layer's prompt pass in batches (E-9), the hyper-connection
+read and write fused in the prompt path (F-1, F-2 - extended here with the BF16 remainders of the split), the
+expert grouping tables through mapped memory, K8V4 KV (`--kv k8v4`, not used here), the AMD/HIP and Turing ports,
+the WDDM cache-sizing steps, tool-call parsing and cancellation fixes. Measured against the previous release, both
+portable builds: first-token KL mean 0.0002 / median 0.00002 (noise: the cache holds 17 more experts), prompt
+reading 1K +12%, 4K +14%, 8K +8-13%, 32K +16% (4791 -> 5539 tok/s), decode unchanged (107.9 vs 106.6 tok/s).
+
+The draft head's token subset (`rt/draft_vocab.bin`, the rows the MTP head may propose) held 142 of the
+vocabulary's 18,580 Cyrillic tokens. With the whole script added (`tools/draft_vocab.py --add cyrillic`, 58,963 ids,
++50 MB of VRAM):
+
+| prompt | subset | tok/s | tokens per round |
+| --- | --- | ---: | ---: |
+| Ukrainian | English/code (upstream's) | 83.2 | 1.40 |
+| Ukrainian | + Cyrillic (now) | 108.8 | 2.11 |
+| English | English/code | 111.9 | 2.40 |
+| English | + Cyrillic | 120.5 | 2.47 |
+
+Upstream's CJK subset (106,299 ids) is not the default here: ~180 MB more of the draft head for scripts this fork's
+users do not write; `--add cjk` builds it.
+
 ### Second pass (2026-09-30, two read-only audits with a fresh context, then measured)
 
 Where a decode round goes (nsys, 262K context, ~21 ms a round): the GPU runs back to back; 4.6 ms is the copy

@@ -25,8 +25,15 @@ upstream's; the original README is kept as [README.upstream.md](README.upstream.
   ~8 s to the first token from a PCIe 5 drive.
 - **Tuned for NVFP4's larger experts** (PCIe share, prompt chunks up to 32K, fused scale passes, a verify commit
   that overlaps the draft) and the fine-tune's own abliterated MTP draft head.
+- **A draft vocabulary with Cyrillic:** the MTP draft head proposes only tokens of its subset, and upstream's held
+  142 of the vocabulary's 18,580 Cyrillic tokens - a Ukrainian answer decoded at 83 tokens/s with 1.4 tokens a round;
+  with the whole Cyrillic script (`tools/draft_vocab.py --add cyrillic`), 109 and 2.1. English is unchanged.
+  Upstream's CJK subset is one `--add cjk` away (`data/draft_vocab_en.bin` is the English/code one).
 - **Fixes:** a scale fold that left NVFP4 hidden activations in FP16's subnormals (2-12% expert error), and the
   batched verify path skipping the query rotation of rotated KV caches.
+- **Merged with upstream Strata 0.1.28** (its batched draft-layer prompt pass, fused hyper-connection prompt kernels,
+  expert grouping through mapped memory, tool-call and cancellation fixes): prompt reading +3-16%, first-token KL
+  to the previous build at noise level.
 
 Each change was measured - first-token KL against a reference, and interleaved speed A/B runs;
 [docs/NVFP4.md](docs/NVFP4.md) has the numbers, and everything that was tried and dropped.
@@ -53,9 +60,9 @@ RTX 5090 (32 GB, PCIe 5 x16), Ryzen 9 9950X3D, 128 GB DDR5-5600, Samsung 9100 PR
 
 | | |
 | --- | ---: |
-| Writes answers, short chat | ~115 tokens/s |
+| Writes answers, short chat | ~115 tokens/s (Ukrainian or Russian too: ~110) |
 | Writes answers, 32K context | ~120 tokens/s |
-| Reads a 32K prompt | ~5,000 tokens/s |
+| Reads a 32K prompt | ~5,500 tokens/s |
 | Start to the first token | ~8 s (63 GiB of experts read at ~10 GiB/s) |
 
 Where precision was still being lost, first-token KL divergence from the more exact variant (8 prompts of 1K-8K
