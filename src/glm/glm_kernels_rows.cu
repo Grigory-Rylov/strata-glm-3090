@@ -114,23 +114,27 @@ __global__ void hc_post_rows_kernel(const float* __restrict__ y_all, const float
         so[j * n + d] = post[j] * yd + comb[j] * r0 + comb[4 + j] * r1 + comb[8 + j] * r2 + comb[12 + j] * r3;
 }
 
-__global__ void conv_silu_seq_kernel(const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ state,
+// window [x[t-3], x[t-2], x[t-1], x[t]] with x[-3..-1] from the state: no recurrence, so every (t, c) at once
+__global__ void conv_silu_par_kernel(const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ state,
                                      float* __restrict__ out, int C, int T) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t) C * T) return;
+    const int t = (int) (i / C), c = (int) (i % C);
+    auto xin = [&](int tt) { return tt >= 0 ? x[(size_t) tt * C + c] : state[(size_t) c * 3 + 3 + tt]; };
+    const float v = w[(size_t) c * 4] * xin(t - 3) + w[(size_t) c * 4 + 1] * xin(t - 2) + w[(size_t) c * 4 + 2] * xin(t - 1) +
+                    w[(size_t) c * 4 + 3] * xin(t);
+    out[i] = v / (1.f + expf(-v));
+}
+
+__global__ void conv_state_kernel(const float* __restrict__ x, float* __restrict__ state, int C, int T) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
-    float s0 = state[(size_t) c * 3], s1 = state[(size_t) c * 3 + 1], s2 = state[(size_t) c * 3 + 2];
-    const float w0 = w[(size_t) c * 4], w1 = w[(size_t) c * 4 + 1], w2 = w[(size_t) c * 4 + 2], w3 = w[(size_t) c * 4 + 3];
-    for (int t = 0; t < T; ++t) {
-        const float xv = x[(size_t) t * C + c];
-        const float v = w0 * s0 + w1 * s1 + w2 * s2 + w3 * xv;
-        s0 = s1;
-        s1 = s2;
-        s2 = xv;
-        out[(size_t) t * C + c] = v / (1.f + expf(-v));
+    float w3[3];
+    for (int j = 0; j < 3; ++j) {
+        const int tt = T - 3 + j;
+        w3[j] = tt >= 0 ? x[(size_t) tt * C + c] : state[(size_t) c * 3 + 3 + tt];
     }
-    state[(size_t) c * 3] = s0;
-    state[(size_t) c * 3 + 1] = s1;
-    state[(size_t) c * 3 + 2] = s2;
+    for (int j = 0; j < 3; ++j) state[(size_t) c * 3 + j] = w3[j];
 }
 
 __global__ void kda_prep_rows_kernel(float* __restrict__ q, float* __restrict__ k, float* __restrict__ gf,
@@ -146,34 +150,55 @@ __global__ void kda_prep_rows_kernel(float* __restrict__ q, float* __restrict__ 
 }
 
 // one block per head, S (dh x dh) in shared memory, the tokens in order
-__global__ void kda_scan_kernel(float* __restrict__ S, const float* __restrict__ q, const float* __restrict__ k,
-                                const float* __restrict__ v, const float* __restrict__ g, const float* __restrict__ beta,
-                                float* __restrict__ o, int H, int dh, int T) {
-    extern __shared__ float sm[];
-    float* Ss = sm;                          // [dh][dh]
-    float *qs = sm + dh * dh, *ks = qs + dh, *eg = ks + dh;
-    const int h = blockIdx.x, vi = threadIdx.x;
-    float* Sg = S + (size_t) h * dh * dh;
-    for (int ki = 0; ki < dh; ++ki) Ss[ki * dh + vi] = Sg[(size_t) ki * dh + vi];
+// The value columns of S are independent (delta_c = beta (v_c - sum_i S[i][c] k_i) touches column c only; the
+// decay scales rows), so a head's 128 columns split over 4 warps, each thread holding its column in registers.
+template <int DH>
+__global__ void __launch_bounds__(32) kda_scan_kernel(float* __restrict__ S, const float* __restrict__ q,
+                                                      const float* __restrict__ k, const float* __restrict__ v,
+                                                      const float* __restrict__ g, const float* __restrict__ beta,
+                                                      float* __restrict__ o, int H, int T) {
+    __shared__ float qs[DH], ks[DH], eg[DH];
+    const int h = blockIdx.x, lane = threadIdx.x, c = blockIdx.y * 32 + lane;
+    float* Sg = S + (size_t) h * DH * DH;
+    float st[DH];
+#pragma unroll
+    for (int i = 0; i < DH; ++i) st[i] = Sg[(size_t) i * DH + c];
     for (int t = 0; t < T; ++t) {
-        const size_t base = ((size_t) t * H + h) * dh;
-        __syncthreads();
-        qs[vi] = q[base + vi];
-        ks[vi] = k[base + vi];
-        eg[vi] = expf(g[base + vi]);
-        __syncthreads();
-        float kv = 0.f;
-        for (int ki = 0; ki < dh; ++ki) kv += Ss[ki * dh + vi] * eg[ki] * ks[ki];
-        const float delta = (v[base + vi] - kv) * beta[(size_t) t * H + h];
-        float acc = 0.f;
-        for (int ki = 0; ki < dh; ++ki) {
-            const float s = Ss[ki * dh + vi] * eg[ki] + ks[ki] * delta;
-            Ss[ki * dh + vi] = s;
-            acc += s * qs[ki];
+        const size_t base = ((size_t) t * H + h) * DH;
+        __syncwarp();
+#pragma unroll
+        for (int j = lane; j < DH; j += 32) {
+            eg[j] = expf(g[base + j]);
+            ks[j] = k[base + j];
+            qs[j] = q[base + j];
         }
-        o[base + vi] = acc;
+        __syncwarp();
+        float kv0 = 0.f, kv1 = 0.f, kv2 = 0.f, kv3 = 0.f;
+#pragma unroll
+        for (int i = 0; i < DH; i += 4) {   // decay the column, then kv = S^T k
+            st[i] *= eg[i]; st[i + 1] *= eg[i + 1]; st[i + 2] *= eg[i + 2]; st[i + 3] *= eg[i + 3];
+            kv0 += st[i] * ks[i];
+            kv1 += st[i + 1] * ks[i + 1];
+            kv2 += st[i + 2] * ks[i + 2];
+            kv3 += st[i + 3] * ks[i + 3];
+        }
+        const float delta = (v[base + c] - ((kv0 + kv1) + (kv2 + kv3))) * beta[(size_t) t * H + h];
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+#pragma unroll
+        for (int i = 0; i < DH; i += 4) {
+            st[i] += ks[i] * delta;
+            st[i + 1] += ks[i + 1] * delta;
+            st[i + 2] += ks[i + 2] * delta;
+            st[i + 3] += ks[i + 3] * delta;
+            a0 += st[i] * qs[i];
+            a1 += st[i + 1] * qs[i + 1];
+            a2 += st[i + 2] * qs[i + 2];
+            a3 += st[i + 3] * qs[i + 3];
+        }
+        o[base + c] = (a0 + a1) + (a2 + a3);
     }
-    for (int ki = 0; ki < dh; ++ki) Sg[(size_t) ki * dh + vi] = Ss[ki * dh + vi];
+#pragma unroll
+    for (int i = 0; i < DH; ++i) Sg[(size_t) i * DH + c] = st[i];
 }
 
 __global__ void kda_out_norm_rows_kernel(float* __restrict__ o, const bf16* __restrict__ w, const float* __restrict__ gate,
@@ -315,7 +340,18 @@ void hc_post_rows(const float* y, const float* streams_in, const float* post, co
 }
 
 void conv_silu_seq(const float* x, const float* w, float* state, float* out, int C, int T, cudaStream_t s) {
-    conv_silu_seq_kernel<<<(unsigned) ((C + 255) / 256), 256, 0, s>>>(x, w, state, out, C, T);
+    // out may alias x: the outputs go to a scratch first, then the state (from x) is updated, then copied back
+    static float* tmp = nullptr;
+    static size_t cap = 0;
+    const size_t n = (size_t) C * T;
+    if (n > cap) {
+        if (tmp) cudaFree(tmp);
+        if (cudaMalloc(&tmp, n * sizeof(float)) != cudaSuccess) { std::fprintf(stderr, "conv_silu_seq: no scratch\n"); std::exit(1); }
+        cap = n;
+    }
+    conv_silu_par_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(x, w, state, tmp, C, T);
+    conv_state_kernel<<<(unsigned) ((C + 255) / 256), 256, 0, s>>>(x, state, C, T);
+    cudaMemcpyAsync(out, tmp, n * sizeof(float), cudaMemcpyDeviceToDevice, s);
     check("conv_silu_seq");
 }
 
@@ -325,15 +361,10 @@ void kda_prep_rows(float* q, float* k, float* gf, const float* dt_bias, const fl
     check("kda_prep_rows");
 }
 
-void kda_scan(float* S, const float* q, const float* k, const float* v, const float* g, const float* beta, float* o,
-              int H, int dh, int T, cudaStream_t s) {
-    const size_t shm = ((size_t) dh * dh + 3 * dh) * sizeof(float);
-    static bool attr = false;
-    if (!attr) {
-        cudaFuncSetAttribute(kda_scan_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) shm);
-        attr = true;
-    }
-    kda_scan_kernel<<<H, dh, shm, s>>>(S, q, k, v, g, beta, o, H, dh, T);
+void kda_scan(float* S, const float* q, const float* k, const float* v, const float* g, const float* beta, float* o, int H,
+              int dh, int T, cudaStream_t s) {
+    if (dh != 128) { std::fprintf(stderr, "kda_scan: head dim %d (128 only)\n", dh); std::exit(1); }
+    kda_scan_kernel<128><<<dim3((unsigned) H, 128 / 32), 32, 0, s>>>(S, q, k, v, g, beta, o, H, T);
     check("kda_scan");
 }
 
