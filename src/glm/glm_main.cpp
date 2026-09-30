@@ -55,7 +55,7 @@ namespace {
 // identical copies on several drives (--mirror) each blob goes to the drive whose queue drains first at its speed.
 class DiskReader {
 public:
-    static constexpr int kParts = 4, kJobs = 16, kDrives = 4;
+    static constexpr int kParts = 4, kJobs = 64, kDrives = 4;
     ~DiskReader() { close(); }
     /// paths: identical copies of experts.bin; gbps: each one's read rate (GB/s), for the balance
     bool open(const std::vector<std::string>& paths, const std::vector<double>& gbps, int threads) {
@@ -439,7 +439,38 @@ struct Engine {
     std::vector<int32_t> res;                                       // per pair: its VRAM slot, or -1
     std::vector<uint8_t*> vslot;
     std::vector<int32_t> slot_pair;                                 // per VRAM slot: its pair
-    static constexpr int kStage = 32;                               // staging slots: a layer's misses (decode: kK)
+    static constexpr int kStage = 32;                               // staging slots: 2 x kBatch (prompt), kK (decode)
+    // the prompt path's pipeline: disk experts read into a pinned ring, copied on pcs into one of two halves of
+    // `stage` while the kernel of the other half runs on s
+    static constexpr int kBatch = kStage / 2, kRing = 48, kRingJob0 = 16;
+    uint8_t* pring = nullptr;
+    size_t ring_stride = 0;
+    cudaStream_t pcs = nullptr;
+    cudaEvent_t ev_copy[2] = {}, ev_done[2] = {}, ev_ring[kRing] = {};
+    unsigned long long* b_ptr[2] = {};                               // device, per half: kBatch blob pointers
+    int32_t *b_start[2] = {}, *b_ng[2] = {}, *b_dst[2] = {}, *b_tok[2] = {};
+    unsigned long long* h_ptr[2] = {};                               // pinned mirrors
+    int32_t *h_start[2] = {}, *h_ng[2] = {}, *h_dst[2] = {}, *h_tok[2] = {};
+    void init_prompt_pipe(int T) {
+        ring_stride = ((size_t) XL.bytes + 8192 + 4095) / 4096 * 4096;
+        CK(cudaHostAlloc((void**) &pring, (size_t) kRing * ring_stride, cudaHostAllocPortable));
+        CK(cudaStreamCreateWithFlags(&pcs, cudaStreamNonBlocking));
+        for (int b = 0; b < 2; ++b) {
+            CK(cudaEventCreateWithFlags(&ev_copy[b], cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&ev_done[b], cudaEventDisableTiming));
+            CK(cudaMalloc(&b_ptr[b], kBatch * sizeof(unsigned long long)));
+            CK(cudaMalloc(&b_start[b], (kBatch + 1) * sizeof(int32_t)));
+            CK(cudaMalloc(&b_ng[b], sizeof(int32_t)));
+            CK(cudaMalloc(&b_dst[b], (size_t) T * kK * sizeof(int32_t)));
+            CK(cudaMalloc(&b_tok[b], (size_t) T * kK * sizeof(int32_t)));
+            CK(cudaMallocHost(&h_ptr[b], kBatch * sizeof(unsigned long long)));
+            CK(cudaMallocHost(&h_start[b], (kBatch + 1) * sizeof(int32_t)));
+            CK(cudaMallocHost(&h_ng[b], sizeof(int32_t)));
+            CK(cudaMallocHost(&h_dst[b], (size_t) T * kK * sizeof(int32_t)));
+            CK(cudaMallocHost(&h_tok[b], (size_t) T * kK * sizeof(int32_t)));
+        }
+        for (auto& ev : ev_ring) CK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+    }
     uint8_t* stage = nullptr;
     unsigned long long* gp_host = nullptr;                          // pinned, kK blob pointers per MoE layer
     struct TierStats { long long vram = 0, ram = 0, file = 0, cpu = 0; double file_wait_s = 0, pf_wait_s = 0; } ts;
@@ -476,6 +507,7 @@ struct Engine {
     // disk reads started for the next layer: (pair, RAM slot) per reader job kK + i
     int pf_n = 0;
     int32_t pf_pair[kK] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    size_t ring_pos = 0;                                             // the prompt path's reads so far (ring order)
     uint8_t* pf_dst[kK];
     long long pf_reads = 0, pf_used = 0;
     // RAM -> VRAM prefetch on its own stream: layer l+1's predicted RAM experts copied into VRAM slots behind layer
@@ -660,11 +692,13 @@ struct Engine {
         tier.rerank(prior);
         tier.set_residency(res.data());
         tiered = true;
-        if (lru) {
+        {
             std::vector<std::string> paths{pack + "/experts.bin"};
             std::vector<double> gbps{10.0};
             for (const auto& mp : mirrors) { paths.push_back(mp); gbps.push_back(7.0); }
             reader.open(paths, gbps, 8);
+        }
+        if (lru) {
             if (cpu_share > 0) cpux.init(cpu_threads, strata::kernels::cpu::expert_layout().fmt[0]);
             std::vector<int32_t> hot_first;
             for (const auto& pr : profile) hot_first.push_back(pr.first * kNE + pr.second);
@@ -903,26 +937,62 @@ struct Engine {
             ts.vram += (long long) resident.size();
             ts.ram += (long long) ram.size();
             ts.file += (long long) disk.size();
+            // the disk reads start first (the longest wait), up to kRing in flight in the pinned ring
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            size_t next_read = 0;
+            auto issue_reads = [&](size_t upto) {
+                for (; next_read < disk.size() && next_read < upto; ++next_read) {
+                    const int slot = (int) (ring_pos + next_read) % kRing;
+                    CK(cudaEventSynchronize(ev_ring[slot]));   // its previous blob has been copied out
+                    reader.start(kRingJob0 + slot, lay.blob_offset(m, disk[next_read].second), XL.bytes, pring + (size_t) slot * ring_stride);
+                }
+            };
+            issue_reads(kRing);
             run(resident);
-            for (const int e : ram) {
-                uint8_t* dst = stage + batch.size() * XL.bytes;
-                CK(cudaMemcpyAsync(dst, tier.stable_blob(m, e), XL.bytes, cudaMemcpyHostToDevice, s));
-                batch.emplace_back(e, dst);
-                if ((int) batch.size() == kStage) { run(batch); batch.clear(); }
+            // the rest through the two halves of `stage`: copies of one half on pcs while the other half computes
+            const size_t n_st = ram.size() + disk.size();
+            for (size_t b0 = 0, bi = 0; b0 < n_st; b0 += kBatch, ++bi) {
+                const int h = (int) (bi & 1);
+                const size_t nb = std::min<size_t>(kBatch, n_st - b0);
+                CK(cudaEventSynchronize(ev_done[h]));   // this half's previous kernel is done: slots and arrays are free
+                int32_t ne = 0;
+                for (size_t k = 0; k < nb; ++k) {
+                    const size_t i = b0 + k;
+                    uint8_t* dst = stage + ((size_t) h * kBatch + k) * XL.bytes;
+                    int e;
+                    if (i < ram.size()) {
+                        e = ram[i];
+                        CK(cudaMemcpyAsync(dst, tier.stable_blob(m, e), XL.bytes, cudaMemcpyHostToDevice, pcs));
+                    } else {
+                        const size_t di = i - ram.size();
+                        e = disk[di].second;
+                        issue_reads(di + kRing);
+                        const int slot = (int) (ring_pos + di) % kRing;
+                        const auto t = std::chrono::steady_clock::now();
+                        if (!reader.wait(kRingJob0 + slot)) { std::fprintf(stderr, "strata-glm: a prompt read failed\n"); std::exit(1); }
+                        ts.file_wait_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+                        CK(cudaMemcpyAsync(dst, pring + (size_t) slot * ring_stride + lay.blob_offset(m, e) % 4096, XL.bytes,
+                                           cudaMemcpyHostToDevice, pcs));
+                        CK(cudaEventRecord(ev_ring[slot], pcs));
+                    }
+                    h_ptr[h][k] = (unsigned long long) dst;
+                    h_start[h][k] = ne;
+                    for (const int32_t en : by[(size_t) e]) { h_tok[h][ne] = en / kK; h_dst[h][ne] = en; ++ne; }
+                }
+                h_start[h][nb] = ne;
+                *h_ng[h] = (int32_t) nb;
+                CK(cudaEventRecord(ev_copy[h], pcs));
+                CK(cudaMemcpyAsync(b_ptr[h], h_ptr[h], nb * sizeof(unsigned long long), cudaMemcpyHostToDevice, s));
+                CK(cudaMemcpyAsync(b_start[h], h_start[h], (nb + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+                CK(cudaMemcpyAsync(b_ng[h], h_ng[h], sizeof(int32_t), cudaMemcpyHostToDevice, s));
+                CK(cudaMemcpyAsync(b_dst[h], h_dst[h], (size_t) ne * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+                CK(cudaMemcpyAsync(b_tok[h], h_tok[h], (size_t) ne * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+                CK(cudaStreamWaitEvent(s, ev_copy[h], 0));
+                strata::kernels::native_expert_grouped_f32(XL, b_ptr[h], b_start[h], b_ng[h], b_dst[h], b_tok[h], kBatch,
+                                                           (int64_t) T * kK, c_xn, c_xscratch, c_rows, s);
+                CK(cudaEventRecord(ev_done[h], s));
             }
-            std::string err;
-            if (!tier.stream(disk, [&](size_t k, const uint8_t* b) {
-                    uint8_t* dst = stage + batch.size() * XL.bytes;
-                    if (cudaMemcpyAsync(dst, b, XL.bytes, cudaMemcpyHostToDevice, s) != cudaSuccess ||
-                        cudaStreamSynchronize(s) != cudaSuccess) return false;   // b is valid until this returns
-                    batch.emplace_back(disk[k].second, dst);
-                    if ((int) batch.size() == kStage) { run(batch); batch.clear(); }
-                    return true;
-                }, 16, err)) {
-                std::fprintf(stderr, "strata-glm: layer %d's experts from the disk: %s\n", l, err.c_str());
-                std::exit(1);
-            }
-            run(batch);
+            ring_pos += disk.size();
         }
         combine_rows_t(c_rows, c_wts, kK, c_y, kEmbd, T, s);
         if (routes) routes->push_back({l, hid});
@@ -1497,8 +1567,11 @@ int main(int argc, char** argv) {
     if (!routes_path.empty()) e.routes = &routes;
     if (chunk > 0) e.init_chunk(chunk, profile.empty());
     if (!profile.empty()) e.init_tier(pack, profile, vram_experts, ram_gib, ram_reserve_gib, vram_reserve_mib);
+    if (chunk > 0 && e.tiered) e.init_prompt_pipe(chunk);
     e.timing_init();
     e.predict_init();
+    const char* nsys_env = std::getenv("GLM_NSYS");   // 1: decode, 2: the prompt (nsys --capture-range=cudaProfilerApi)
+    if (nsys_env && std::atoi(nsys_env) == 2) CK(cudaProfilerStart());
     const auto t0 = std::chrono::steady_clock::now();
     if (chunk > 0) {
         for (size_t i = 0; i < prompt.size(); i += (size_t) chunk) {
@@ -1511,6 +1584,7 @@ int main(int argc, char** argv) {
             e.forward(prompt[i], (int) i, i + 1 == prompt.size() ? dump_dir : std::string());
     }
     const double tp = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (nsys_env && std::atoi(nsys_env) == 2) CK(cudaProfilerStop());
     if (e.tiered) {   // the prompt said which experts this conversation uses: the tiers follow it
         const double ps = (double) (e.ts.vram + e.ts.ram + e.ts.file);
         if (ps > 0)
@@ -1526,7 +1600,7 @@ int main(int argc, char** argv) {
     std::vector<int> out;
     int pos = (int) prompt.size(), steps = 0;
     const Engine::TierStats ts0 = e.ts;
-    const bool nsys = std::getenv("GLM_NSYS") != nullptr;   // nsys --capture-range=cudaProfilerApi: decode only
+    const bool nsys = nsys_env && std::atoi(nsys_env) == 1;
     if (nsys) CK(cudaProfilerStart());
     const auto t1 = std::chrono::steady_clock::now();
     for (int n = 0; n < max_new && pos < max_ctx; ++n) {
