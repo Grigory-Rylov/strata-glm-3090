@@ -7,8 +7,9 @@ and measured on an RTX 5090) + 64 GB of RAM or more, text and pictures.** A fork
 instead of the Q2/Q3 quants Strata ships for. NVFP4 keeps the experts at 4.5 bits with calibrated scales, which is
 why this fork exists: the 2-3 bit quants were noticeably less accurate on the same model.
 
-Strata itself keeps the 63 GiB of routed experts in RAM, caches the most-used ones in VRAM, computes the misses on
-the CPU and over PCIe in parallel with the GPU, and decodes with an MTP draft head. Everything about that design is
+Strata itself keeps the routed experts in RAM (63 GiB here; with less than 96 GB of RAM this fork keeps only the
+ones outside VRAM and reads the rest from the SSD), caches the most-used ones in VRAM, computes the misses on the CPU
+and over PCIe in parallel with the GPU, and decodes with an MTP draft head. Everything about that design is
 upstream's; the original README is kept as [README.upstream.md](README.upstream.md).
 
 ## How it differs from upstream Strata
@@ -101,6 +102,10 @@ RTX 5090 (32 GB, PCIe 5 x16), Ryzen 9 9950X3D, 128 GB DDR5-5600, Samsung 9100 PR
 | Writes answers, 32K context | ~120 tokens/s |
 | Reads a 32K prompt | ~5,500 tokens/s |
 | Start to the first token | ~8 s (63 GiB of experts read at ~10 GiB/s) |
+
+With 64 GB of RAM (the low-RAM mode, measured with the rest of this PC's RAM locked away): ~115 tokens/s short chat,
+9.3 s to the first token of a 32K prompt instead of 5.7, ~20 s to start; the table under Requirements has the
+smaller cards.
 
 Where precision was still being lost, first-token KL divergence from the more exact variant (8 prompts of 1K-8K
 tokens plus one of 32K; two runs of the same configuration differ by a median 0.000007):
@@ -260,8 +265,9 @@ either way - CUDA pins it for the GPU's copies.
 
 ## Limits
 
-- Built and measured on Windows with one sm_120 GPU only; the MMQ and AVX-512 paths assume a Blackwell card and an
-  AVX-512 CPU (both fall back where the code allows, but other setups are untested).
+- Built and measured on Windows with one RTX 5090 and 128 GB of RAM. RTX 20/30/40 cards, smaller VRAM and 64 GB of
+  RAM were tested on that PC through their own code paths and budgets (docs/NVFP4.md), not on the real hardware; a
+  CPU without AVX-512 takes ggml-cpu's AVX2 path for its share of the experts. The low-RAM mode is Windows-only.
 - A decode round (~21 ms) is the GPU running back to back, ~4.6 ms of it pulling the PCIe share of the experts
   and ~3.4 ms waiting for the CPU's share, which reads DRAM at ~55 of the ~65 GB/s this platform does. More VRAM
   for the expert cache or more memory bandwidth are what would move it; docs/NVFP4.md lists what was tried.

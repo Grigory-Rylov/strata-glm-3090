@@ -1,7 +1,7 @@
 # Strata NVFP4 — ready-made engine for Windows
 
 Qwen3.8-Flash-Next (125B hybrid MoE), OrcaRouter's abliteration in ModelOpt NVFP4, on one GeForce RTX 20, 30, 40 or 50
-card with 12 GB of VRAM or more - text and pictures.
+card with 12 GB of VRAM or more and 64 GB of RAM or more - text and pictures.
 Source, measurements and how it works: https://github.com/sergqwer/strata-nvfp4
 
 ## What you need
