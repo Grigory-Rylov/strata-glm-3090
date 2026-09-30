@@ -17,6 +17,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/prefill/moe_mmq.hpp"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -451,6 +452,37 @@ struct Engine {
     int32_t *b_start[2] = {}, *b_ng[2] = {}, *b_dst[2] = {}, *b_tok[2] = {};
     unsigned long long* h_ptr[2] = {};                               // pinned mirrors
     int32_t *h_start[2] = {}, *h_ng[2] = {}, *h_dst[2] = {}, *h_tok[2] = {};
+    // MMQ (llama.cpp's int8 tensor-core products, Strata's moe_mmq): the layer's activations as q8_1 rows in the
+    // order the experts are processed; each staging half's experts in one gate/up and one down launch
+    bool prompt_mmq = true;                                          // --prompt-f32: the exact FP32 expert kernel
+    std::unique_ptr<strata::prefill::mmq::Context> mmq_ctx;
+    int32_t *m_src = nullptr, *m_dst = nullptr, *m_bounds = nullptr, *m_ident = nullptr, *m_rb[2] = {};
+    int32_t *h_src = nullptr, *h_dstv = nullptr, *h_bounds = nullptr, *h_rb[2] = {};
+    uint8_t *m_xq = nullptr, *m_hq = nullptr;
+    float *m_gu = nullptr, *m_h = nullptr, *m_tails[2] = {};
+    void init_prompt_mmq(int T) {
+        namespace mq = strata::prefill::mmq;
+        if (!mq::built() || !mq::supported(XL.gu_type)) { prompt_mmq = false; return; }
+        const size_t E = (size_t) T * kK;
+        CK(cudaMalloc(&m_src, E * sizeof(int32_t)));
+        CK(cudaMalloc(&m_dst, E * sizeof(int32_t)));
+        CK(cudaMalloc(&m_ident, E * sizeof(int32_t)));
+        CK(cudaMalloc(&m_bounds, (kNE + 1) * sizeof(int32_t)));
+        CK(cudaMallocHost(&h_src, E * sizeof(int32_t)));
+        CK(cudaMallocHost(&h_dstv, E * sizeof(int32_t)));
+        CK(cudaMallocHost(&h_bounds, (kNE + 1) * sizeof(int32_t)));
+        for (int b = 0; b < 2; ++b) {
+            CK(cudaMalloc(&m_rb[b], (kBatch + 1) * sizeof(int32_t)));
+            CK(cudaMallocHost(&h_rb[b], (kBatch + 1) * sizeof(int32_t)));
+            CK(cudaMalloc(&m_tails[b], kBatch * 4 * sizeof(float)));
+        }
+        CK(cudaMalloc(&m_xq, mq::q8_bytes((int64_t) E, kEmbd)));
+        CK(cudaMalloc(&m_hq, mq::q8_bytes((int64_t) E, kFF)));
+        CK(cudaMalloc(&m_gu, E * 2 * kFF * sizeof(float)));
+        CK(cudaMalloc(&m_h, E * kFF * sizeof(float)));
+        mq::iota(m_ident, (int64_t) E, s);
+        mmq_ctx = std::make_unique<mq::Context>();
+    }
     void init_prompt_pipe(int T) {
         ring_stride = ((size_t) XL.bytes + 8192 + 4095) / 4096 * 4096;
         CK(cudaHostAlloc((void**) &pring, (size_t) kRing * ring_stride, cudaHostAllocPortable));
@@ -645,7 +677,8 @@ struct Engine {
             std::fprintf(stderr, "strata-glm: %s\n", err.c_str());
             std::exit(1);
         }
-        CK(cudaMalloc(&stage, (size_t) kStage * XL.bytes));
+        CK(cudaMalloc(&stage, (size_t) kStage * XL.bytes + (1 << 20)));   // + MMQ's read past the last expert
+        CK(cudaMemset(stage, 0, (size_t) kStage * XL.bytes + (1 << 20)));
         CK(cudaMallocHost(&x_host, kEmbd * sizeof(float)));
         CK(cudaMallocHost(&cpu_rows, (size_t) kK * kEmbd * sizeof(float)));
         CK(cudaMallocHost(&gq_host, (size_t) kMoe * kK * sizeof(unsigned long long)));
@@ -873,6 +906,97 @@ struct Engine {
         gm.wmat(ly.wo, c_vo, c_y, kEmbd, kMlaH * kDv, T);
     }
 
+    // The tiered prompt path through MMQ: every routed expert of the layer (VRAM's copied device to device, RAM's
+    // and the disk's over PCIe) goes through the two staging halves; a half's experts are one gate/up and one down
+    // launch. Rows (entries) are in processing order: VRAM, RAM, disk.
+    void moe_chunk_mmq(int m, int T, const std::vector<std::vector<int32_t>>& by,
+                       const std::vector<std::pair<int, const uint8_t*>>& resident, const std::vector<int>& ram,
+                       const std::vector<std::pair<int32_t, int32_t>>& disk) {
+        namespace mq = strata::prefill::mmq;
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        const auto& f = lay.fmt[(size_t) m];
+        // MMQ steps from one expert's matrix to the next in whole blocks (expert_bytes / 36): the blobs sit in the
+        // staging slots at a stride that is a multiple of the block (and of 16), not at their own 14,155,792 bytes
+        const size_t S = (XL.bytes + 143) / 144 * 144;
+        std::vector<int> order;
+        std::vector<const uint8_t*> vsrc;
+        for (const auto& [e, b] : resident) { order.push_back(e); vsrc.push_back(b); }
+        for (const int e : ram) order.push_back(e);
+        for (const auto& d : disk) order.push_back(d.second);
+        const size_t n = order.size(), nres = resident.size(), nram = ram.size();
+        CK(cudaEventSynchronize(ev_done[0]));   // the previous layer's uploads from the pinned arrays have run
+        CK(cudaEventSynchronize(ev_done[1]));
+        int32_t r = 0;
+        for (size_t j = 0; j < n; ++j) {
+            h_bounds[j] = r;
+            for (const int32_t en : by[(size_t) order[j]]) { h_src[r] = en / kK; h_dstv[r] = en; ++r; }
+        }
+        h_bounds[n] = r;
+        CK(cudaMemcpyAsync(m_src, h_src, (size_t) r * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(m_dst, h_dstv, (size_t) r * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(m_bounds, h_bounds, (n + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+        mq::quantize(c_xn, m_src, m_xq, XL.gu_type, kEmbd, kEmbd, r, s);
+        // the disk reads start now, kRing in flight
+        const size_t d0 = nres + nram;
+        size_t next_read = 0;
+        auto issue_reads = [&](size_t upto) {
+            for (; next_read < disk.size() && next_read < upto; ++next_read) {
+                const int slot = (int) (ring_pos + next_read) % kRing;
+                CK(cudaEventSynchronize(ev_ring[slot]));
+                reader.start(kRingJob0 + slot, lay.blob_offset(m, disk[next_read].second), XL.bytes, pring + (size_t) slot * ring_stride);
+            }
+        };
+        issue_reads(kRing);
+        for (size_t b0 = 0, bi = 0; b0 < n; b0 += kBatch, ++bi) {
+            const int h = (int) (bi & 1);
+            const int nb = (int) std::min<size_t>(kBatch, n - b0);
+            CK(cudaEventSynchronize(ev_done[h]));
+            uint8_t* half = stage + (size_t) h * kBatch * S;
+            int32_t maxr = 0;
+            for (int k = 0; k < nb; ++k) {
+                const size_t i = b0 + (size_t) k;
+                uint8_t* dst = half + (size_t) k * S;
+                maxr = std::max<int32_t>(maxr, h_bounds[i + 1] - h_bounds[i]);
+                if (i < nres) {
+                    CK(cudaMemcpyAsync(dst, vsrc[i], XL.bytes, cudaMemcpyDeviceToDevice, pcs));
+                } else if (i < d0) {
+                    CK(cudaMemcpyAsync(dst, tier.stable_blob(m, order[i]), XL.bytes, cudaMemcpyHostToDevice, pcs));
+                } else {
+                    const size_t di = i - d0;
+                    issue_reads(di + kRing);
+                    const int slot = (int) (ring_pos + di) % kRing;
+                    const auto t = std::chrono::steady_clock::now();
+                    if (!reader.wait(kRingJob0 + slot)) { std::fprintf(stderr, "strata-glm: a prompt read failed\n"); std::exit(1); }
+                    ts.file_wait_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+                    CK(cudaMemcpyAsync(dst, pring + (size_t) slot * ring_stride + lay.blob_offset(m, order[i]) % 4096,
+                                       XL.bytes, cudaMemcpyHostToDevice, pcs));
+                    CK(cudaEventRecord(ev_ring[slot], pcs));
+                }
+            }
+            CK(cudaEventRecord(ev_copy[h], pcs));
+            const int32_t r0 = h_bounds[b0], nr = h_bounds[b0 + (size_t) nb] - r0;
+            for (int k = 0; k <= nb; ++k) h_rb[h][k] = h_bounds[b0 + (size_t) k] - r0;
+            CK(cudaMemcpyAsync(m_rb[h], h_rb[h], (size_t) (nb + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+            CK(cudaStreamWaitEvent(s, ev_copy[h], 0));
+            glm::gather_tails(half, S, f.tail_off, nb, m_tails[h], s);
+            mq::Product gu;
+            gu.w = half; gu.type = XL.gu_type; gu.w_rows = 2 * kFF; gu.w_cols = kEmbd; gu.expert_bytes = S;
+            gu.n = nb; gu.xq = m_xq; gu.bounds = m_bounds + b0; gu.ids = m_ident; gu.total_rows = r; gu.max_rows = maxr;
+            gu.dst = m_gu; gu.ld_dst = 2 * kFF;
+            mmq_ctx->run(gu, s);
+            glm::swiglu_rows(m_gu, m_h, m_rb[h], nb, m_tails[h], r0, nr, kFF, kSwigluLimit, s);
+            mq::quantize(m_h + (size_t) r0 * kFF, nullptr, m_hq, XL.d_type, kFF, kFF, nr, s);
+            mq::Product dn;
+            dn.w = half + f.down_off; dn.type = XL.d_type; dn.w_rows = kEmbd; dn.w_cols = kFF; dn.expert_bytes = S;
+            dn.n = nb; dn.xq = m_hq; dn.bounds = m_rb[h]; dn.ids = m_dst + r0; dn.total_rows = nr; dn.max_rows = maxr;
+            dn.dst = c_rows; dn.ld_dst = kEmbd;
+            mmq_ctx->run(dn, s);
+            glm::scale_entry_wts(c_wts, m_dst + r0, m_rb[h], nb, m_tails[h], nr, s);
+            CK(cudaEventRecord(ev_done[h], s));
+        }
+        ring_pos += disk.size();
+    }
+
     void moe_chunk(Layer& ly, int l, int T) {
         using namespace glm;
         gm.w16(ly.router, c_xn, c_t1, kNE, kEmbd, T);
@@ -937,6 +1061,12 @@ struct Engine {
             ts.vram += (long long) resident.size();
             ts.ram += (long long) ram.size();
             ts.file += (long long) disk.size();
+            if (prompt_mmq) {
+                moe_chunk_mmq(m, T, by, resident, ram, disk);
+                combine_rows_t(c_rows, c_wts, kK, c_y, kEmbd, T, s);
+                if (routes) routes->push_back({l, hid});
+                return;
+            }
             // the disk reads start first (the longest wait), up to kRing in flight in the pinned ring
             const auto& lay = strata::kernels::cpu::expert_layout();
             size_t next_read = 0;
@@ -1501,7 +1631,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> mirrors;
     double cpu_share = 0;
     int cpu_threads = 14;
-    bool no_prefetch = false, dense_bf16 = false;
+    bool no_prefetch = false, dense_bf16 = false, prompt_f32 = false;
     int pf_copies = 0, pf_reads = 4;
     long long rebalance_vram = 32, rebalance_ram = 64;
     for (int i = 1; i < argc; ++i) {
@@ -1529,6 +1659,7 @@ int main(int argc, char** argv) {
         else if (a == "--pf-copies") pf_copies = std::atoi(next().c_str());
         else if (a == "--pf-reads") pf_reads = std::atoi(next().c_str());
         else if (a == "--dense-bf16") dense_bf16 = true;
+        else if (a == "--prompt-f32") prompt_f32 = true;
         else if (a == "--rebalance-moves") { rebalance_vram = std::atoll(next().c_str()); rebalance_ram = 2 * rebalance_vram; }
         else { std::fprintf(stderr, "strata-glm: unknown argument %s\n", a.c_str()); return 2; }
     }
@@ -1567,7 +1698,11 @@ int main(int argc, char** argv) {
     if (!routes_path.empty()) e.routes = &routes;
     if (chunk > 0) e.init_chunk(chunk, profile.empty());
     if (!profile.empty()) e.init_tier(pack, profile, vram_experts, ram_gib, ram_reserve_gib, vram_reserve_mib);
-    if (chunk > 0 && e.tiered) e.init_prompt_pipe(chunk);
+    if (chunk > 0 && e.tiered) {
+        e.init_prompt_pipe(chunk);
+        if (!prompt_f32) e.init_prompt_mmq(chunk);
+        else e.prompt_mmq = false;
+    }
     e.timing_init();
     e.predict_init();
     const char* nsys_env = std::getenv("GLM_NSYS");   // 1: decode, 2: the prompt (nsys --capture-range=cudaProfilerApi)

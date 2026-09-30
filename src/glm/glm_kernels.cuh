@@ -136,6 +136,15 @@ void idx_scores_rows(const float* q, const float* w, const float* pooled, float*
 /// and its incomplete tail; cnt[t] = how many. On the GPU (glm_select.cu): no host round trip.
 void idx_select_rows(const float* score, int ld, int pos0, int kpool, int budget, int32_t* sel, int sel_ld, int32_t* cnt,
                      int T, cudaStream_t s);
+/// The prompt path's MMQ experts (glm_moe.cu): a group of n blobs `stride` apart; rows r0..r0+nr, expert j owning
+/// [r0 + rb[j], r0 + rb[j+1]) (rb relative, on the device).
+/// tails: out[4j..4j+3] = blob j's {s_gate, s_up, s_down, 0}
+void gather_tails(const uint8_t* base, size_t stride, size_t tail_off, int n, float* out, cudaStream_t s);
+/// h[r] = silu(clamp(gate * s_gate)) * clamp(up * s_up) from MMQ's gate|up rows gu[r] (2 ff wide)
+void swiglu_rows(const float* gu, float* h, const int32_t* rb, int n, const float* tails, long long r0, int nr, int ff,
+                 float lim, cudaStream_t s);
+/// wts[dst[r]] *= s_down of row r's expert (the combine then applies it)
+void scale_entry_wts(float* wts, const int32_t* dst, const int32_t* rb, int n, const float* tails, int nr, cudaStream_t s);
 /// route_topk for T tokens: logits [T][n], ids / wts [T][k]
 void route_rows(const float* logits, const float* bias, int n_expert, int k, float scaling, int32_t* ids, float* wts,
                 int T, cudaStream_t s);
