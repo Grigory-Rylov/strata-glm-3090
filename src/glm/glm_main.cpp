@@ -8,6 +8,7 @@
 // pack's experts.bin and computed by Strata's NVFP4 expert kernel with FP32 activations (native_expert_grouped_f32).
 // --dump-dir writes, at the last prompt token, every layer's output streams (l%02d.f32) - what tools/glm_ref.py
 // --dump-dir writes - and --dump-logits the next token's logits.
+#include "glm_gemm.cuh"
 #include "glm_kernels.cuh"
 #include "strata/kernels/iq_kernels.hpp"
 
@@ -142,6 +143,220 @@ struct Engine {
     int32_t *grp_start, *n_groups, *ent_dst, *ent_tok;
     void* xscratch = nullptr;
     cudaStream_t s = nullptr;
+    // ---- the prompt path (forward_chunk): T <= chunk tokens at once
+    int chunk = 0;
+    glm::Gemm gm;
+    float *c_streams, *c_mix, *c_x, *c_xn, *c_y, *c_post, *c_comb, *c_t1, *c_t2, *c_t3, *c_q, *c_k, *c_v, *c_gf, *c_b, *c_o,
+        *c_gate, *c_qr, *c_qm, *c_qa, *c_ctx, *c_vo, *c_iq, *c_iw, *c_score, *c_rows, *c_wts;
+    int32_t *c_ids, *c_sel, *c_cnt, *c_grp_start, *c_ngroups, *c_ent_dst, *c_ent_tok;
+    unsigned long long* c_grp_ptr;
+    uint8_t* layer_slots = nullptr;                                 // a whole MoE layer's 288 blobs
+    uint8_t* layer_host = nullptr;                                  // pinned staging, one layer
+    void* c_xscratch = nullptr;
+    glm::bf16* c_emb = nullptr;
+    static constexpr int kSelLd = kIdxTopk + kKpool;
+
+    void init_chunk(int T) {
+        chunk = T;
+        gm.init(s, (size_t) T * kMlaH * kR);   // the widest split: the MLA context rows (64 x 512)
+        auto buf = [&](size_t n) { float* p = nullptr; CK(cudaMalloc(&p, n * sizeof(float))); return p; };
+        c_streams = buf((size_t) T * kHc * kEmbd); c_mix = buf((size_t) T * 24); c_x = buf((size_t) T * kEmbd);
+        c_xn = buf((size_t) T * kEmbd); c_y = buf((size_t) T * kEmbd); c_post = buf((size_t) T * 4); c_comb = buf((size_t) T * 16);
+        c_t1 = buf((size_t) T * kDenseFF); c_t2 = buf((size_t) T * kDenseFF); c_t3 = buf((size_t) T * kDenseFF);
+        c_q = buf((size_t) T * kKdaC); c_k = buf((size_t) T * kKdaC); c_v = buf((size_t) T * kKdaC); c_gf = buf((size_t) T * kKdaC);
+        c_b = buf((size_t) T * kKdaH); c_o = buf((size_t) T * kKdaC); c_gate = buf((size_t) T * kKdaC);
+        c_qr = buf((size_t) T * kQLora); c_qm = buf((size_t) T * kMlaH * kDk); c_qa = buf((size_t) T * kMlaH * kR);
+        c_ctx = buf((size_t) T * kMlaH * kR); c_vo = buf((size_t) T * kMlaH * kDv); c_iq = buf((size_t) T * kIdxH * kIdxD);
+        c_iw = buf((size_t) T * kIdxH); c_score = buf((size_t) T * (max_ctx / kKpool + 1));
+        c_rows = buf((size_t) T * kK * kEmbd); c_wts = buf((size_t) T * kK);
+        CK(cudaMalloc(&c_ids, (size_t) T * kK * sizeof(int32_t)));
+        CK(cudaMalloc(&c_sel, (size_t) T * kSelLd * sizeof(int32_t)));
+        CK(cudaMalloc(&c_cnt, (size_t) T * sizeof(int32_t)));
+        CK(cudaMalloc(&c_grp_ptr, kNE * sizeof(unsigned long long)));
+        CK(cudaMalloc(&c_grp_start, (kNE + 1) * sizeof(int32_t)));
+        CK(cudaMalloc(&c_ngroups, sizeof(int32_t)));
+        CK(cudaMalloc(&c_ent_dst, (size_t) T * kK * sizeof(int32_t)));
+        CK(cudaMalloc(&c_ent_tok, (size_t) T * kK * sizeof(int32_t)));
+        CK(cudaMalloc(&c_emb, (size_t) T * kEmbd * sizeof(glm::bf16)));
+        CK(cudaMalloc(&layer_slots, (size_t) kNE * XL.bytes));
+        CK(cudaMallocHost(&layer_host, (size_t) kNE * XL.bytes));
+        CK(cudaMalloc(&c_xscratch, strata::kernels::native_expert_scratch_bytes((int64_t) T * kK, kFF)));
+        size_t fr = 0, tot = 0;
+        cudaMemGetInfo(&fr, &tot);
+        std::fprintf(stderr, "strata-glm: prompt path up to %d tokens a chunk; %.1f GiB of VRAM free\n", T, fr / 1073741824.0);
+    }
+
+    void kda_chunk(Layer& ly, int T) {
+        using namespace glm;
+        gm.w16(ly.wq, c_xn, c_q, kKdaC, kEmbd, T);
+        gm.w16(ly.wk, c_xn, c_k, kKdaC, kEmbd, T);
+        gm.w16(ly.wv, c_xn, c_v, kKdaC, kEmbd, T);
+        conv_silu_seq(c_q, ly.q_conv, ly.conv, c_q, kKdaC, T, s);
+        conv_silu_seq(c_k, ly.k_conv, ly.conv + (size_t) kKdaC * 3, c_k, kKdaC, T, s);
+        conv_silu_seq(c_v, ly.v_conv, ly.conv + (size_t) 2 * kKdaC * 3, c_v, kKdaC, T, s);
+        gm.w16(ly.fa, c_xn, c_t1, kKdaD, kEmbd, T);
+        gm.w16(ly.fb, c_t1, c_gf, kKdaC, kKdaD, T);
+        gm.w16(ly.bproj, c_xn, c_b, kKdaH, kEmbd, T);
+        kda_prep_rows(c_q, c_k, c_gf, ly.dt_bias, ly.A_log, kLowerBound, c_b, kKdaH, kKdaD, T, s);
+        kda_scan(ly.S, c_q, c_k, c_v, c_gf, c_b, c_o, kKdaH, kKdaD, T, s);
+        gm.w16(ly.ga, c_xn, c_t1, kKdaD, kEmbd, T);
+        gm.w16(ly.gb, c_t1, c_gate, kKdaC, kKdaD, T);
+        kda_out_norm_rows(c_o, ly.onorm, c_gate, kEps, kKdaH, kKdaD, T, s);
+        gm.w16(ly.wo, c_o, c_y, kEmbd, kKdaC, T);
+    }
+
+    void dsa_chunk(Layer& ly, int T, int pos0) {
+        using namespace glm;
+        gm.w16(ly.qa, c_xn, c_t1, kQLora, kEmbd, T);
+        rmsnorm(c_t1, ly.qa_norm, kEps, c_qr, kQLora, T, s);
+        gm.w16(ly.qb, c_qr, c_qm, kMlaH * kDk, kQLora, T);
+        gm.w16(ly.kva, c_xn, c_t1, kR, kEmbd, T);
+        rmsnorm(c_t1, ly.kva_norm, kEps, ly.lat + (size_t) pos0 * kR, kR, T, s);
+        gm.w16(ly.iwqb, c_qr, c_iq, kIdxH * kIdxD, kQLora, T);
+        gm.w16(ly.iwk, c_xn, c_t1, kIdxD, kEmbd, T);
+        layernorm_rows(c_t1, ly.ik_w, ly.ik_b, 1e-6f, ly.ikc + (size_t) pos0 * kIdxD, kIdxD, T, s);
+        gm.w16(ly.igate, c_xn, ly.igc + (size_t) pos0 * kIdxD, kIdxD, kEmbd, T);
+        const int pool_lo = pos0 / kKpool, pool_hi = (pos0 + T) / kKpool;   // the pools this chunk completes
+        idx_pool_rows(ly.ikc, ly.igc, ly.iape, ly.pooled, pool_lo, pool_hi - pool_lo, kKpool, kIdxD, s);
+        const int budget = kIdxTopk / kKpool;
+        const int32_t* sel = nullptr;
+        int max_sel = pos0 + T;
+        static const bool dense = std::getenv("GLM_DENSE") != nullptr;   // tests: every visible token
+        if (pool_hi > budget && !dense) {
+            // some query sees more complete pools than the budget: the top ones by the indexer's score, then its tail
+            gm.w16(ly.iwp, c_xn, c_iw, kIdxH, kEmbd, T);
+            idx_scores_rows(c_iq, c_iw, ly.pooled, c_score, pool_hi, kIdxH, kIdxD, pos0, kKpool, T, s);
+            std::vector<float> hs((size_t) T * pool_hi);
+            CK(cudaMemcpyAsync(hs.data(), c_score, hs.size() * sizeof(float), cudaMemcpyDeviceToHost, s));
+            CK(cudaStreamSynchronize(s));
+            std::vector<int32_t> hsel((size_t) T * kSelLd), hcnt((size_t) T);
+            std::vector<int> order;
+            max_sel = 0;
+            for (int t = 0; t < T; ++t) {
+                const int pos = pos0 + t, vp = (pos + 1) / kKpool;
+                int32_t* row = hsel.data() + (size_t) t * kSelLd;
+                int n = 0;
+                if (vp <= budget) {
+                    for (int q = 0; q < vp * kKpool; ++q) row[n++] = q;
+                } else {
+                    order.resize((size_t) vp);
+                    for (int i = 0; i < vp; ++i) order[(size_t) i] = i;
+                    const float* sc = hs.data() + (size_t) t * pool_hi;
+                    std::partial_sort(order.begin(), order.begin() + budget, order.end(),
+                                      [&](int a, int c) { return sc[a] > sc[c]; });
+                    for (int i = 0; i < budget; ++i)
+                        for (int j = 0; j < kKpool; ++j) row[n++] = order[(size_t) i] * kKpool + j;
+                }
+                for (int q = vp * kKpool; q <= pos; ++q) row[n++] = q;   // the incomplete tail
+                hcnt[(size_t) t] = n;
+                max_sel = std::max(max_sel, n);
+            }
+            CK(cudaMemcpyAsync(c_sel, hsel.data(), hsel.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+            CK(cudaMemcpyAsync(c_cnt, hcnt.data(), hcnt.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+            CK(cudaStreamSynchronize(s));
+            sel = c_sel;
+        }
+        const long long ws = (long long) (kDk + kDv) * kR;
+        gm.heads16(ly.kvb, ws, false, c_qm, kMlaH * kDk, c_qa, kMlaH * kR, kR, kDk, T, kMlaH);
+        mla_attend_rows(c_qa, ly.lat, sel, c_cnt, kSelLd, pos0, max_sel, 1.0f / std::sqrt((float) kDk), c_ctx, kMlaH, kR,
+                        T, s);
+        gm.heads16(ly.kvb + (size_t) kDk * kR, ws, true, c_ctx, kMlaH * kR, c_vo, kMlaH * kDv, kDv, kR, T, kMlaH);
+        gm.w16(ly.wo, c_vo, c_y, kEmbd, kMlaH * kDv, T);
+    }
+
+    void moe_chunk(Layer& ly, int l, int T) {
+        using namespace glm;
+        gm.w16(ly.router, c_xn, c_t1, kNE, kEmbd, T);
+        route_rows(c_t1, ly.router_bias, kNE, kK, kRouteScale, c_ids, c_wts, T, s);
+        gm.w16(ly.sg, c_xn, c_t1, kFF, kEmbd, T);
+        gm.w16(ly.su, c_xn, c_t2, kFF, kEmbd, T);
+        swiglu_clamp(c_t1, c_t2, c_t3, T * kFF, kSwigluLimit, s);
+        gm.w16(ly.sd, c_t3, c_y, kEmbd, kFF, T);
+        // the whole layer's experts into their slots (one sequential read), the tokens grouped by expert
+        std::vector<int32_t> hid((size_t) T * kK);
+        CK(cudaMemcpyAsync(hid.data(), c_ids, hid.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, s));
+        const int m = l - kDenseLead;
+        _fseeki64(experts, (long long) m * kNE * (long long) XL.bytes, SEEK_SET);
+        if (std::fread(layer_host, 1, (size_t) kNE * XL.bytes, experts) != (size_t) kNE * XL.bytes) {
+            std::fprintf(stderr, "strata-glm: short read of layer %d's experts\n", l);
+            std::exit(1);
+        }
+        CK(cudaMemcpyAsync(layer_slots, layer_host, (size_t) kNE * XL.bytes, cudaMemcpyHostToDevice, s));
+        CK(cudaStreamSynchronize(s));
+        std::vector<std::vector<int32_t>> by((size_t) kNE);
+        for (int i = 0; i < T * kK; ++i) by[(size_t) hid[(size_t) i]].push_back(i);
+        std::vector<unsigned long long> gp;
+        std::vector<int32_t> gs, et, ed;
+        for (int e = 0; e < kNE; ++e) {
+            if (by[(size_t) e].empty()) continue;
+            gp.push_back((unsigned long long) (layer_slots + (size_t) e * XL.bytes));
+            gs.push_back((int32_t) et.size());
+            for (const int32_t i : by[(size_t) e]) { et.push_back(i / kK); ed.push_back(i); }
+        }
+        gs.push_back((int32_t) et.size());
+        const int32_t ng = (int32_t) gp.size();
+        CK(cudaMemcpyAsync(c_grp_ptr, gp.data(), gp.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(c_grp_start, gs.data(), gs.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(c_ngroups, &ng, sizeof(int32_t), cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(c_ent_tok, et.data(), et.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(c_ent_dst, ed.data(), ed.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+        strata::kernels::native_expert_grouped_f32(XL, c_grp_ptr, c_grp_start, c_ngroups, c_ent_dst, c_ent_tok, ng,
+                                                   (int64_t) T * kK, c_xn, c_xscratch, c_rows, s);
+        combine_rows_t(c_rows, c_wts, kK, c_y, kEmbd, T, s);
+        CK(cudaStreamSynchronize(s));   // the host vectors above
+        if (routes) routes->push_back({l, hid});
+    }
+
+    void dense_chunk(Layer& ly, int T) {
+        using namespace glm;
+        gm.w32(ly.dg, c_xn, c_t1, kDenseFF, kEmbd, T);
+        gm.w32(ly.du, c_xn, c_t2, kDenseFF, kEmbd, T);
+        swiglu_clamp(c_t1, c_t2, c_t3, T * kDenseFF, kSwigluLimit, s);
+        gm.w32(ly.dd, c_t3, c_y, kEmbd, kDenseFF, T);
+    }
+
+    // routing log (for the expert profile): per MoE layer and chunk, the T*K chosen ids
+    struct Route { int layer; std::vector<int32_t> ids; };
+    std::vector<Route>* routes = nullptr;
+
+    // T tokens at positions pos0..: the last one's next-token logits in `logits`
+    void forward_chunk(const int* toks, int T, int pos0, const std::string& dump_dir) {
+        using namespace glm;
+        for (int t = 0; t < T; ++t)
+            CK(cudaMemcpyAsync(c_emb + (size_t) t * kEmbd, embed.data() + (size_t) toks[t] * kEmbd, kEmbd * sizeof(bf16),
+                               cudaMemcpyHostToDevice, s));
+        bf16_to_f32(c_emb, c_x, T * kEmbd, s);
+        for (int t = 0; t < T; ++t)
+            for (int j = 0; j < kHc; ++j)
+                CK(cudaMemcpyAsync(c_streams + ((size_t) t * kHc + j) * kEmbd, c_x + (size_t) t * kEmbd, kEmbd * sizeof(float),
+                                   cudaMemcpyDeviceToDevice, s));
+        for (int l = 0; l < kLayers; ++l) {
+            Layer& ly = L[(size_t) l];
+            gm.w16(ly.hc_attn_fn, c_streams, c_mix, 24, kHc * kEmbd, T);
+            hc_pre_rows(c_streams, c_mix, ly.hc_attn_base, ly.hc_attn_scale, kEmbd, kEps, kHcEps, kSinkhorn, c_x, c_post, c_comb, T, s);
+            rmsnorm(c_x, ly.in_norm, kEps, c_xn, kEmbd, T, s);
+            if (is_dsa(l)) dsa_chunk(ly, T, pos0); else kda_chunk(ly, T);
+            hc_post_rows(c_y, c_streams, c_post, c_comb, c_streams, kEmbd, T, s);
+            gm.w16(ly.hc_ffn_fn, c_streams, c_mix, 24, kHc * kEmbd, T);
+            hc_pre_rows(c_streams, c_mix, ly.hc_ffn_base, ly.hc_ffn_scale, kEmbd, kEps, kHcEps, kSinkhorn, c_x, c_post, c_comb, T, s);
+            rmsnorm(c_x, ly.post_norm, kEps, c_xn, kEmbd, T, s);
+            if (l < kDenseLead) dense_chunk(ly, T); else moe_chunk(ly, l, T);
+            hc_post_rows(c_y, c_streams, c_post, c_comb, c_streams, kEmbd, T, s);
+            if (!dump_dir.empty()) {
+                std::vector<float> h((size_t) kHc * kEmbd);
+                CK(cudaMemcpyAsync(h.data(), c_streams + (size_t) (T - 1) * kHc * kEmbd, h.size() * sizeof(float),
+                                   cudaMemcpyDeviceToHost, s));
+                CK(cudaStreamSynchronize(s));
+                char name[64];
+                std::snprintf(name, sizeof name, "/l%02d.f32", l);
+                if (std::FILE* f = std::fopen((dump_dir + name).c_str(), "wb")) { std::fwrite(h.data(), 4, h.size(), f); std::fclose(f); }
+            }
+        }
+        hc_mean(c_streams + (size_t) (T - 1) * kHc * kEmbd, x, kEmbd, s);
+        rmsnorm(x, final_norm, kEps, xn, kEmbd, 1, s);
+        gemv_bf16(lm_head, xn, logits, kVocab, kEmbd, 1, s);
+        CK(cudaStreamSynchronize(s));
+    }
 
     void load(const std::string& pack) {
         std::string err;
@@ -386,7 +601,8 @@ struct Engine {
 
 int main(int argc, char** argv) {
     std::string pack, tokens_path, dump_dir, dump_logits;
-    int max_new = 16, max_ctx = 8192;
+    int max_new = 16, max_ctx = 8192, chunk = 0;
+    std::string routes_path;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(2); } return argv[++i]; };
@@ -396,6 +612,8 @@ int main(int argc, char** argv) {
         else if (a == "--max-context") max_ctx = std::atoi(next().c_str());
         else if (a == "--dump-dir") dump_dir = next();
         else if (a == "--dump-logits") dump_logits = next();
+        else if (a == "--chunk") chunk = std::atoi(next().c_str());
+        else if (a == "--routes") routes_path = next();
         else { std::fprintf(stderr, "strata-glm: unknown argument %s\n", a.c_str()); return 2; }
     }
     if (pack.empty() || tokens_path.empty()) {
@@ -416,9 +634,30 @@ int main(int argc, char** argv) {
     Engine e;
     e.max_ctx = max_ctx;
     e.load(pack);
+    std::vector<Engine::Route> routes;
+    if (!routes_path.empty()) e.routes = &routes;
+    if (chunk > 0) e.init_chunk(chunk);
     const auto t0 = std::chrono::steady_clock::now();
-    for (size_t i = 0; i < prompt.size(); ++i)
-        e.forward(prompt[i], (int) i, i + 1 == prompt.size() ? dump_dir : std::string());
+    if (chunk > 0) {
+        for (size_t i = 0; i < prompt.size(); i += (size_t) chunk) {
+            const int T = (int) std::min<size_t>((size_t) chunk, prompt.size() - i);
+            e.forward_chunk(prompt.data() + i, T, (int) i, i + T == prompt.size() ? dump_dir : std::string());
+            std::fprintf(stderr, "strata-glm: %zu of %zu prompt tokens\n", i + T, prompt.size());
+        }
+    } else {
+        for (size_t i = 0; i < prompt.size(); ++i)
+            e.forward(prompt[i], (int) i, i + 1 == prompt.size() ? dump_dir : std::string());
+    }
+    if (!routes_path.empty()) {   // layer, then T*K ids per record
+        if (std::FILE* f = std::fopen(routes_path.c_str(), "ab")) {
+            for (const auto& r : routes) {
+                const int32_t hdr[2] = {r.layer, (int32_t) r.ids.size()};
+                std::fwrite(hdr, sizeof hdr, 1, f);
+                std::fwrite(r.ids.data(), sizeof(int32_t), r.ids.size(), f);
+            }
+            std::fclose(f);
+        }
+    }
     const double tp = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::vector<float> lg(kVocab);
     CK(cudaMemcpy(lg.data(), e.logits, lg.size() * sizeof(float), cudaMemcpyDeviceToHost));

@@ -202,10 +202,13 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--dump-dir")
     ap.add_argument("--layers", type=int, default=0, help="stop after this many layers (debugging)")
+    ap.add_argument("--topk", type=int, default=0, help="override index_topk (a huge value: dense attention)")
     a = ap.parse_args()
     d = pathlib.Path(a.model)
     cfg = json.loads((d / "config.json").read_text())
     cfg = cfg.get("text_config", cfg)
+    if a.topk:
+        cfg["index_topk"] = a.topk
     ids = [int(t) for t in pathlib.Path(a.tokens).read_text().replace(",", " ").split()]
     ck = Checkpoint(d)
     w = W(ck)

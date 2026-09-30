@@ -78,4 +78,41 @@ void nvfp4_to_f32(const uint8_t* w, const uint8_t* sc, float s2, float* out, int
 /// BF16 row of the embedding table (host or device) -> FP32
 void bf16_to_f32(const bf16* in, float* out, int n, cudaStream_t s);
 
+
+// ---------------------------------------------------------------- the prompt path: T tokens at once
+/// LayerNorm over nrows rows of n
+void layernorm_rows(const float* x, const bf16* w, const bf16* b, float eps, float* out, int n, int nrows, cudaStream_t s);
+/// hc_pre_finish for T tokens: streams [T][4n], mix [T][24] -> x [T][n], post [T][4], comb [T][16]
+void hc_pre_rows(const float* streams, const float* mix, const bf16* base, const bf16* scale, int n, float rms_eps,
+                 float hc_eps, int iters, float* x, float* post, float* comb, int T, cudaStream_t s);
+/// hc_post for T tokens (in place allowed)
+void hc_post_rows(const float* y, const float* streams_in, const float* post, const float* comb, float* streams_out,
+                  int n, int T, cudaStream_t s);
+/// the causal conv + SiLU over T tokens in order (x, out: [T][C]; state [C][3] carried in and out)
+void conv_silu_seq(const float* x, const float* w, float* state, float* out, int C, int T, cudaStream_t s);
+/// kda_prep for T tokens (q, k, gf: [T][H*dh]; b: [T][H])
+void kda_prep_rows(float* q, float* k, float* gf, const float* dt_bias, const float* A_log, float lower_bound, float* b,
+                   int H, int dh, int T, cudaStream_t s);
+/// the gated delta rule over T tokens in order, S [H][dh][dh] carried in and out; o [T][H*dh]
+void kda_scan(float* S, const float* q, const float* k, const float* v, const float* g, const float* beta, float* o,
+              int H, int dh, int T, cudaStream_t s);
+/// kda_out_norm for T tokens
+void kda_out_norm_rows(float* o, const bf16* w, const float* gate, float eps, int H, int dh, int T, cudaStream_t s);
+/// MLA attention for T queries at positions pos0.. : query t attends to cache rows sel[t][0..cnt[t]) (sel == null:
+/// all rows 0..pos0+t, causal). qa: [T][H][R]; ctx out [T][H][R]; max_sel: the longest list (shared memory).
+void mla_attend_rows(const float* qa, const float* lat, const int32_t* sel, const int32_t* cnt, int sel_ld, int pos0,
+                     int max_sel, float scale, float* ctx, int H, int R, int T, cudaStream_t s);
+/// the pooled keys of pools [p0, p0 + np): pooled[p] from key/gate rows 4p..4p+3
+void idx_pool_rows(const float* key, const float* gate, const bf16* ape, float* pooled, int p0, int np, int kpool, int dim,
+                   cudaStream_t s);
+/// scores [T][n_pool] for queries at positions pos0..; a pool is visible when its last token <= the query's position,
+/// invisible ones get -FLT_MAX
+void idx_scores_rows(const float* q, const float* w, const float* pooled, float* score, int n_pool, int H, int dim,
+                     int pos0, int kpool, int T, cudaStream_t s);
+/// route_topk for T tokens: logits [T][n], ids / wts [T][k]
+void route_rows(const float* logits, const float* bias, int n_expert, int k, float scaling, int32_t* ids, float* wts,
+                int T, cudaStream_t s);
+/// y[t] += sum_j w[t][j] * rows[t*k + j] over n
+void combine_rows_t(const float* rows, const float* w, int k, float* y, int n, int T, cudaStream_t s);
+
 }  // namespace glm
