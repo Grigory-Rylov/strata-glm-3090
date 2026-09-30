@@ -487,6 +487,7 @@ struct Engine {
     int pf_vn = 0;
     long long pf_copies = 0, pf_copies_used = 0;
     int pf_copy_max = 2;                                             // --pf-copies: the most confident N a layer
+    int pf_read_max = kK;                                            // --pf-reads: disk reads for the top N predicted
     int32_t pf_vrank[kK];
     long long pf_rank_n[kK] = {}, pf_rank_used[kK] = {};              // prefetch copies by predicted rank
     void predict_enqueue(int l) {   // layer l's experts from the current streams, on the stream, into pf_ids
@@ -1249,7 +1250,7 @@ struct Engine {
             if (pf) {
                 CK(cudaEventSynchronize(ev_pred));
                 const int mn = m + 1;
-                for (int i = 0; i < kK && pf_n < kK; ++i) {
+                for (int i = 0; i < pf_read_max && pf_n < kK; ++i) {
                     const int32_t q = mn * kNE + pf_ids[i];
                     if (res[(size_t) q] >= 0 || tier.has_copy(mn, pf_ids[i])) continue;
                     bool busy = false;
@@ -1467,7 +1468,7 @@ int main(int argc, char** argv) {
     double cpu_share = 0;
     int cpu_threads = 14;
     bool no_prefetch = false, dense_bf16 = false;
-    int pf_copies = 0;
+    int pf_copies = 0, pf_reads = 4;
     long long rebalance_vram = 32, rebalance_ram = 64;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1492,6 +1493,7 @@ int main(int argc, char** argv) {
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--no-prefetch") no_prefetch = true;
         else if (a == "--pf-copies") pf_copies = std::atoi(next().c_str());
+        else if (a == "--pf-reads") pf_reads = std::atoi(next().c_str());
         else if (a == "--dense-bf16") dense_bf16 = true;
         else if (a == "--rebalance-moves") { rebalance_vram = std::atoll(next().c_str()); rebalance_ram = 2 * rebalance_vram; }
         else { std::fprintf(stderr, "strata-glm: unknown argument %s\n", a.c_str()); return 2; }
@@ -1525,6 +1527,7 @@ int main(int argc, char** argv) {
     e.cpu_threads = cpu_threads;
     e.prefetch = !no_prefetch;
     e.pf_copy_max = pf_copies;
+    e.pf_read_max = std::min(pf_reads, kK);
     e.load(pack);
     std::vector<Engine::Route> routes;
     if (!routes_path.empty()) e.routes = &routes;
