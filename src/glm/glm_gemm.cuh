@@ -20,6 +20,8 @@ public:
     void w16(const bf16* W, const float* X, float* Y, int N, int K, int T, int ldx = 0, int ldy = 0);
     /// the same with FP32 weights
     void w32(const float* W, const float* X, float* Y, int N, int K, int T);
+    /// the same with a Mat: an FP8 one turned into BF16 (exactly) in a scratch buffer, the row scale on Y's columns
+    void wmat(const Mat& W, const float* X, float* Y, int N, int K, int T, int ldx = 0, int ldy = 0);
     /// per head h < H: Y_h[t][:] = X_h[t][:] (Kd) times W_h (row-major [Kd][Nd] when !transW, [Nd][Kd] when transW),
     /// W_h = W + h * w_stride; X_h = X + h * Kd (rows ldx apart); Y_h = Y + h * Nd (rows ldy apart)
     void heads16(const bf16* W, long long w_stride, bool transW, const float* X, int ldx, float* Y, int ldy, int Nd,
@@ -32,6 +34,8 @@ private:
     cudaStream_t s_ = nullptr;
     bf16 *hi_ = nullptr, *lo_ = nullptr;
     size_t cap_ = 0;
+    bf16* wbuf_ = nullptr;   // an FP8 matrix as BF16
+    size_t wcap_ = 0;
 };
 
 }  // namespace glm

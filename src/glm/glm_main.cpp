@@ -18,6 +18,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
+#include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
 #if defined(_WIN32)
@@ -128,8 +129,16 @@ private:
             ov.Offset = (DWORD) p.off;
             ov.OffsetHigh = (DWORD) (p.off >> 32);
             DWORD got = 0;
-            const bool ok = h != INVALID_HANDLE_VALUE && ReadFile(h, p.dst, p.len, &got, &ov) && got == p.len;
-            if (!ok) bad_[p.job].store(1);
+            LARGE_INTEGER fs{};
+            if (h != INVALID_HANDLE_VALUE) GetFileSizeEx(h, &fs);
+            // the last blob's aligned window runs past the end of the file: only the bytes up to it must arrive
+            const uint64_t need = std::min<uint64_t>(p.len, (uint64_t) fs.QuadPart > p.off ? (uint64_t) fs.QuadPart - p.off : 0);
+            const bool ok = h != INVALID_HANDLE_VALUE && ReadFile(h, p.dst, p.len, &got, &ov) && got >= need && need > 0;
+            if (!ok) {
+                bad_[p.job].store(1);
+                std::fprintf(stderr, "strata-glm: read of %u bytes at %llu (drive %d) failed: got %lu, error %lu\n", p.len,
+                             (unsigned long long) p.off, d, (unsigned long) got, (unsigned long) GetLastError());
+            }
             queued_[d].fetch_sub((long long) p.len);
             left_[p.job].fetch_sub(1, std::memory_order_acq_rel);
         }
@@ -331,13 +340,16 @@ struct Layer {
     glm::bf16 *hc_attn_fn, *hc_attn_base, *hc_attn_scale, *hc_ffn_fn, *hc_ffn_base, *hc_ffn_scale;
     glm::bf16 *in_norm, *post_norm;
     // KDA
-    glm::bf16 *wq, *wk, *wv, *fa, *fb, *bproj, *ga, *gb, *onorm, *wo;
+    glm::Mat wq, wk, wv, fa, fb, bproj, ga, gb, wo;
+    glm::bf16* onorm;
     float *q_conv, *k_conv, *v_conv, *dt_bias, *A_log;
     // DSA
-    glm::bf16 *qa, *qa_norm, *qb, *kva, *kva_norm, *kvb, *iwqb, *iwk, *ik_w, *ik_b, *iwp, *igate, *iape;
+    glm::Mat qa, qb, kva, iwqb, iwk, iwp, igate;
+    glm::bf16 *qa_norm, *kva_norm, *kvb, *ik_w, *ik_b, *iape;
     // MLP
-    float *dg = nullptr, *du = nullptr, *dd = nullptr;           // dense (layers 0-2), FP32
-    glm::bf16 *router = nullptr, *sg = nullptr, *su = nullptr, *sd = nullptr;
+    glm::Mat dg, du, dd;                                           // dense (layers 0-2): NVFP4 held exactly in BF16
+    glm::bf16* router = nullptr;
+    glm::Mat sg, su, sd;
     float* router_bias = nullptr;
     // state
     float *S = nullptr, *conv = nullptr;                           // KDA: [H][dh][dh], [3][C][3]
@@ -347,7 +359,50 @@ struct Layer {
 struct Engine {
     Checkpoint ck;
     std::vector<Layer> L;
-    glm::bf16 *final_norm = nullptr, *lm_head = nullptr;
+    glm::bf16* final_norm = nullptr;
+    glm::Mat lm_head;
+    // --dense-bf16: keep the checkpoint's BF16; default: FP8 E4M3 with a scale per row, quantized here once
+    bool dense_fp8 = true;
+    glm::Mat mat(const std::string& name) {
+        glm::Mat m;
+        const TensorRef& r = ck.ref(name);
+        glm::bf16* w = ck.bf(name);
+        m.w = w;
+        if (!dense_fp8 || r.shape.size() != 2 || r.shape[1] % 16) return m;
+        const int rows = (int) r.shape[0], cols = (int) r.shape[1];
+        uint8_t* q = nullptr;
+        float* sc = nullptr;
+        CK(cudaMalloc(&q, (size_t) rows * cols));
+        CK(cudaMalloc(&sc, (size_t) rows * sizeof(float)));
+        glm::quant_fp8_rows(w, rows, cols, q, sc, nullptr);
+        CK(cudaDeviceSynchronize());
+        CK(cudaFree(w));
+        m.w = q;
+        m.scale = sc;
+        m.fp8 = true;
+        return m;
+    }
+    // an NVFP4 matrix held exactly in BF16 (e2m1 x e4m3), weight_scale_2 as the row scale
+    glm::Mat nvfp4_mat(const std::string& prefix, int rows, int cols) {
+        uint8_t* w = ck.dev<uint8_t>(prefix + ".weight", "U8");
+        uint8_t* sc = ck.dev<uint8_t>(prefix + ".weight_scale", "F8_E4M3");
+        const auto s2b = ck.read(prefix + ".weight_scale_2");
+        float s2 = 0.f;
+        std::memcpy(&s2, s2b.data(), 4);
+        glm::bf16* out = nullptr;
+        float* scale = nullptr;
+        CK(cudaMalloc(&out, (size_t) rows * cols * sizeof(glm::bf16)));
+        CK(cudaMalloc(&scale, (size_t) rows * sizeof(float)));
+        glm::nvfp4_to_bf16(w, sc, out, rows, cols, nullptr);
+        glm::fill(scale, s2, rows, nullptr);
+        CK(cudaDeviceSynchronize());
+        cudaFree(w);
+        cudaFree(sc);
+        glm::Mat m;
+        m.w = out;
+        m.scale = scale;
+        return m;
+    }
     std::vector<glm::bf16> embed;                                   // host, BF16 [vocab][embd]
     int max_ctx = 8192;
     // buffers
@@ -426,8 +481,8 @@ struct Engine {
         using namespace glm;
         Layer& ly = L[(size_t) l];
         gemv_bf16(ly.hc_ffn_fn, streams, p_mix, 24, kHc * kEmbd, 1, s);
-        hc_pre_finish(streams, p_mix, ly.hc_ffn_base, ly.hc_ffn_scale, kEmbd, kEps, kHcEps, kSinkhorn, p_x, p_post, p_comb, s);
-        rmsnorm(p_x, ly.post_norm, kEps, p_xn, kEmbd, 1, s);
+        hc_pre_finish(streams, p_mix, ly.hc_ffn_base, ly.hc_ffn_scale, kEmbd, kEps, kHcEps, kSinkhorn, p_x, p_post, p_comb, s,
+                      ly.post_norm, p_xn);
         gemv_bf16(ly.router, p_xn, p_log, kNE, kEmbd, 1, s);
         route_topk(p_log, ly.router_bias, kNE, kK, kRouteScale, p_ids, p_wts, s);
         CK(cudaMemcpyAsync(pf_ids, p_ids, kK * sizeof(int32_t), cudaMemcpyDeviceToHost, s));
@@ -462,8 +517,8 @@ struct Engine {
         if (!predict || l >= kLayers || l < kDenseLead) return;
         Layer& ly = L[(size_t) l];
         gemv_bf16(ly.hc_ffn_fn, streams, p_mix, 24, kHc * kEmbd, 1, s);
-        hc_pre_finish(streams, p_mix, ly.hc_ffn_base, ly.hc_ffn_scale, kEmbd, kEps, kHcEps, kSinkhorn, p_x, p_post, p_comb, s);
-        rmsnorm(p_x, ly.post_norm, kEps, p_xn, kEmbd, 1, s);
+        hc_pre_finish(streams, p_mix, ly.hc_ffn_base, ly.hc_ffn_scale, kEmbd, kEps, kHcEps, kSinkhorn, p_x, p_post, p_comb, s,
+                      ly.post_norm, p_xn);
         gemv_bf16(ly.router, p_xn, p_log, kNE, kEmbd, 1, s);
         route_topk(p_log, ly.router_bias, kNE, kK, kRouteScale, p_ids, p_wts, s);
         CK(cudaMemcpyAsync(pred[v][l], p_ids, kK * sizeof(int32_t), cudaMemcpyDeviceToHost, s));
@@ -708,34 +763,34 @@ struct Engine {
 
     void kda_chunk(Layer& ly, int T) {
         using namespace glm;
-        gm.w16(ly.wq, c_xn, c_q, kKdaC, kEmbd, T);
-        gm.w16(ly.wk, c_xn, c_k, kKdaC, kEmbd, T);
-        gm.w16(ly.wv, c_xn, c_v, kKdaC, kEmbd, T);
+        gm.wmat(ly.wq, c_xn, c_q, kKdaC, kEmbd, T);
+        gm.wmat(ly.wk, c_xn, c_k, kKdaC, kEmbd, T);
+        gm.wmat(ly.wv, c_xn, c_v, kKdaC, kEmbd, T);
         conv_silu_seq(c_q, ly.q_conv, ly.conv, c_q, kKdaC, T, s);
         conv_silu_seq(c_k, ly.k_conv, ly.conv + (size_t) kKdaC * 3, c_k, kKdaC, T, s);
         conv_silu_seq(c_v, ly.v_conv, ly.conv + (size_t) 2 * kKdaC * 3, c_v, kKdaC, T, s);
-        gm.w16(ly.fa, c_xn, c_t1, kKdaD, kEmbd, T);
-        gm.w16(ly.fb, c_t1, c_gf, kKdaC, kKdaD, T);
-        gm.w16(ly.bproj, c_xn, c_b, kKdaH, kEmbd, T);
+        gm.wmat(ly.fa, c_xn, c_t1, kKdaD, kEmbd, T);
+        gm.wmat(ly.fb, c_t1, c_gf, kKdaC, kKdaD, T);
+        gm.wmat(ly.bproj, c_xn, c_b, kKdaH, kEmbd, T);
         kda_prep_rows(c_q, c_k, c_gf, ly.dt_bias, ly.A_log, kLowerBound, c_b, kKdaH, kKdaD, T, s);
         kda_scan(ly.S, c_q, c_k, c_v, c_gf, c_b, c_o, kKdaH, kKdaD, T, s);
-        gm.w16(ly.ga, c_xn, c_t1, kKdaD, kEmbd, T);
-        gm.w16(ly.gb, c_t1, c_gate, kKdaC, kKdaD, T);
+        gm.wmat(ly.ga, c_xn, c_t1, kKdaD, kEmbd, T);
+        gm.wmat(ly.gb, c_t1, c_gate, kKdaC, kKdaD, T);
         kda_out_norm_rows(c_o, ly.onorm, c_gate, kEps, kKdaH, kKdaD, T, s);
-        gm.w16(ly.wo, c_o, c_y, kEmbd, kKdaC, T);
+        gm.wmat(ly.wo, c_o, c_y, kEmbd, kKdaC, T);
     }
 
     void dsa_chunk(Layer& ly, int T, int pos0) {
         using namespace glm;
-        gm.w16(ly.qa, c_xn, c_t1, kQLora, kEmbd, T);
+        gm.wmat(ly.qa, c_xn, c_t1, kQLora, kEmbd, T);
         rmsnorm(c_t1, ly.qa_norm, kEps, c_qr, kQLora, T, s);
-        gm.w16(ly.qb, c_qr, c_qm, kMlaH * kDk, kQLora, T);
-        gm.w16(ly.kva, c_xn, c_t1, kR, kEmbd, T);
+        gm.wmat(ly.qb, c_qr, c_qm, kMlaH * kDk, kQLora, T);
+        gm.wmat(ly.kva, c_xn, c_t1, kR, kEmbd, T);
         rmsnorm(c_t1, ly.kva_norm, kEps, ly.lat + (size_t) pos0 * kR, kR, T, s);
-        gm.w16(ly.iwqb, c_qr, c_iq, kIdxH * kIdxD, kQLora, T);
-        gm.w16(ly.iwk, c_xn, c_t1, kIdxD, kEmbd, T);
+        gm.wmat(ly.iwqb, c_qr, c_iq, kIdxH * kIdxD, kQLora, T);
+        gm.wmat(ly.iwk, c_xn, c_t1, kIdxD, kEmbd, T);
         layernorm_rows(c_t1, ly.ik_w, ly.ik_b, 1e-6f, ly.ikc + (size_t) pos0 * kIdxD, kIdxD, T, s);
-        gm.w16(ly.igate, c_xn, ly.igc + (size_t) pos0 * kIdxD, kIdxD, kEmbd, T);
+        gm.wmat(ly.igate, c_xn, ly.igc + (size_t) pos0 * kIdxD, kIdxD, kEmbd, T);
         const int pool_lo = pos0 / kKpool, pool_hi = (pos0 + T) / kKpool;   // the pools this chunk completes
         idx_pool_rows(ly.ikc, ly.igc, ly.iape, ly.pooled, pool_lo, pool_hi - pool_lo, kKpool, kIdxD, s);
         const int budget = kIdxTopk / kKpool;
@@ -744,7 +799,7 @@ struct Engine {
         static const bool dense = std::getenv("GLM_DENSE") != nullptr;   // tests: every visible token
         if (pool_hi > budget && !dense) {
             // some query sees more complete pools than the budget: the top ones by the indexer's score, then its tail
-            gm.w16(ly.iwp, c_xn, c_iw, kIdxH, kEmbd, T);
+            gm.wmat(ly.iwp, c_xn, c_iw, kIdxH, kEmbd, T);
             idx_scores_rows(c_iq, c_iw, ly.pooled, c_score, pool_hi, kIdxH, kIdxD, pos0, kKpool, T, s);
             std::vector<float> hs((size_t) T * pool_hi);
             CK(cudaMemcpyAsync(hs.data(), c_score, hs.size() * sizeof(float), cudaMemcpyDeviceToHost, s));
@@ -781,17 +836,17 @@ struct Engine {
         mla_attend_rows(c_qa, ly.lat, sel, c_cnt, kSelLd, pos0, max_sel, 1.0f / std::sqrt((float) kDk), c_ctx, kMlaH, kR,
                         T, s);
         gm.heads16(ly.kvb + (size_t) kDk * kR, ws, true, c_ctx, kMlaH * kR, c_vo, kMlaH * kDv, kDv, kR, T, kMlaH);
-        gm.w16(ly.wo, c_vo, c_y, kEmbd, kMlaH * kDv, T);
+        gm.wmat(ly.wo, c_vo, c_y, kEmbd, kMlaH * kDv, T);
     }
 
     void moe_chunk(Layer& ly, int l, int T) {
         using namespace glm;
         gm.w16(ly.router, c_xn, c_t1, kNE, kEmbd, T);
         route_rows(c_t1, ly.router_bias, kNE, kK, kRouteScale, c_ids, c_wts, T, s);
-        gm.w16(ly.sg, c_xn, c_t1, kFF, kEmbd, T);
-        gm.w16(ly.su, c_xn, c_t2, kFF, kEmbd, T);
+        gm.wmat(ly.sg, c_xn, c_t1, kFF, kEmbd, T);
+        gm.wmat(ly.su, c_xn, c_t2, kFF, kEmbd, T);
         swiglu_clamp(c_t1, c_t2, c_t3, T * kFF, kSwigluLimit, s);
-        gm.w16(ly.sd, c_t3, c_y, kEmbd, kFF, T);
+        gm.wmat(ly.sd, c_t3, c_y, kEmbd, kFF, T);
         // the tokens grouped by expert
         std::vector<int32_t> hid((size_t) T * kK);
         CK(cudaMemcpyAsync(hid.data(), c_ids, hid.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, s));
@@ -875,10 +930,10 @@ struct Engine {
 
     void dense_chunk(Layer& ly, int T) {
         using namespace glm;
-        gm.w32(ly.dg, c_xn, c_t1, kDenseFF, kEmbd, T);
-        gm.w32(ly.du, c_xn, c_t2, kDenseFF, kEmbd, T);
+        gm.wmat(ly.dg, c_xn, c_t1, kDenseFF, kEmbd, T);
+        gm.wmat(ly.du, c_xn, c_t2, kDenseFF, kEmbd, T);
         swiglu_clamp(c_t1, c_t2, c_t3, T * kDenseFF, kSwigluLimit, s);
-        gm.w32(ly.dd, c_t3, c_y, kEmbd, kDenseFF, T);
+        gm.wmat(ly.dd, c_t3, c_y, kEmbd, kDenseFF, T);
     }
 
     // routing log (for the expert profile): per MoE layer and chunk, the T*K chosen ids
@@ -921,7 +976,7 @@ struct Engine {
         }
         hc_mean(c_streams + (size_t) (T - 1) * kHc * kEmbd, x, kEmbd, s);
         rmsnorm(x, final_norm, kEps, xn, kEmbd, 1, s);
-        gemv_bf16(lm_head, xn, logits, kVocab, kEmbd, 1, s);
+        gemv(lm_head, xn, logits, kVocab, kEmbd, 1, s);
         CK(cudaStreamSynchronize(s));
     }
 
@@ -939,22 +994,22 @@ struct Engine {
             y.post_norm = ck.bf(p + "post_attention_layernorm.weight");
             const std::string a = p + "self_attn.";
             if (!is_dsa(l)) {
-                y.wq = ck.bf(a + "q_proj.weight"); y.wk = ck.bf(a + "k_proj.weight"); y.wv = ck.bf(a + "v_proj.weight");
+                y.wq = mat(a + "q_proj.weight"); y.wk = mat(a + "k_proj.weight"); y.wv = mat(a + "v_proj.weight");
                 y.q_conv = ck.f32(a + "q_conv1d.weight"); y.k_conv = ck.f32(a + "k_conv1d.weight"); y.v_conv = ck.f32(a + "v_conv1d.weight");
-                y.fa = ck.bf(a + "f_a_proj.weight"); y.fb = ck.bf(a + "f_b_proj.weight");
+                y.fa = mat(a + "f_a_proj.weight"); y.fb = mat(a + "f_b_proj.weight");
                 y.dt_bias = ck.f32(a + "dt_bias"); y.A_log = ck.f32(a + "A_log");
-                y.bproj = ck.bf(a + "b_proj.weight"); y.ga = ck.bf(a + "g_a_proj.weight"); y.gb = ck.bf(a + "g_b_proj.weight");
-                y.onorm = ck.bf(a + "o_norm.weight"); y.wo = ck.bf(a + "o_proj.weight");
+                y.bproj = mat(a + "b_proj.weight"); y.ga = mat(a + "g_a_proj.weight"); y.gb = mat(a + "g_b_proj.weight");
+                y.onorm = ck.bf(a + "o_norm.weight"); y.wo = mat(a + "o_proj.weight");
                 CK(cudaMalloc(&y.S, (size_t) kKdaH * kKdaD * kKdaD * sizeof(float)));
                 CK(cudaMalloc(&y.conv, (size_t) 3 * kKdaC * 3 * sizeof(float)));
             } else {
-                y.qa = ck.bf(a + "q_a_proj.weight"); y.qa_norm = ck.bf(a + "q_a_layernorm.weight"); y.qb = ck.bf(a + "q_b_proj.weight");
-                y.kva = ck.bf(a + "kv_a_proj_with_mqa.weight"); y.kva_norm = ck.bf(a + "kv_a_layernorm.weight"); y.kvb = ck.bf(a + "kv_b_proj.weight");
-                y.wo = ck.bf(a + "o_proj.weight");
+                y.qa = mat(a + "q_a_proj.weight"); y.qa_norm = ck.bf(a + "q_a_layernorm.weight"); y.qb = mat(a + "q_b_proj.weight");
+                y.kva = mat(a + "kv_a_proj_with_mqa.weight"); y.kva_norm = ck.bf(a + "kv_a_layernorm.weight"); y.kvb = ck.bf(a + "kv_b_proj.weight");
+                y.wo = mat(a + "o_proj.weight");
                 const std::string ip = a + "indexer.";
-                y.iwqb = ck.bf(ip + "wq_b.weight"); y.iwk = ck.bf(ip + "wk.weight"); y.ik_w = ck.bf(ip + "k_norm.weight");
-                y.ik_b = ck.bf(ip + "k_norm.bias"); y.iwp = ck.bf(ip + "weights_proj.weight");
-                y.igate = ck.bf(ip + "index_kpool_compress_gate"); y.iape = ck.bf(ip + "index_kpool_compress_ape");
+                y.iwqb = mat(ip + "wq_b.weight"); y.iwk = mat(ip + "wk.weight"); y.ik_w = ck.bf(ip + "k_norm.weight");
+                y.ik_b = ck.bf(ip + "k_norm.bias"); y.iwp = mat(ip + "weights_proj.weight");
+                y.igate = mat(ip + "index_kpool_compress_gate"); y.iape = ck.bf(ip + "index_kpool_compress_ape");
                 CK(cudaMalloc(&y.lat, (size_t) max_ctx * kR * sizeof(float)));
                 CK(cudaMalloc(&y.ikc, (size_t) max_ctx * kIdxD * sizeof(float)));
                 CK(cudaMalloc(&y.igc, (size_t) max_ctx * kIdxD * sizeof(float)));
@@ -962,19 +1017,19 @@ struct Engine {
             }
             const std::string m = p + "mlp.";
             if (l < kDenseLead) {
-                y.dg = ck.nvfp4_f32(m + "gate_proj", kDenseFF, kEmbd);
-                y.du = ck.nvfp4_f32(m + "up_proj", kDenseFF, kEmbd);
-                y.dd = ck.nvfp4_f32(m + "down_proj", kEmbd, kDenseFF);
+                y.dg = nvfp4_mat(m + "gate_proj", kDenseFF, kEmbd);
+                y.du = nvfp4_mat(m + "up_proj", kDenseFF, kEmbd);
+                y.dd = nvfp4_mat(m + "down_proj", kEmbd, kDenseFF);
             } else {
                 y.router = ck.bf(m + "gate.weight");
                 y.router_bias = ck.f32(m + "gate.e_score_correction_bias");
-                y.sg = ck.bf(m + "shared_experts.gate_proj.weight");
-                y.su = ck.bf(m + "shared_experts.up_proj.weight");
-                y.sd = ck.bf(m + "shared_experts.down_proj.weight");
+                y.sg = mat(m + "shared_experts.gate_proj.weight");
+                y.su = mat(m + "shared_experts.up_proj.weight");
+                y.sd = mat(m + "shared_experts.down_proj.weight");
             }
         }
         final_norm = ck.bf("model.language_model.norm.weight");
-        lm_head = ck.bf("lm_head.weight");
+        lm_head = mat("lm_head.weight");
         {
             const auto b = ck.read("model.language_model.embed_tokens.weight");
             embed.resize(b.size() / 2);
@@ -1034,35 +1089,35 @@ struct Engine {
 
     void kda(Layer& ly) {
         using namespace glm;
-        gemv_bf16(ly.wq, xn, q, kKdaC, kEmbd, 1, s);
-        gemv_bf16(ly.wk, xn, k, kKdaC, kEmbd, 1, s);
-        gemv_bf16(ly.wv, xn, v, kKdaC, kEmbd, 1, s);
+        gemv(ly.wq, xn, q, kKdaC, kEmbd, 1, s);
+        gemv(ly.wk, xn, k, kKdaC, kEmbd, 1, s);
+        gemv(ly.wv, xn, v, kKdaC, kEmbd, 1, s);
         conv_silu_step(q, ly.q_conv, ly.conv, q, kKdaC, s);
         conv_silu_step(k, ly.k_conv, ly.conv + (size_t) kKdaC * 3, k, kKdaC, s);
         conv_silu_step(v, ly.v_conv, ly.conv + (size_t) 2 * kKdaC * 3, v, kKdaC, s);
-        gemv_bf16(ly.fa, xn, tmp1, kKdaD, kEmbd, 1, s);
-        gemv_bf16(ly.fb, tmp1, gf, kKdaC, kKdaD, 1, s);
-        gemv_bf16(ly.bproj, xn, b, kKdaH, kEmbd, 1, s);
+        gemv(ly.fa, xn, tmp1, kKdaD, kEmbd, 1, s);
+        gemv(ly.fb, tmp1, gf, kKdaC, kKdaD, 1, s);
+        gemv(ly.bproj, xn, b, kKdaH, kEmbd, 1, s);
         kda_prep(q, k, gf, ly.dt_bias, ly.A_log, kLowerBound, b, kKdaH, kKdaD, s);
         kda_step(ly.S, q, k, v, gf, b, o, kKdaH, kKdaD, s);
-        gemv_bf16(ly.ga, xn, tmp1, kKdaD, kEmbd, 1, s);
-        gemv_bf16(ly.gb, tmp1, gate, kKdaC, kKdaD, 1, s);
+        gemv(ly.ga, xn, tmp1, kKdaD, kEmbd, 1, s);
+        gemv(ly.gb, tmp1, gate, kKdaC, kKdaD, 1, s);
         kda_out_norm(o, ly.onorm, gate, kEps, kKdaH, kKdaD, s);
-        gemv_bf16(ly.wo, o, y, kEmbd, kKdaC, 1, s);
+        gemv(ly.wo, o, y, kEmbd, kKdaC, 1, s);
     }
 
     void dsa(Layer& ly, int pos) {
         using namespace glm;
-        gemv_bf16(ly.qa, xn, tmp1, kQLora, kEmbd, 1, s);
+        gemv(ly.qa, xn, tmp1, kQLora, kEmbd, 1, s);
         rmsnorm(tmp1, ly.qa_norm, kEps, q_resid, kQLora, 1, s);
-        gemv_bf16(ly.qb, q_resid, qm, kMlaH * kDk, kQLora, 1, s);
-        gemv_bf16(ly.kva, xn, tmp1, kR, kEmbd, 1, s);
+        gemv(ly.qb, q_resid, qm, kMlaH * kDk, kQLora, 1, s);
+        gemv(ly.kva, xn, tmp1, kR, kEmbd, 1, s);
         rmsnorm(tmp1, ly.kva_norm, kEps, ly.lat + (size_t) pos * kR, kR, 1, s);
         // the indexer's caches and, when a pool completes, its pooled key
-        gemv_bf16(ly.iwqb, q_resid, iq, kIdxH * kIdxD, kQLora, 1, s);
-        gemv_bf16(ly.iwk, xn, tmp1, kIdxD, kEmbd, 1, s);
+        gemv(ly.iwqb, q_resid, iq, kIdxH * kIdxD, kQLora, 1, s);
+        gemv(ly.iwk, xn, tmp1, kIdxD, kEmbd, 1, s);
         layernorm(tmp1, ly.ik_w, ly.ik_b, 1e-6f, ly.ikc + (size_t) pos * kIdxD, kIdxD, s);
-        gemv_bf16(ly.igate, xn, ly.igc + (size_t) pos * kIdxD, kIdxD, kEmbd, 1, s);
+        gemv(ly.igate, xn, ly.igc + (size_t) pos * kIdxD, kIdxD, kEmbd, 1, s);
         if (pos % kKpool == kKpool - 1) {
             const int p0 = pos - (kKpool - 1);
             idx_pool(ly.ikc + (size_t) p0 * kIdxD, ly.igc + (size_t) p0 * kIdxD, ly.iape, ly.pooled + (size_t) (pos / kKpool) * kIdxD,
@@ -1074,7 +1129,7 @@ struct Engine {
         if (n_pool <= kIdxTopk / kKpool) {
             for (int t = 0; t <= pos; ++t) hsel.push_back(t);
         } else {
-            gemv_bf16(ly.iwp, xn, iw, kIdxH, kEmbd, 1, s);
+            gemv(ly.iwp, xn, iw, kIdxH, kEmbd, 1, s);
             idx_scores(iq, iw, ly.pooled, score, n_pool, kIdxH, kIdxD, s);
             std::vector<float> hs((size_t) n_pool);
             CK(cudaMemcpyAsync(hs.data(), score, hs.size() * sizeof(float), cudaMemcpyDeviceToHost, s));
@@ -1091,7 +1146,7 @@ struct Engine {
         mla_absorb_q(qm, ly.kvb, qa, kMlaH, kDk, kDv, kR, s);
         mla_attend(qa, ly.lat, sel, (int) hsel.size(), 1.0f / std::sqrt((float) kDk), ctx, kMlaH, kR, s);
         mla_value(ctx, ly.kvb, vo, kMlaH, kDk, kDv, kR, s);
-        gemv_bf16(ly.wo, vo, y, kEmbd, kMlaH * kDv, 1, s);
+        gemv(ly.wo, vo, y, kEmbd, kMlaH * kDv, 1, s);
         CK(cudaStreamSynchronize(s));   // hsel lives on this stack frame
     }
 
@@ -1105,10 +1160,10 @@ struct Engine {
         const bool pf = prefetch && l + 1 < kLayers;
         if (pf) predict_enqueue(l + 1);
         // the shared expert (BF16, clamped SwiGLU): the GPU runs it while the host sorts the routed ones
-        gemv_bf16(ly.sg, xn, tmp1, kFF, kEmbd, 1, s);
-        gemv_bf16(ly.su, xn, tmp2, kFF, kEmbd, 1, s);
+        gemv(ly.sg, xn, tmp1, kFF, kEmbd, 1, s);
+        gemv(ly.su, xn, tmp2, kFF, kEmbd, 1, s);
         swiglu_clamp(tmp1, tmp2, tmp3, kFF, kSwigluLimit, s);
-        gemv_bf16(ly.sd, tmp3, y, kEmbd, kFF, 1, s);
+        gemv(ly.sd, tmp3, y, kEmbd, kFF, 1, s);
         CK(cudaEventSynchronize(ev_ids));
         int32_t hid[kK];
         std::memcpy(hid, hid_pin, sizeof(hid));
@@ -1302,10 +1357,10 @@ struct Engine {
 
     void dense_mlp(Layer& ly) {
         using namespace glm;
-        gemv_f32(ly.dg, xn, tmp1, kDenseFF, kEmbd, 1, s);
-        gemv_f32(ly.du, xn, tmp2, kDenseFF, kEmbd, 1, s);
+        gemv(ly.dg, xn, tmp1, kDenseFF, kEmbd, 1, s);
+        gemv(ly.du, xn, tmp2, kDenseFF, kEmbd, 1, s);
         swiglu_clamp(tmp1, tmp2, tmp3, kDenseFF, kSwigluLimit, s);
-        gemv_f32(ly.dd, tmp3, y, kEmbd, kDenseFF, 1, s);
+        gemv(ly.dd, tmp3, y, kEmbd, kDenseFF, 1, s);
     }
 
     // one token at position pos: the next token's logits in `logits`
@@ -1318,13 +1373,13 @@ struct Engine {
         for (int l = 0; l < kLayers; ++l) {
             Layer& ly = L[(size_t) l];
             gemv_bf16(ly.hc_attn_fn, streams, mix, 24, kHc * kEmbd, 1, s);
-            hc_pre_finish(streams, mix, ly.hc_attn_base, ly.hc_attn_scale, kEmbd, kEps, kHcEps, kSinkhorn, x, post, comb, s);
-            rmsnorm(x, ly.in_norm, kEps, xn, kEmbd, 1, s);
+            hc_pre_finish(streams, mix, ly.hc_attn_base, ly.hc_attn_scale, kEmbd, kEps, kHcEps, kSinkhorn, x, post, comb, s,
+                          ly.in_norm, xn);
             if (is_dsa(l)) dsa(ly, pos); else kda(ly);
             hc_post(y, streams, post, comb, streams, kEmbd, s);
             gemv_bf16(ly.hc_ffn_fn, streams, mix, 24, kHc * kEmbd, 1, s);
-            hc_pre_finish(streams, mix, ly.hc_ffn_base, ly.hc_ffn_scale, kEmbd, kEps, kHcEps, kSinkhorn, x, post, comb, s);
-            rmsnorm(x, ly.post_norm, kEps, xn, kEmbd, 1, s);
+            hc_pre_finish(streams, mix, ly.hc_ffn_base, ly.hc_ffn_scale, kEmbd, kEps, kHcEps, kSinkhorn, x, post, comb, s,
+                          ly.post_norm, xn);
             predict_layer(0, l + 1);
             if (l < kDenseLead) dense_mlp(ly); else moe(ly, l);
             hc_post(y, streams, post, comb, streams, kEmbd, s);
@@ -1340,7 +1395,7 @@ struct Engine {
         }
         hc_mean(streams, x, kEmbd, s);
         rmsnorm(x, final_norm, kEps, xn, kEmbd, 1, s);
-        gemv_bf16(lm_head, xn, logits, kVocab, kEmbd, 1, s);
+        gemv(lm_head, xn, logits, kVocab, kEmbd, 1, s);
         CK(cudaStreamSynchronize(s));
     }
 };
@@ -1358,7 +1413,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> mirrors;
     double cpu_share = 0;
     int cpu_threads = 14;
-    bool no_prefetch = false;
+    bool no_prefetch = false, dense_bf16 = false;
     long long rebalance_vram = 32, rebalance_ram = 64;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1382,6 +1437,7 @@ int main(int argc, char** argv) {
         else if (a == "--cpu-share") cpu_share = std::atof(next().c_str());
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--no-prefetch") no_prefetch = true;
+        else if (a == "--dense-bf16") dense_bf16 = true;
         else if (a == "--rebalance-moves") { rebalance_vram = std::atoll(next().c_str()); rebalance_ram = 2 * rebalance_vram; }
         else { std::fprintf(stderr, "strata-glm: unknown argument %s\n", a.c_str()); return 2; }
     }
@@ -1407,6 +1463,7 @@ int main(int argc, char** argv) {
     if (rebalance_every < 0) rebalance_every = policy == "lru" ? 0 : 16;
     Engine e;
     e.max_ctx = max_ctx;
+    e.dense_fp8 = !dense_bf16;
     e.lru = policy == "lru";
     e.mirrors = mirrors;
     e.cpu_share = cpu_share;
@@ -1446,6 +1503,8 @@ int main(int argc, char** argv) {
     std::vector<int> out;
     int pos = (int) prompt.size(), steps = 0;
     const Engine::TierStats ts0 = e.ts;
+    const bool nsys = std::getenv("GLM_NSYS") != nullptr;   // nsys --capture-range=cudaProfilerApi: decode only
+    if (nsys) CK(cudaProfilerStart());
     const auto t1 = std::chrono::steady_clock::now();
     for (int n = 0; n < max_new && pos < max_ctx; ++n) {
         const int tok = (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
@@ -1463,6 +1522,7 @@ int main(int argc, char** argv) {
         CK(cudaMemcpy(lg.data(), e.logits, lg.size() * sizeof(float), cudaMemcpyDeviceToHost));
     }
     const double td = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+    if (nsys) CK(cudaProfilerStop());
     if (!routes_path.empty()) {   // layer, then T*K ids per record (the prompt's chunks, then each decode step)
         if (std::FILE* f = std::fopen(routes_path.c_str(), "ab")) {
             for (const auto& r : routes) {

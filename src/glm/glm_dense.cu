@@ -1,0 +1,190 @@
+// src/glm/glm_dense.cu - strata-glm's dense weights in FP8 (see Mat in glm_kernels.cuh).
+//
+// The dense projections are the whole per-token read besides the experts (~17 GB in BF16): E4M3 with a scale per
+// row halves it and leaves ~8.5 GB of VRAM to the expert tier. Quantized once at load; the prompt path turns a
+// matrix back into BF16 exactly and puts the row scale on its output columns.
+#include "glm_kernels.cuh"
+
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+
+#include <cstdio>
+#include <cstdlib>
+
+namespace glm {
+namespace {
+
+void ck(const char* what) {
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "glm dense %s: %s\n", what, cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+
+__device__ __forceinline__ float bfv(bf16 v) { return __uint_as_float((uint32_t) v << 16); }
+
+__device__ __forceinline__ float2 e4m3x2(uint32_t two) {   // two E4M3 bytes (low one first) -> floats
+    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) (two & 0xffffu), __NV_E4M3);
+    return __half22float2(*(const __half2*) &h);
+}
+
+__device__ __forceinline__ float wsum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+
+// a warp per row, 16 weights per lane per step
+template <int NT>
+__global__ void __launch_bounds__(256) gemv_fp8_kernel(const uint8_t* __restrict__ W, const float* __restrict__ scale,
+                                                       const float* __restrict__ x, float* __restrict__ y, int rows,
+                                                       int cols, int x_ld, int y_ld) {
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= rows) return;
+    const uint4* wr = (const uint4*) (W + (size_t) row * cols);
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.f;
+    for (int c16 = lane; c16 < cols / 16; c16 += 32) {
+        const uint4 u = __ldg(wr + c16);
+        const uint32_t w4[4] = {u.x, u.y, u.z, u.w};
+        float wf[16];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 a = e4m3x2(w4[j]), b = e4m3x2(w4[j] >> 16);
+            wf[4 * j] = a.x; wf[4 * j + 1] = a.y; wf[4 * j + 2] = b.x; wf[4 * j + 3] = b.y;
+        }
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            const float4* xv = (const float4*) (x + (size_t) t * x_ld + (size_t) c16 * 16);
+            float a = 0.f;
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const float4 v = xv[q];
+                a += wf[4 * q] * v.x + wf[4 * q + 1] * v.y + wf[4 * q + 2] * v.z + wf[4 * q + 3] * v.w;
+            }
+            acc[t] += a;
+        }
+    }
+    const float sc = scale[row];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        const float v = wsum(acc[t]);
+        if (lane == 0) y[(size_t) t * y_ld + row] = v * sc;
+    }
+}
+
+__global__ void quant_fp8_kernel(const bf16* __restrict__ w, int cols, uint8_t* __restrict__ q, float* __restrict__ scale) {
+    const size_t r = blockIdx.x;
+    const bf16* wr = w + r * cols;
+    float m = 0.f;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) m = fmaxf(m, fabsf(bfv(wr[c])));
+    __shared__ float part[32];
+    m = fmaxf(m, 0.f);
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = m;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = threadIdx.x < (blockDim.x >> 5) ? part[threadIdx.x] : 0.f;
+        for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+        if (threadIdx.x == 0) part[0] = v;
+    }
+    __syncthreads();
+    const float s = part[0] > 0.f ? part[0] / 448.f : 1.f;
+    if (threadIdx.x == 0) scale[r] = s;
+    const float inv = 1.f / s;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x)
+        q[r * cols + c] = (uint8_t) __nv_cvt_float_to_fp8(bfv(wr[c]) * inv, __NV_SATFINITE, __NV_E4M3);
+}
+
+__global__ void fp8_to_bf16_kernel(const uint8_t* __restrict__ q, bf16* __restrict__ out, size_t n2) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;   // two values
+    if (i >= n2) return;
+    const float2 f = e4m3x2(((const uint16_t*) q)[i]);
+    out[2 * i] = (bf16) (__float_as_uint(f.x) >> 16);       // exact: at most 4 significant bits
+    out[2 * i + 1] = (bf16) (__float_as_uint(f.y) >> 16);
+}
+
+__global__ void scale_cols_kernel(float* __restrict__ Y, const float* __restrict__ scale, int N, int T, int ldy) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t) N * T) return;
+    const size_t t = i / N, c = i % N;
+    Y[t * ldy + c] *= scale[c];
+}
+
+__device__ __forceinline__ float e4m3v(uint8_t b) {
+    const __half_raw h = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t) b, __NV_E4M3);
+    return __half2float(*(const __half*) &h);
+}
+
+__global__ void nvfp4_to_bf16_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ sc, bf16* __restrict__ out,
+                                     int rows, int cols) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;   // one byte = two values
+    if (i >= (long long) rows * cols / 2) return;
+    const float E2M1[16] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6, -0.f, -0.5f, -1, -1.5f, -2, -3, -4, -6};
+    const long long r = i / (cols / 2), c = 2 * (i % (cols / 2));
+    const float s = e4m3v(sc[r * (cols / 16) + c / 16]);
+    const uint8_t b = w[i];
+    out[r * cols + c] = (bf16) (__float_as_uint(E2M1[b & 0xF] * s) >> 16);   // exact: <= 5 significant bits
+    out[r * cols + c + 1] = (bf16) (__float_as_uint(E2M1[b >> 4] * s) >> 16);
+}
+
+__global__ void fill_kernel(float* p, float v, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) p[i] = v;
+}
+
+}  // namespace
+
+void gemv(const Mat& W, const float* x, float* y, int rows, int cols, int nt, cudaStream_t s, int x_ld, int y_ld) {
+    if (!W.fp8) {
+        gemv_bf16(W.b16(), x, y, rows, cols, nt, s, x_ld, y_ld);
+        if (W.scale) scale_cols(y, W.scale, rows, nt, y_ld ? y_ld : rows, s);
+        return;
+    }
+    if (cols % 16) { std::fprintf(stderr, "gemv fp8: cols %d not a multiple of 16\n", cols); std::exit(1); }
+    x_ld = x_ld ? x_ld : cols;
+    y_ld = y_ld ? y_ld : rows;
+    const dim3 g((unsigned) ((rows + 7) / 8));
+    const uint8_t* w = (const uint8_t*) W.w;
+    switch (nt) {
+        case 1: gemv_fp8_kernel<1><<<g, 256, 0, s>>>(w, W.scale, x, y, rows, cols, x_ld, y_ld); break;
+        case 2: gemv_fp8_kernel<2><<<g, 256, 0, s>>>(w, W.scale, x, y, rows, cols, x_ld, y_ld); break;
+        case 4: gemv_fp8_kernel<4><<<g, 256, 0, s>>>(w, W.scale, x, y, rows, cols, x_ld, y_ld); break;
+        case 8: gemv_fp8_kernel<8><<<g, 256, 0, s>>>(w, W.scale, x, y, rows, cols, x_ld, y_ld); break;
+        default:
+            for (int t = 0; t < nt; ++t)
+                gemv_fp8_kernel<1><<<g, 256, 0, s>>>(w, W.scale, x + (size_t) t * x_ld, y + (size_t) t * y_ld, rows, cols, x_ld, y_ld);
+    }
+    ck("gemv fp8");
+}
+
+void quant_fp8_rows(const bf16* w, int rows, int cols, uint8_t* q, float* scale, cudaStream_t s) {
+    quant_fp8_kernel<<<(unsigned) rows, 256, 0, s>>>(w, cols, q, scale);
+    ck("quant_fp8_rows");
+}
+
+void fp8_to_bf16(const uint8_t* q, bf16* out, size_t n, cudaStream_t s) {
+    const size_t n2 = n / 2;
+    fp8_to_bf16_kernel<<<(unsigned) ((n2 + 255) / 256), 256, 0, s>>>(q, out, n2);
+    ck("fp8_to_bf16");
+}
+
+void scale_cols(float* Y, const float* scale, int N, int T, int ldy, cudaStream_t s) {
+    const size_t n = (size_t) N * T;
+    scale_cols_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(Y, scale, N, T, ldy);
+    ck("scale_cols");
+}
+
+void nvfp4_to_bf16(const uint8_t* w, const uint8_t* sc, bf16* out, int rows, int cols, cudaStream_t s) {
+    const long long n = (long long) rows * cols / 2;
+    nvfp4_to_bf16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(w, sc, out, rows, cols);
+    ck("nvfp4_to_bf16");
+}
+
+void fill(float* p, float v, int n, cudaStream_t s) {
+    fill_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(p, v, n);
+    ck("fill");
+}
+
+}  // namespace glm

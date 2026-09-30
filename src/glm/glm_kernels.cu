@@ -116,51 +116,43 @@ __global__ void layernorm_kernel(const float* __restrict__ x, const bf16* __rest
 __global__ void hc_pre_kernel(const float* __restrict__ streams, const float* __restrict__ mix,
                               const bf16* __restrict__ base, const bf16* __restrict__ scale, int n, float rms_eps,
                               float hc_eps, int iters, float* __restrict__ x, float* __restrict__ post_out,
-                              float* __restrict__ comb_out) {
-    __shared__ float pre[4], post[4], comb[16], inv_rms;
+                              float* __restrict__ comb_out, const bf16* __restrict__ norm_w, float* __restrict__ xn) {
+    __shared__ float pre[4];
     float ss = 0.f;
     for (int i = threadIdx.x; i < 4 * n; i += blockDim.x) ss += streams[i] * streams[i];
     ss = block_sum(ss);
-    if (threadIdx.x == 0) {
-        inv_rms = rsqrtf(ss / (float) (4 * n) + rms_eps);
+    if (threadIdx.x < 32) {   // warp 0: lane 4r + c holds comb[r][c]; lanes 0-7 also pre / post
+        const int lane = threadIdx.x, r = (lane >> 2) & 3, c = lane & 3;
+        const float inv_rms = rsqrtf(ss / (float) (4 * n) + rms_eps);
         const float s0 = bf(scale[0]), s1 = bf(scale[1]), s2 = bf(scale[2]);
-        for (int j = 0; j < 4; ++j) {
-            pre[j] = 1.f / (1.f + expf(-(mix[j] * inv_rms * s0 + bf(base[j])))) + hc_eps;
-            post[j] = 2.f / (1.f + expf(-(mix[4 + j] * inv_rms * s1 + bf(base[4 + j]))));
-        }
+        if (lane < 4) pre[lane] = 1.f / (1.f + expf(-(mix[lane] * inv_rms * s0 + bf(base[lane])))) + hc_eps;
+        else if (lane < 8) post_out[lane - 4] = 2.f / (1.f + expf(-(mix[lane] * inv_rms * s1 + bf(base[lane]))));
         // comb: softmax over each row (the last index), + eps, then columns, then (iters-1) x (rows, columns)
-        for (int r = 0; r < 4; ++r) {
-            float m = -FLT_MAX, v[4];
-            for (int c = 0; c < 4; ++c) {
-                v[c] = mix[8 + 4 * r + c] * inv_rms * s2 + bf(base[8 + 4 * r + c]);
-                m = fmaxf(m, v[c]);
-            }
-            float sum = 0.f;
-            for (int c = 0; c < 4; ++c) sum += (v[c] = expf(v[c] - m));
-            for (int c = 0; c < 4; ++c) comb[4 * r + c] = v[c] / sum + hc_eps;
+        const int e = 4 * r + c;
+        const float v = mix[8 + e] * inv_rms * s2 + bf(base[8 + e]);
+        float m = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 1));
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+        const float ev = expf(v - m);
+        auto row_sum = [](float a) { a += __shfl_xor_sync(0xffffffffu, a, 1); return a + __shfl_xor_sync(0xffffffffu, a, 2); };
+        auto col_sum = [](float a) { a += __shfl_xor_sync(0xffffffffu, a, 4); return a + __shfl_xor_sync(0xffffffffu, a, 8); };
+        float cb = ev / row_sum(ev) + hc_eps;
+        cb /= col_sum(cb) + hc_eps;
+        for (int it = 1; it < iters; ++it) {
+            cb /= row_sum(cb) + hc_eps;
+            cb /= col_sum(cb) + hc_eps;
         }
-        auto cols = [&]() {
-            for (int c = 0; c < 4; ++c) {
-                float sum = 0.f;
-                for (int r = 0; r < 4; ++r) sum += comb[4 * r + c];
-                for (int r = 0; r < 4; ++r) comb[4 * r + c] /= sum + hc_eps;
-            }
-        };
-        auto rows = [&]() {
-            for (int r = 0; r < 4; ++r) {
-                float sum = 0.f;
-                for (int c = 0; c < 4; ++c) sum += comb[4 * r + c];
-                for (int c = 0; c < 4; ++c) comb[4 * r + c] /= sum + hc_eps;
-            }
-        };
-        cols();
-        for (int it = 1; it < iters; ++it) { rows(); cols(); }
-        for (int j = 0; j < 4; ++j) post_out[j] = post[j];
-        for (int j = 0; j < 16; ++j) comb_out[j] = comb[j];
+        if (lane < 16) comb_out[lane] = cb;
     }
     __syncthreads();
-    for (int d = threadIdx.x; d < n; d += blockDim.x)
-        x[d] = pre[0] * streams[d] + pre[1] * streams[n + d] + pre[2] * streams[2 * n + d] + pre[3] * streams[3 * n + d];
+    float nss = 0.f;
+    for (int d = threadIdx.x; d < n; d += blockDim.x) {
+        const float v = pre[0] * streams[d] + pre[1] * streams[n + d] + pre[2] * streams[2 * n + d] + pre[3] * streams[3 * n + d];
+        x[d] = v;
+        nss += v * v;
+    }
+    if (xn == nullptr) return;
+    const float inv = rsqrtf(block_sum(nss) / (float) n + rms_eps);
+    for (int d = threadIdx.x; d < n; d += blockDim.x) xn[d] = x[d] * inv * (norm_w ? bf(norm_w[d]) : 1.f);
 }
 
 __global__ void hc_post_kernel(const float* __restrict__ y, const float* streams_in, const float* __restrict__ post,
@@ -332,25 +324,38 @@ __global__ void idx_scores_kernel(const float* __restrict__ q, const float* __re
 // ---------------------------------------------------------------- MoE bits
 __global__ void route_kernel(const float* __restrict__ logits, const float* __restrict__ bias, int n, int k,
                              float scaling, int32_t* __restrict__ ids, float* __restrict__ wts) {
-    if (threadIdx.x != 0) return;
-    float chosen[64];
-    int idx[64];
-    for (int j = 0; j < k; ++j) { chosen[j] = -FLT_MAX; idx[j] = -1; }
-    for (int e = 0; e < n; ++e) {
-        const float sc = 1.f / (1.f + expf(-logits[e])) + bias[e];
-        int pos = k;
-        while (pos > 0 && sc > chosen[pos - 1]) --pos;   // descending; ties keep the lower id first
-        if (pos < k) {
-            for (int j = k - 1; j > pos; --j) { chosen[j] = chosen[j - 1]; idx[j] = idx[j - 1]; }
-            chosen[pos] = sc;
-            idx[pos] = e;
-        }
+    constexpr int kPer = 16;   // n <= 512
+    const int lane = threadIdx.x;
+    float sc[kPer];
+#pragma unroll
+    for (int q = 0; q < kPer; ++q) {
+        const int e = lane + 32 * q;
+        sc[q] = e < n ? 1.f / (1.f + expf(-logits[e])) + bias[e] : -INFINITY;
     }
-    float sum = 0.f;
-    for (int j = 0; j < k; ++j) sum += 1.f / (1.f + expf(-logits[idx[j]]));
+    __shared__ int pick[64];
     for (int j = 0; j < k; ++j) {
-        ids[j] = idx[j];
-        wts[j] = (1.f / (1.f + expf(-logits[idx[j]]))) / (sum + 1e-20f) * scaling;
+        float bv = -INFINITY;
+        int bi = 0x7fffffff;
+#pragma unroll
+        for (int q = 0; q < kPer; ++q)
+            if (sc[q] > bv) { bv = sc[q]; bi = lane + 32 * q; }   // q ascending: the lower id wins a tie
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) pick[j] = bi;
+#pragma unroll
+        for (int q = 0; q < kPer; ++q)
+            if (lane + 32 * q == bi) sc[q] = -INFINITY;
+    }
+    __syncwarp();
+    if (lane != 0) return;
+    float sum = 0.f;
+    for (int j = 0; j < k; ++j) sum += 1.f / (1.f + expf(-logits[pick[j]]));
+    for (int j = 0; j < k; ++j) {
+        ids[j] = pick[j];
+        wts[j] = (1.f / (1.f + expf(-logits[pick[j]]))) / (sum + 1e-20f) * scaling;
     }
 }
 
@@ -434,8 +439,9 @@ void layernorm(const float* x, const bf16* w, const bf16* b, float eps, float* o
 }
 
 void hc_pre_finish(const float* streams, const float* mix, const bf16* base, const bf16* scale, int n, float rms_eps,
-                   float hc_eps, int iters, float* x, float* post, float* comb, cudaStream_t s) {
-    hc_pre_kernel<<<1, 1024, 0, s>>>(streams, mix, base, scale, n, rms_eps, hc_eps, iters, x, post, comb);
+                   float hc_eps, int iters, float* x, float* post, float* comb, cudaStream_t s, const bf16* norm_w,
+                   float* xn) {
+    hc_pre_kernel<<<1, 1024, 0, s>>>(streams, mix, base, scale, n, rms_eps, hc_eps, iters, x, post, comb, norm_w, xn);
     check("hc_pre");
 }
 

@@ -61,6 +61,25 @@ void Gemm::w16(const bf16* W, const float* X, float* Y, int N, int K, int T, int
                      CUDA_R_32F, ldy ? ldy : N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), "bf16 lo");
 }
 
+void Gemm::wmat(const Mat& W, const float* X, float* Y, int N, int K, int T, int ldx, int ldy) {
+    const bf16* w = W.b16();
+    if (W.fp8) {
+        const size_t n = (size_t) N * K;
+        if (n > wcap_) {
+            if (wbuf_) cudaFree(wbuf_);
+            if (cudaMalloc(&wbuf_, n * sizeof(bf16)) != cudaSuccess) {
+                std::fprintf(stderr, "glm gemm: cannot allocate %zu BF16 weights\n", n);
+                std::exit(1);
+            }
+            wcap_ = n;
+        }
+        fp8_to_bf16((const uint8_t*) W.w, wbuf_, n, s_);
+        w = wbuf_;
+    }
+    w16(w, X, Y, N, K, T, ldx, ldy);
+    if (W.scale) scale_cols(Y, W.scale, N, T, ldy ? ldy : N, s_);
+}
+
 void Gemm::w32(const float* W, const float* X, float* Y, int N, int K, int T) {
     const float one = 1.f, zero = 0.f;
     ckb(cublasSgemm(h_, CUBLAS_OP_T, CUBLAS_OP_N, N, T, K, &one, W, K, X, K, &zero, Y, N), "f32");

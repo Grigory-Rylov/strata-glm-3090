@@ -20,6 +20,26 @@ void gemv_bf16(const bf16* W, const float* x, float* y, int rows, int cols, int 
 /// The same with FP32 weights (the leading dense MLP layers, decoded from NVFP4 at load).
 void gemv_f32(const float* W, const float* x, float* y, int rows, int cols, int nt, cudaStream_t s);
 
+/// A dense weight matrix [rows][cols]: BF16, or FP8 E4M3 with an FP32 scale per row. A BF16 matrix may carry
+/// the scale too (the leading dense MLP: its NVFP4 values held exactly in BF16, weight_scale_2 on the output).
+struct Mat {
+    const void* w = nullptr;
+    const float* scale = nullptr;   ///< per row (output), or null
+    bool fp8 = false;
+    const bf16* b16() const { return (const bf16*) w; }
+};
+/// y[t][r] = scale[r] * sum_c W[r][c] * x[t][c], as gemv_bf16 (cols % 16 == 0 for FP8).
+void gemv(const Mat& W, const float* x, float* y, int rows, int cols, int nt, cudaStream_t s, int x_ld = 0, int y_ld = 0);
+/// W (BF16) -> q (E4M3) and scale[r] = amax(row r) / 448, once at load.
+void quant_fp8_rows(const bf16* w, int rows, int cols, uint8_t* q, float* scale, cudaStream_t s);
+/// E4M3 -> BF16, exactly (every E4M3 value is a BF16 value); the prompt path's GEMMs read the result.
+void fp8_to_bf16(const uint8_t* q, bf16* out, size_t n, cudaStream_t s);
+/// Y[t][n] *= scale[n] for t < T (row stride ldy).
+void scale_cols(float* Y, const float* scale, int N, int T, int ldy, cudaStream_t s);
+/// NVFP4 (codes, E4M3 block scales) -> BF16 without weight_scale_2: e2m1 x e4m3 has at most 5 significant bits.
+void nvfp4_to_bf16(const uint8_t* w, const uint8_t* sc, bf16* out, int rows, int cols, cudaStream_t s);
+void fill(float* p, float v, int n, cudaStream_t s);
+
 /// out = x * rsqrt(mean(x^2) + eps) * w (w BF16, or none) over rows of n; nrows rows.
 void rmsnorm(const float* x, const bf16* w, float eps, float* out, int n, int nrows, cudaStream_t s);
 /// LayerNorm with BF16 weight and bias (the indexer's k_norm).
@@ -28,7 +48,9 @@ void layernorm(const float* x, const bf16* w, const bf16* b, float eps, float* o
 /// mHC pre: from the 4 streams (hc x n) and the raw mixes `mix` (24 = fn . streams, before the input norm's
 /// 1/rms), writes collapsed x (n), post (4) and comb (4x4, [m][n] = input stream m into output stream n).
 void hc_pre_finish(const float* streams, const float* mix, const bf16* base, const bf16* scale, int n, float rms_eps,
-                   float hc_eps, int sinkhorn_iters, float* x, float* post, float* comb, cudaStream_t s);
+                   float hc_eps, int sinkhorn_iters, float* x, float* post, float* comb, cudaStream_t s,
+                   const bf16* norm_w = nullptr, float* xn = nullptr);
+/// (with norm_w and xn: also xn = rmsnorm(x) * norm_w, eps rms_eps - the layer's input norm in the same launch)
 /// streams_out[j] = post[j] * y + sum_m comb[m][j] * streams_in[m] (may alias streams_in: it is read first).
 void hc_post(const float* y, const float* streams_in, const float* post, const float* comb, float* streams_out, int n,
              cudaStream_t s);
