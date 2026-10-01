@@ -729,6 +729,7 @@ struct Engine {
     // --skip-disk W (lossy, opt-in): a routed expert that is only on the disk and whose normalized routing weight is
     // below W is left out (the others' weights rescaled to the same sum) instead of waited for
     float skip_disk = 0.f;
+    float skip_ram = 0.f;   // --skip-ram W (lossy, opt-in): the same for an expert in RAM (saves its PCIe copy)
     float* wts_pin = nullptr;
     long long skipped = 0;
     std::vector<int32_t> pending_free;                               // RAM copies of experts that moved to VRAM
@@ -1843,7 +1844,7 @@ struct Engine {
         gemv_bf16(ly.router, xn, tmp1, kNE, kEmbd, 1, s);
         route_topk(tmp1, ly.router_bias, kNE, kK, kRouteScale, ids, wts, s);
         CK(cudaMemcpyAsync(hid_pin, ids, kK * sizeof(int32_t), cudaMemcpyDeviceToHost, s));
-        if (skip_disk > 0) CK(cudaMemcpyAsync(wts_pin, wts, kK * sizeof(float), cudaMemcpyDeviceToHost, s));
+        if (skip_disk > 0 || skip_ram > 0) CK(cudaMemcpyAsync(wts_pin, wts, kK * sizeof(float), cudaMemcpyDeviceToHost, s));
         if (cpu_share > 0) CK(cudaMemcpyAsync(x_host, xn, kEmbd * sizeof(float), cudaMemcpyDeviceToHost, s));
         CK(cudaEventRecord(ev_ids, s));
         const bool pf = prefetch && l + 1 < kLayers;
@@ -1956,7 +1957,11 @@ struct Engine {
             bool skipj[kK] = {};
             for (int j = 0; j < kK; ++j) {   // on the disk: into the RAM slot of the least recent member outside VRAM
                 if (done[j] || tier.has_copy(m, hid[j]) || pfj[j] >= 0 || spj[j] >= 0) continue;
-                if (skip_disk > 0 && wts_pin[j] / kRouteScale < skip_disk) { skipj[j] = done[j] = true; ++skipped; continue; }
+                if (std::max(skip_disk, skip_ram) > 0 && wts_pin[j] / kRouteScale < std::max(skip_disk, skip_ram)) {
+                    skipj[j] = done[j] = true;
+                    ++skipped;
+                    continue;
+                }
                 const int32_t v = ram_pick(pj);
                 if (v < 0) continue;   // nothing to evict: staged below through the tier's own read
                 tier.promote_done(v / kNE, v % kNE);   // its slot becomes the spare demote_begin takes
@@ -1992,6 +1997,7 @@ struct Engine {
             }
             for (int j = 0; j < kK; ++j) {   // in RAM: copied into a VRAM slot (it was going to the GPU anyway)
                 if (done[j] || dslot[j] != nullptr || pfj[j] >= 0 || spj[j] >= 0) continue;
+                if (skip_ram > 0 && wts_pin[j] / kRouteScale < skip_ram) { skipj[j] = done[j] = true; ++skipped; continue; }
                 const uint8_t* b = tier.has_copy(m, hid[j]) ? tier.stable_blob(m, hid[j]) : tier.blob(m, hid[j]);
                 if (b == nullptr) { std::fprintf(stderr, "strata-glm: no bytes for expert %d of layer %d\n", hid[j], l); std::exit(1); }
                 const bool in_ram = tier.has_copy(m, hid[j]);
@@ -2264,7 +2270,7 @@ int main(int argc, char** argv) {
     int cpu_threads = 14;
     bool no_prefetch = false, dense_bf16 = false, prompt_f32 = false, ram_exclusive = false;
     double vram_static = 0.7;   // --vram-static 0: VRAM all LRU (inclusive)
-    float skip_disk = 0.f;
+    float skip_disk = 0.f, skip_ram = 0.f;
     std::string teacher_path, step_logits_path;   // decode forced to these tokens; every step's logits written out
     int pf_copies = 2, pf_reads = 6;   // reads 6: chat_uk +1.3%, chat_code +0.7% over 4 (8: no better)
     // formats (KL to BF16 dense + FP16 latent, 48 teacher-forced steps after a 2600-token prompt, median): int8 dense
@@ -2310,6 +2316,7 @@ int main(int argc, char** argv) {
         else if (a == "--ram-exclusive") ram_exclusive = true;
         else if (a == "--vram-static") vram_static = std::atof(next().c_str());
         else if (a == "--skip-disk") skip_disk = (float) std::atof(next().c_str());
+        else if (a == "--skip-ram") skip_ram = (float) std::atof(next().c_str());
         else if (a == "--teacher") teacher_path = next();
         else if (a == "--dump-step-logits") step_logits_path = next();
         else if (a == "--rebalance-moves") { rebalance_vram = std::atoll(next().c_str()); rebalance_ram = 2 * rebalance_vram; }
@@ -2358,6 +2365,7 @@ int main(int argc, char** argv) {
     e.excl = ram_exclusive;
     e.vram_static = vram_static;
     e.skip_disk = skip_disk;
+    e.skip_ram = skip_ram;
     e.mirrors = mirrors;
     e.cpu_share = cpu_share;
     e.cpu_threads = cpu_threads;
@@ -2442,7 +2450,7 @@ int main(int argc, char** argv) {
     const double td = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
     if (nsys) CK(cudaProfilerStop());
     if (step_f) std::fclose(step_f);
-    if (e.skipped > 0 && steps > 0) std::fprintf(stderr, "strata-glm: skipped %.1f disk experts a token\n", (double) e.skipped / steps);
+    if (e.skipped > 0 && steps > 0) std::fprintf(stderr, "strata-glm: skipped %.1f experts outside VRAM a token\n", (double) e.skipped / steps);
     if (!routes_path.empty()) {   // layer, then T*K ids per record (the prompt's chunks, then each decode step)
         if (std::FILE* f = std::fopen(routes_path.c_str(), "ab")) {
             for (const auto& r : routes) {
