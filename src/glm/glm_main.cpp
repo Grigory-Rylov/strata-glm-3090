@@ -1134,7 +1134,9 @@ struct Engine {
         if (pool_hi > budget && !dense) {
             // some query sees more complete pools than the budget: the top ones by the indexer's score, then its tail
             gm.wmat(ly.iwp, c_xn, c_iw, kIdxH, kEmbd, T);
-            idx_scores_rows(c_iq, c_iw, ly.pooled, c_score, pool_hi, kIdxH, kIdxD, pos0, kKpool, T, s);
+            static const bool idx_old = std::getenv("GLM_IDX_OLD") != nullptr;
+            if (idx_old) idx_scores_rows(c_iq, c_iw, ly.pooled, c_score, pool_hi, kIdxH, kIdxD, pos0, kKpool, T, s);
+            else idx_scores_tc(c_iq, c_iw, ly.pooled, c_score, pool_hi, pos0, kKpool, T, s);
             idx_select_rows(c_score, pool_hi, pos0, kKpool, budget, c_sel, kSelLd, c_cnt, T, s);
             max_sel = kSelLd;
             sel = c_sel;

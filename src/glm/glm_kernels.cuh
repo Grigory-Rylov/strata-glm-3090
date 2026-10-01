@@ -164,6 +164,9 @@ size_t mla_tc_part_floats(int T, int nsplit);
 /// conv_silu_seq's scratch (C x T floats) up front / back
 void conv_silu_reserve(size_t n);
 void conv_silu_release();
+/// idx_scores_rows on tensor cores (FP16 WMMA), for the 32 x 128 indexer: the prompt path's long chunks
+void idx_scores_tc(const float* q, const float* w, const float* pooled, float* score, int n_pool, int pos0, int kpool, int T,
+                   cudaStream_t s);
 /// route_topk for T tokens: logits [T][n], ids / wts [T][k]
 void route_rows(const float* logits, const float* bias, int n_expert, int k, float scaling, int32_t* ids, float* wts,
                 int T, cudaStream_t s);

@@ -7,6 +7,11 @@
 // lower pools), so a run is deterministic and needs no host round trip.
 #include "glm_kernels.cuh"
 
+#include <cuda_fp16.h>
+#include <mma.h>
+
+#include <cfloat>
+
 #include <cstdio>
 #include <cstdlib>
 
@@ -105,7 +110,81 @@ __global__ void __launch_bounds__(1024) idx_select_kernel(const float* __restric
     if (tid == 0) cnt[t] = base + (pos + 1 - tail0);
 }
 
+// The indexer's scores on tensor cores: score[t][p] = H^-1/2 sum_h w[t][h] relu(q[t][h] . pooled[p] / sqrt(D)), D =
+// 128, H = 32. A block takes 2 queries (64 head rows of Q, FP16 in shared memory) and walks a span of pools 64 at a
+// time: S = Q P^T in WMMA fragments, then each (query, pool) sums its 32 heads. Pools whose last token comes after
+// the query are -FLT_MAX. Quadratic in the context (a query sees every pool), so at 262K it matters.
+constexpr int kD = 128, kQH = 32, kQT = 2, kPT = 64, kDl = kD + 8;
+__global__ void __launch_bounds__(128) idx_scores_tc_kernel(const float* __restrict__ q, const float* __restrict__ w,
+                                                            const float* __restrict__ pooled, float* __restrict__ score,
+                                                            int n_pool, int pos0, int kpool, int T, int span) {
+    using namespace nvcuda;
+    extern __shared__ __align__(32) unsigned char sm[];
+    __half* Qs = (__half*) sm;                                   // [kQT * kQH][kDl]
+    __half* Ps = Qs + kQT * kQH * kDl;                            // [kPT][kDl]
+    float* Ss = (float*) (Ps + kPT * kDl);                       // [kQT * kQH][kPT]
+    const int t0 = blockIdx.y * kQT, p_begin = blockIdx.x * span, tid = threadIdx.x, warp = tid >> 5;
+    const float sc = rsqrtf((float) kD), hs = rsqrtf((float) kQH);
+    for (int i = tid; i < kQT * kQH * kD; i += 128) {
+        const int r = i / kD, d = i % kD, t = t0 + r / kQH;
+        Qs[r * kDl + d] = __float2half(t < T ? q[(size_t) t * kQH * kD + (size_t) (r % kQH) * kD + d] : 0.f);
+    }
+    for (int pb = p_begin; pb < min(n_pool, p_begin + span); pb += kPT) {
+        __syncthreads();
+        for (int i = tid; i < kPT * kD; i += 128) {
+            const int r = i / kD, d = i % kD, pp = pb + r;
+            Ps[r * kDl + d] = __float2half(pp < n_pool ? pooled[(size_t) pp * kD + d] : 0.f);
+        }
+        __syncthreads();
+        // warp w: head rows 16w..16w+15 x all 64 pools
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+        for (int f = 0; f < 4; ++f) wmma::fill_fragment(acc[f], 0.f);
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b;
+        for (int kk = 0; kk < kD; kk += 16) {
+            wmma::load_matrix_sync(a, Qs + (warp * 16) * kDl + kk, kDl);
+            for (int f = 0; f < 4; ++f) {
+                wmma::load_matrix_sync(b, Ps + (f * 16) * kDl + kk, kDl);
+                wmma::mma_sync(acc[f], a, b, acc[f]);
+            }
+        }
+        for (int f = 0; f < 4; ++f) wmma::store_matrix_sync(Ss + (warp * 16) * kPT + f * 16, acc[f], kPT, wmma::mem_row_major);
+        __syncthreads();
+        {   // 128 threads = 2 queries x 64 pools
+            const int qi = tid / kPT, pl = tid % kPT, t = t0 + qi, pp = pb + pl;
+            if (t < T && pp < n_pool) {
+                float total = -FLT_MAX;
+                if (pp * kpool + kpool - 1 <= pos0 + t) {
+                    total = 0.f;
+                    const float* wt = w + (size_t) t * kQH;
+                    for (int h = 0; h < kQH; ++h) total += wt[h] * fmaxf(Ss[(qi * kQH + h) * kPT + pl] * sc, 0.f);
+                    total *= hs;
+                }
+                score[(size_t) t * n_pool + pp] = total;
+            }
+        }
+    }
+}
+
 }  // namespace
+
+void idx_scores_tc(const float* q, const float* w, const float* pooled, float* score, int n_pool, int pos0, int kpool, int T,
+                   cudaStream_t s) {
+    constexpr size_t smem = (size_t) (kQT * kQH + kPT) * kDl * 2 + (size_t) kQT * kQH * kPT * 4;
+    static bool attr = false;
+    if (!attr) {
+        cudaFuncSetAttribute(idx_scores_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+        attr = true;
+    }
+    const int span = 1024;
+    idx_scores_tc_kernel<<<dim3((unsigned) ((n_pool + span - 1) / span), (unsigned) ((T + kQT - 1) / kQT)), 128, smem, s>>>(
+        q, w, pooled, score, n_pool, pos0, kpool, T, span);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "glm idx_scores_tc: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
 
 void idx_select_rows(const float* score, int ld, int pos0, int kpool, int budget, int32_t* sel, int sel_ld, int32_t* cnt,
                      int T, cudaStream_t s) {
