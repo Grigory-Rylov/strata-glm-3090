@@ -2227,10 +2227,11 @@ int main(int argc, char** argv) {
     float skip_disk = 0.f;
     std::string teacher_path, step_logits_path;   // decode forced to these tokens; every step's logits written out
     int pf_copies = 2, pf_reads = 4;
-    // defaults that trade a little accuracy for VRAM (KL to BF16 dense over 129 teacher-forced steps: FP8 0.023 ->
-    // this mix ~0.02-0.03; --dense-fp4 none --dense-fp8 --latent-f16 restore the FP8 / FP16 formats)
+    // formats (KL to BF16 dense + FP16 latent, 48 teacher-forced steps after a 2600-token prompt, median): int8 dense
+    // 0.0078 (old FP8: 0.0135); + NVFP4 KDA q/k 0.017 for 1 GB of VRAM; NVFP4 head / shared / mla add 0.006-0.012
+    // each, all of them 0.041 (top-1 83%) - opt-in. --dense-fp4 none --dense-fp8 --latent-f16 restore the old ones.
     bool pf_stage_on = false, ram_lru = false, latent_i8 = true;
-    std::string dense_fp4 = "kdaqk,mla,shared,head";   // KDA's v/o stay 8-bit: NVFP4 there doubled the median KL
+    std::string dense_fp4 = "kdaqk";
     bool dense_i8 = true;
     long long rebalance_vram = 32, rebalance_ram = 64;
     for (int i = 1; i < argc; ++i) {
