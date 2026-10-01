@@ -128,8 +128,10 @@ __global__ void layernorm_kernel(const float* __restrict__ x, const bf16* __rest
 __global__ void hc_pre_kernel(const float* __restrict__ streams, const float* __restrict__ mix,
                               const bf16* __restrict__ base, const bf16* __restrict__ scale, int n, float rms_eps,
                               float hc_eps, int iters, float* __restrict__ x, float* __restrict__ post_out,
-                              float* __restrict__ comb_out, const bf16* __restrict__ norm_w, float* __restrict__ xn) {
+                              float* __restrict__ comb_out, const bf16* __restrict__ norm_w, float* __restrict__ xn,
+                              int mix_parts) {
     __shared__ float pre[4];
+    auto mixv = [&](int i) { float v = 0.f; for (int p = 0; p < mix_parts; ++p) v += mix[p * 24 + i]; return v; };
     float ss = 0.f;
     for (int i = threadIdx.x; i < 4 * n; i += blockDim.x) ss += streams[i] * streams[i];
     ss = block_sum(ss);
@@ -137,11 +139,11 @@ __global__ void hc_pre_kernel(const float* __restrict__ streams, const float* __
         const int lane = threadIdx.x, r = (lane >> 2) & 3, c = lane & 3;
         const float inv_rms = rsqrtf(ss / (float) (4 * n) + rms_eps);
         const float s0 = bf(scale[0]), s1 = bf(scale[1]), s2 = bf(scale[2]);
-        if (lane < 4) pre[lane] = 1.f / (1.f + expf(-(mix[lane] * inv_rms * s0 + bf(base[lane])))) + hc_eps;
-        else if (lane < 8) post_out[lane - 4] = 2.f / (1.f + expf(-(mix[lane] * inv_rms * s1 + bf(base[lane]))));
+        if (lane < 4) pre[lane] = 1.f / (1.f + expf(-(mixv(lane) * inv_rms * s0 + bf(base[lane])))) + hc_eps;
+        else if (lane < 8) post_out[lane - 4] = 2.f / (1.f + expf(-(mixv(lane) * inv_rms * s1 + bf(base[lane]))));
         // comb: softmax over each row (the last index), + eps, then columns, then (iters-1) x (rows, columns)
         const int e = 4 * r + c;
-        const float v = mix[8 + e] * inv_rms * s2 + bf(base[8 + e]);
+        const float v = mixv(8 + e) * inv_rms * s2 + bf(base[8 + e]);
         float m = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 1));
         m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
         const float ev = expf(v - m);
@@ -455,10 +457,38 @@ void layernorm(const float* x, const bf16* w, const bf16* b, float eps, float* o
     check("layernorm");
 }
 
+// rows x cols (BF16) times x into parts [nparts][rows]: block p takes columns [p cols/nparts, (p+1) cols/nparts),
+// a warp per row (rows <= 32 over 8 warps), 8 columns a lane per step
+__global__ void __launch_bounds__(256) hc_mix_kernel(const bf16* __restrict__ W, const float* __restrict__ x,
+                                                     float* __restrict__ parts, int rows, int cols, int span) {
+    const int p = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31, c0 = p * span;
+    for (int r = warp; r < rows; r += 8) {
+        const uint4* wr = (const uint4*) (W + (size_t) r * cols + c0);
+        const float4* xv = (const float4*) (x + c0);
+        float acc = 0.f;
+        for (int c8 = lane; c8 < span / 8; c8 += 32) {
+            const uint4 u = __ldg(wr + c8);
+            const float4 a = xv[2 * c8], b = xv[2 * c8 + 1];
+            acc += __uint_as_float(u.x << 16) * a.x + __uint_as_float(u.x & 0xffff0000u) * a.y +
+                   __uint_as_float(u.y << 16) * a.z + __uint_as_float(u.y & 0xffff0000u) * a.w +
+                   __uint_as_float(u.z << 16) * b.x + __uint_as_float(u.z & 0xffff0000u) * b.y +
+                   __uint_as_float(u.w << 16) * b.z + __uint_as_float(u.w & 0xffff0000u) * b.w;
+        }
+        acc = warp_sum(acc);
+        if (lane == 0) parts[p * 24 + r] = acc;
+    }
+}
+
+void hc_mix(const bf16* W, const float* x, float* parts, int rows, int cols, int nparts, cudaStream_t s) {
+    hc_mix_kernel<<<nparts, 256, 0, s>>>(W, x, parts, rows, cols, cols / nparts);
+    check("hc_mix");
+}
+
 void hc_pre_finish(const float* streams, const float* mix, const bf16* base, const bf16* scale, int n, float rms_eps,
                    float hc_eps, int iters, float* x, float* post, float* comb, cudaStream_t s, const bf16* norm_w,
-                   float* xn) {
-    hc_pre_kernel<<<1, 1024, 0, s>>>(streams, mix, base, scale, n, rms_eps, hc_eps, iters, x, post, comb, norm_w, xn);
+                   float* xn, int mix_parts) {
+    hc_pre_kernel<<<1, 1024, 0, s>>>(streams, mix, base, scale, n, rms_eps, hc_eps, iters, x, post, comb, norm_w, xn,
+                                     mix_parts);
     check("hc_pre");
 }
 

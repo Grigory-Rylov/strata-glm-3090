@@ -52,7 +52,10 @@ void layernorm(const float* x, const bf16* w, const bf16* b, float eps, float* o
 /// 1/rms), writes collapsed x (n), post (4) and comb (4x4, [m][n] = input stream m into output stream n).
 void hc_pre_finish(const float* streams, const float* mix, const bf16* base, const bf16* scale, int n, float rms_eps,
                    float hc_eps, int sinkhorn_iters, float* x, float* post, float* comb, cudaStream_t s,
-                   const bf16* norm_w = nullptr, float* xn = nullptr);
+                   const bf16* norm_w = nullptr, float* xn = nullptr, int mix_parts = 1);
+/// the 24 mixes as `parts` partial sums over column slices ([parts][24], summed by hc_pre_finish(mix_parts)):
+/// 16 blocks instead of the 3 a 24-row gemv gets
+void hc_mix(const bf16* W, const float* x, float* parts, int rows, int cols, int nparts, cudaStream_t s);
 /// (with norm_w and xn: also xn = rmsnorm(x) * norm_w, eps rms_eps - the layer's input norm in the same launch)
 /// streams_out[j] = post[j] * y + sum_m comb[m][j] * streams_in[m] (may alias streams_in: it is read first).
 void hc_post(const float* y, const float* streams_in, const float* post, const float* comb, float* streams_out, int n,

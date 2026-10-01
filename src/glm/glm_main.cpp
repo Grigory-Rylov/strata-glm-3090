@@ -430,6 +430,8 @@ struct Engine {
         if (pos0 - ic_base + T > ic_win) { std::fprintf(stderr, "strata-glm: indexer window %d too small\n", ic_win); std::exit(1); }
     }
     // buffers
+    static constexpr int kMixParts = 16;
+    float *mixp = nullptr, *p_mixp = nullptr;                       // the hc mixes as kMixParts column slices
     float *streams, *mix, *x, *xn, *post, *comb, *y, *tmp1, *tmp2, *tmp3, *q, *k, *v, *gf, *b, *o, *gate;
     float *q_resid, *qm, *qa, *ctx, *vo, *iq, *ik, *ig, *iw, *score, *logits, *rows, *wts;
     int32_t *ids, *sel, *sel_cnt;
@@ -669,9 +671,9 @@ struct Engine {
     void predict_enqueue(int l) {   // layer l's experts from the current streams, on the stream, into pf_ids
         using namespace glm;
         Layer& ly = L[(size_t) l];
-        gemv_bf16(ly.hc_ffn_fn, streams, p_mix, 24, kHc * kEmbd, 1, s);
-        hc_pre_finish(streams, p_mix, ly.hc_ffn_base, ly.hc_ffn_scale, kEmbd, kEps, kHcEps, kSinkhorn, p_x, p_post, p_comb, s,
-                      ly.post_norm, p_xn);
+        hc_mix(ly.hc_ffn_fn, streams, p_mixp, 24, kHc * kEmbd, kMixParts, s);
+        hc_pre_finish(streams, p_mixp, ly.hc_ffn_base, ly.hc_ffn_scale, kEmbd, kEps, kHcEps, kSinkhorn, p_x, p_post, p_comb, s,
+                      ly.post_norm, p_xn, kMixParts);
         gemv_bf16(ly.router, p_xn, p_log, kNE, kEmbd, 1, s);
         route_topk(p_log, ly.router_bias, kNE, kK, kRouteScale, p_ids, p_wts, s);
         CK(cudaMemcpyAsync(pf_ids, p_ids, kK * sizeof(int32_t), cudaMemcpyDeviceToHost, s));
@@ -720,9 +722,9 @@ struct Engine {
         using namespace glm;
         if (!predict || l >= kLayers || l < kDenseLead) return;
         Layer& ly = L[(size_t) l];
-        gemv_bf16(ly.hc_ffn_fn, streams, p_mix, 24, kHc * kEmbd, 1, s);
-        hc_pre_finish(streams, p_mix, ly.hc_ffn_base, ly.hc_ffn_scale, kEmbd, kEps, kHcEps, kSinkhorn, p_x, p_post, p_comb, s,
-                      ly.post_norm, p_xn);
+        hc_mix(ly.hc_ffn_fn, streams, p_mixp, 24, kHc * kEmbd, kMixParts, s);
+        hc_pre_finish(streams, p_mixp, ly.hc_ffn_base, ly.hc_ffn_scale, kEmbd, kEps, kHcEps, kSinkhorn, p_x, p_post, p_comb, s,
+                      ly.post_norm, p_xn, kMixParts);
         gemv_bf16(ly.router, p_xn, p_log, kNE, kEmbd, 1, s);
         route_topk(p_log, ly.router_bias, kNE, kK, kRouteScale, p_ids, p_wts, s);
         CK(cudaMemcpyAsync(pred[v][l], p_ids, kK * sizeof(int32_t), cudaMemcpyDeviceToHost, s));
@@ -1409,6 +1411,7 @@ struct Engine {
         streams = buf(kHc * kEmbd); mix = buf(32); x = buf(kEmbd); xn = buf(kEmbd); post = buf(4); comb = buf(16);
         y = buf(kEmbd); tmp1 = buf(kDenseFF); tmp2 = buf(kDenseFF); tmp3 = buf(kDenseFF);
         q = buf(kKdaC); k = buf(kKdaC); v = buf(kKdaC); gf = buf(kKdaC); b = buf(kKdaH); o = buf(kKdaC); gate = buf(kKdaC);
+        mixp = buf(24 * kMixParts); p_mixp = buf(24 * kMixParts);
         q_resid = buf(kQLora); qm = buf(kMlaH * kDk); qa = buf(kMlaH * kR); ctx = buf(kMlaH * kR); vo = buf(kMlaH * kDv);
         iq = buf(kIdxH * kIdxD); ik = buf(kIdxD); ig = buf(kIdxD); iw = buf(kIdxH); score = buf(max_ctx / kKpool + 1);
         logits = buf(kVocab); rows = buf(kK * kEmbd); wts = buf(kK);
@@ -1876,14 +1879,14 @@ struct Engine {
         for (int j = 0; j < kHc; ++j) CK(cudaMemcpyAsync(streams + (size_t) j * kEmbd, x, kEmbd * sizeof(float), cudaMemcpyDeviceToDevice, s));
         for (int l = 0; l < kLayers; ++l) {
             Layer& ly = L[(size_t) l];
-            gemv_bf16(ly.hc_attn_fn, streams, mix, 24, kHc * kEmbd, 1, s);
-            hc_pre_finish(streams, mix, ly.hc_attn_base, ly.hc_attn_scale, kEmbd, kEps, kHcEps, kSinkhorn, x, post, comb, s,
-                          ly.in_norm, xn);
+            hc_mix(ly.hc_attn_fn, streams, mixp, 24, kHc * kEmbd, kMixParts, s);
+            hc_pre_finish(streams, mixp, ly.hc_attn_base, ly.hc_attn_scale, kEmbd, kEps, kHcEps, kSinkhorn, x, post, comb, s,
+                          ly.in_norm, xn, kMixParts);
             if (is_dsa(l)) dsa(ly, pos); else kda(ly);
             hc_post(y, streams, post, comb, streams, kEmbd, s);
-            gemv_bf16(ly.hc_ffn_fn, streams, mix, 24, kHc * kEmbd, 1, s);
-            hc_pre_finish(streams, mix, ly.hc_ffn_base, ly.hc_ffn_scale, kEmbd, kEps, kHcEps, kSinkhorn, x, post, comb, s,
-                          ly.post_norm, xn);
+            hc_mix(ly.hc_ffn_fn, streams, mixp, 24, kHc * kEmbd, kMixParts, s);
+            hc_pre_finish(streams, mixp, ly.hc_ffn_base, ly.hc_ffn_scale, kEmbd, kEps, kHcEps, kSinkhorn, x, post, comb, s,
+                          ly.post_norm, xn, kMixParts);
             predict_layer(0, l + 1);
             if (l < kDenseLead) dense_mlp(ly); else moe(ly, l);
             hc_post(y, streams, post, comb, streams, kEmbd, s);
