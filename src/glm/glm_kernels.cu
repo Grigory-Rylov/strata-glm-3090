@@ -237,6 +237,37 @@ __global__ void kda_step_kernel(float* __restrict__ S, const float* __restrict__
     o[base + vi] = acc;
 }
 
+// the same step a warp per 32 value columns, each thread's column of S read once into registers (the old kernel read
+// it twice from memory with one block per head); the arithmetic in the same order
+template <int DH>
+__global__ void __launch_bounds__(32) kda_step_reg_kernel(float* __restrict__ S, const float* __restrict__ q,
+                                                          const float* __restrict__ k, const float* __restrict__ v,
+                                                          const float* __restrict__ g, const float* __restrict__ beta,
+                                                          float* __restrict__ o) {
+    __shared__ float qs[DH], ks[DH], eg[DH];
+    const int h = blockIdx.x, lane = threadIdx.x, c = blockIdx.y * 32 + lane;
+    const size_t base = (size_t) h * DH;
+    for (int j = lane; j < DH; j += 32) { qs[j] = q[base + j]; ks[j] = k[base + j]; eg[j] = expf(g[base + j]); }
+    __syncwarp();
+    float* Sh = S + (size_t) h * DH * DH;
+    float st[DH];
+    float kv = 0.f;
+#pragma unroll
+    for (int i = 0; i < DH; ++i) {
+        st[i] = Sh[(size_t) i * DH + c];
+        kv += st[i] * eg[i] * ks[i];
+    }
+    const float delta = (v[base + c] - kv) * beta[h];
+    float acc = 0.f;
+#pragma unroll
+    for (int i = 0; i < DH; ++i) {
+        const float sv = st[i] * eg[i] + ks[i] * delta;
+        Sh[(size_t) i * DH + c] = sv;
+        acc += sv * qs[i];
+    }
+    o[base + c] = acc;
+}
+
 __global__ void kda_out_norm_kernel(float* __restrict__ o, const bf16* __restrict__ w, const float* __restrict__ gate,
                                     float eps, int dh) {
     const int h = blockIdx.x, i = threadIdx.x;
@@ -516,7 +547,8 @@ void kda_prep(float* q, float* k, float* gf, const float* dt_bias, const float* 
 
 void kda_step(float* S, const float* q, const float* k, const float* v, const float* g, const float* beta, float* o,
               int H, int dh, cudaStream_t s) {
-    kda_step_kernel<<<H, dh, 3 * dh * sizeof(float), s>>>(S, q, k, v, g, beta, o, dh);
+    if (dh == 128) kda_step_reg_kernel<128><<<dim3((unsigned) H, 128 / 32), 32, 0, s>>>(S, q, k, v, g, beta, o);
+    else kda_step_kernel<<<H, dh, 3 * dh * sizeof(float), s>>>(S, q, k, v, g, beta, o, dh);
     check("kda_step");
 }
 
