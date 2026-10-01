@@ -374,7 +374,8 @@ struct Engine {
     bool latent_i8 = false;   // --latent-i8: the MLA latent cache in int8 (half of FP16) - "k8" for an MLA, K and V one tensor
     // --dense-fp4 attn,shared,head: those matrices in NVFP4 (blocks of 16, a scale per row) instead of FP8 - half the
     // VRAM and the per-token read, lossy (the leading dense MLP is NVFP4 in the checkpoint: kept as it is)
-    bool fp4_attn = false, fp4_shared = false, fp4_head = false;
+    bool fp4_qk = false, fp4_vo = false, fp4_mla = false, fp4_shared = false, fp4_head = false;
+    bool dense_i8 = false;   // --dense-i8: what would be FP8 is int8 with a scale per 32 values instead (Q8_0-like)
     size_t fp4_saved = 0;
     glm::Mat mat(const std::string& name, bool fp4 = false) {
         glm::Mat m;
@@ -396,6 +397,18 @@ struct Engine {
             m.bsc = bs;
             m.scale = sc;
             fp4_saved += (size_t) rows * cols * 7 / 16;
+            return m;
+        }
+        if (dense_i8 && cols % 32 == 0) {
+            int8_t* q = nullptr;
+            glm::f16* qs = nullptr;
+            CK(cudaMalloc(&q, (size_t) rows * cols));
+            CK(cudaMalloc(&qs, (size_t) rows * cols / 32 * sizeof(glm::f16)));
+            glm::quant_i8_rows(w, rows, cols, q, qs, nullptr);
+            CK(cudaDeviceSynchronize());
+            CK(cudaFree(w));
+            m.w = q;
+            m.qs = qs;
             return m;
         }
         uint8_t* q = nullptr;
@@ -1057,7 +1070,15 @@ struct Engine {
             std::vector<std::string> paths{pack + "/experts.bin"};
             std::vector<double> gbps{10.0};
             for (const auto& mp : mirrors) { paths.push_back(mp); gbps.push_back(7.0); }
-            reader.open(paths, gbps, 8);
+            // env (tests): GLM_GBPS=a,b - the drives' rates for the balance; GLM_DISK_THREADS - reads in flight a drive
+            if (const char* g = std::getenv("GLM_GBPS"))
+                for (size_t d = 0; d < gbps.size() && *g; ++d) {
+                    gbps[d] = std::atof(g);
+                    while (*g && *g != ',') ++g;
+                    if (*g == ',') ++g;
+                }
+            const char* dt = std::getenv("GLM_DISK_THREADS");
+            reader.open(paths, gbps, dt ? std::atoi(dt) : 8);
         }
         if (lru && pf_stage) init_spool();
         if (lru) {
@@ -1623,22 +1644,22 @@ struct Engine {
             y.post_norm = ck.bf(p + "post_attention_layernorm.weight");
             const std::string a = p + "self_attn.";
             if (!is_dsa(l)) {
-                y.wq = mat(a + "q_proj.weight", fp4_attn); y.wk = mat(a + "k_proj.weight", fp4_attn);
-                y.wv = mat(a + "v_proj.weight", fp4_attn);
+                y.wq = mat(a + "q_proj.weight", fp4_qk); y.wk = mat(a + "k_proj.weight", fp4_qk);
+                y.wv = mat(a + "v_proj.weight", fp4_vo);
                 y.q_conv = ck.f32(a + "q_conv1d.weight"); y.k_conv = ck.f32(a + "k_conv1d.weight"); y.v_conv = ck.f32(a + "v_conv1d.weight");
                 y.fa = mat(a + "f_a_proj.weight"); y.fb = mat(a + "f_b_proj.weight");
                 y.dt_bias = ck.f32(a + "dt_bias"); y.A_log = ck.f32(a + "A_log");
                 y.bproj = mat(a + "b_proj.weight"); y.ga = mat(a + "g_a_proj.weight"); y.gb = mat(a + "g_b_proj.weight");
-                y.onorm = ck.bf(a + "o_norm.weight"); y.wo = mat(a + "o_proj.weight", fp4_attn);
+                y.onorm = ck.bf(a + "o_norm.weight"); y.wo = mat(a + "o_proj.weight", fp4_vo);
                 CK(cudaMalloc(&y.S, (size_t) kKdaH * kKdaD * kKdaD * sizeof(float)));
                 CK(cudaMalloc(&y.conv, (size_t) 3 * kKdaC * 3 * sizeof(float)));
             } else {
-                y.qa = mat(a + "q_a_proj.weight", fp4_attn); y.qa_norm = ck.bf(a + "q_a_layernorm.weight");
-                y.qb = mat(a + "q_b_proj.weight", fp4_attn);
-                y.kva = mat(a + "kv_a_proj_with_mqa.weight", fp4_attn); y.kva_norm = ck.bf(a + "kv_a_layernorm.weight"); y.kvb = ck.bf(a + "kv_b_proj.weight");
-                y.wo = mat(a + "o_proj.weight", fp4_attn);
+                y.qa = mat(a + "q_a_proj.weight", fp4_mla); y.qa_norm = ck.bf(a + "q_a_layernorm.weight");
+                y.qb = mat(a + "q_b_proj.weight", fp4_mla);
+                y.kva = mat(a + "kv_a_proj_with_mqa.weight", fp4_mla); y.kva_norm = ck.bf(a + "kv_a_layernorm.weight"); y.kvb = ck.bf(a + "kv_b_proj.weight");
+                y.wo = mat(a + "o_proj.weight", fp4_mla);
                 const std::string ip = a + "indexer.";
-                y.iwqb = mat(ip + "wq_b.weight", fp4_attn); y.iwk = mat(ip + "wk.weight"); y.ik_w = ck.bf(ip + "k_norm.weight");
+                y.iwqb = mat(ip + "wq_b.weight", fp4_mla); y.iwk = mat(ip + "wk.weight"); y.ik_w = ck.bf(ip + "k_norm.weight");
                 y.ik_b = ck.bf(ip + "k_norm.bias"); y.iwp = mat(ip + "weights_proj.weight");
                 y.igate = mat(ip + "index_kpool_compress_gate"); y.iape = ck.bf(ip + "index_kpool_compress_ape");
                 if (latent_i8) {
@@ -2208,6 +2229,7 @@ int main(int argc, char** argv) {
     int pf_copies = 2, pf_reads = 4;
     bool pf_stage_on = false, ram_lru = false, latent_i8 = false;
     std::string dense_fp4;
+    bool dense_i8 = false;
     long long rebalance_vram = 32, rebalance_ram = 64;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -2235,6 +2257,7 @@ int main(int argc, char** argv) {
         else if (a == "--ram-lru") ram_lru = true;
         else if (a == "--latent-i8") latent_i8 = true;
         else if (a == "--dense-fp4" && i + 1 < argc) dense_fp4 = argv[++i];
+        else if (a == "--dense-i8") dense_i8 = true;
         else if (a == "--pf-copies") pf_copies = std::atoi(next().c_str());
         else if (a == "--pf-reads") pf_reads = std::atoi(next().c_str());
         else if (a == "--dense-bf16") dense_bf16 = true;
@@ -2272,12 +2295,18 @@ int main(int argc, char** argv) {
     e.dense_fp8 = !dense_bf16;
     e.chunk_cap = chunk;
     e.latent_i8 = latent_i8;
-    for (const char* c : {"attn", "shared", "head", "all"}) {
-        if (dense_fp4.find(c) == std::string::npos) continue;
-        const bool all = std::string(c) == "all";
-        if (all || std::string(c) == "attn") e.fp4_attn = true;
-        if (all || std::string(c) == "shared") e.fp4_shared = true;
-        if (all || std::string(c) == "head") e.fp4_head = true;
+    e.dense_i8 = dense_i8;
+    // a comma list: all, attn (= kda + mla), kda (= kdaqk + kdavo: KDA's q/k and v/o projections), mla (MLA and the
+    // indexer's query), shared, head; none
+    for (std::stringstream ss(dense_fp4); ss.good();) {
+        std::string c;
+        std::getline(ss, c, ',');
+        const bool all = c == "all", attn = all || c == "attn", kda = attn || c == "kda";
+        e.fp4_qk |= kda || c == "kdaqk";
+        e.fp4_vo |= kda || c == "kdavo";
+        e.fp4_mla |= attn || c == "mla";
+        e.fp4_shared |= all || c == "shared";
+        e.fp4_head |= all || c == "head";
     }
     e.lru = policy == "lru";
     e.excl = ram_exclusive;

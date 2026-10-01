@@ -63,7 +63,7 @@ void Gemm::w16(const bf16* W, const float* X, float* Y, int N, int K, int T, int
 
 void Gemm::wmat(const Mat& W, const float* X, float* Y, int N, int K, int T, int ldx, int ldy) {
     const bf16* w = W.b16();
-    if (W.fp8 || W.bsc) {
+    if (W.fp8 || W.bsc || W.qs) {
         const size_t n = (size_t) N * K;
         if (n > wcap_) {
             if (wbuf_) cudaFree(wbuf_);
@@ -73,7 +73,8 @@ void Gemm::wmat(const Mat& W, const float* X, float* Y, int N, int K, int T, int
             }
             wcap_ = n;
         }
-        if (W.bsc) nvfp4_to_bf16((const uint8_t*) W.w, W.bsc, wbuf_, N, K, s_);
+        if (W.qs) i8_to_bf16((const int8_t*) W.w, W.qs, wbuf_, N, K, s_);
+        else if (W.bsc) nvfp4_to_bf16((const uint8_t*) W.w, W.bsc, wbuf_, N, K, s_);
         else fp8_to_bf16((const uint8_t*) W.w, wbuf_, n, s_);
         w = wbuf_;
     }
