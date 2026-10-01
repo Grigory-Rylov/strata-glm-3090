@@ -359,6 +359,8 @@ struct Layer {
     // state
     float *S = nullptr, *conv = nullptr;                           // KDA: [H][dh][dh], [3][C][3]
     glm::f16* lat = nullptr;                                       // DSA: the MLA latent of every position (FP16)
+    int8_t* lat8 = nullptr;                                        // or int8 (--latent-i8), a scale per 64 values
+    float* lat8s = nullptr;
     float *ikc = nullptr, *igc = nullptr, *pooled = nullptr;       // the indexer's key / gate window, its pools
 };
 
@@ -369,6 +371,7 @@ struct Engine {
     glm::Mat lm_head;
     // --dense-bf16: keep the checkpoint's BF16; default: FP8 E4M3 with a scale per row, quantized here once
     bool dense_fp8 = true;
+    bool latent_i8 = false;   // --latent-i8: the MLA latent cache in int8 (half of FP16) - "k8" for an MLA, K and V one tensor
     glm::Mat mat(const std::string& name) {
         glm::Mat m;
         const TensorRef& r = ck.ref(name);
@@ -1115,7 +1118,8 @@ struct Engine {
         rmsnorm(c_t1, ly.qa_norm, kEps, c_qr, kQLora, T, s);
         gm.wmat(ly.qb, c_qr, c_qm, kMlaH * kDk, kQLora, T);
         gm.wmat(ly.kva, c_xn, c_t1, kR, kEmbd, T);
-        rmsnorm_f16(c_t1, ly.kva_norm, kEps, ly.lat + (size_t) pos0 * kR, kR, T, s);
+        if (ly.lat8) rmsnorm_i8(c_t1, ly.kva_norm, kEps, ly.lat8 + (size_t) pos0 * kR, ly.lat8s + (size_t) pos0 * (kR / 64), kR, T, s);
+        else rmsnorm_f16(c_t1, ly.kva_norm, kEps, ly.lat + (size_t) pos0 * kR, kR, T, s);
         gm.wmat(ly.iwqb, c_qr, c_iq, kIdxH * kIdxD, kQLora, T);
         gm.wmat(ly.iwk, c_xn, c_t1, kIdxD, kEmbd, T);
         layernorm_rows(c_t1, ly.ik_w, ly.ik_b, 1e-6f, ly.ikc + (size_t) (pos0 - ic_base) * kIdxD, kIdxD, T, s);
@@ -1138,7 +1142,7 @@ struct Engine {
         const long long ws = (long long) (kDk + kDv) * kR;
         gm.heads16(ly.kvb, ws, false, c_qm, kMlaH * kDk, c_qa, kMlaH * kR, kR, kDk, T, kMlaH);
         (void) max_sel;
-        mla_attend_tc(c_qa, ly.lat, sel, c_cnt, kSelLd, pos0, 1.0f / std::sqrt((float) kDk), c_ctx, T, 1, nullptr, s);
+        mla_attend_tc(c_qa, ly.lat, ly.lat8, ly.lat8s, sel, c_cnt, kSelLd, pos0, 1.0f / std::sqrt((float) kDk), c_ctx, T, 1, nullptr, s);
         gm.heads16(ly.kvb + (size_t) kDk * kR, ws, true, c_ctx, kMlaH * kR, c_vo, kMlaH * kDv, kDv, kR, T, kMlaH);
         gm.wmat(ly.wo, c_vo, c_y, kEmbd, kMlaH * kDv, T);
     }
@@ -1451,7 +1455,12 @@ struct Engine {
                 y.iwqb = mat(ip + "wq_b.weight"); y.iwk = mat(ip + "wk.weight"); y.ik_w = ck.bf(ip + "k_norm.weight");
                 y.ik_b = ck.bf(ip + "k_norm.bias"); y.iwp = mat(ip + "weights_proj.weight");
                 y.igate = mat(ip + "index_kpool_compress_gate"); y.iape = ck.bf(ip + "index_kpool_compress_ape");
-                CK(cudaMalloc(&y.lat, (size_t) max_ctx * kR * sizeof(glm::f16)));
+                if (latent_i8) {
+                    CK(cudaMalloc(&y.lat8, (size_t) max_ctx * kR));
+                    CK(cudaMalloc(&y.lat8s, (size_t) max_ctx * (kR / 64) * sizeof(float)));
+                } else {
+                    CK(cudaMalloc(&y.lat, (size_t) max_ctx * kR * sizeof(glm::f16)));
+                }
                 CK(cudaMalloc(&y.ikc, (size_t) ic_win * kIdxD * sizeof(float)));
                 CK(cudaMalloc(&y.igc, (size_t) ic_win * kIdxD * sizeof(float)));
                 CK(cudaMalloc(&y.pooled, (size_t) (max_ctx / kKpool + 1) * kIdxD * sizeof(float)));
@@ -1557,7 +1566,8 @@ struct Engine {
         rmsnorm(tmp1, ly.qa_norm, kEps, q_resid, kQLora, 1, s);
         gemv(ly.qb, q_resid, qm, kMlaH * kDk, kQLora, 1, s);
         gemv(ly.kva, xn, tmp1, kR, kEmbd, 1, s);
-        rmsnorm_f16(tmp1, ly.kva_norm, kEps, ly.lat + (size_t) pos * kR, kR, 1, s);
+        if (ly.lat8) rmsnorm_i8(tmp1, ly.kva_norm, kEps, ly.lat8 + (size_t) pos * kR, ly.lat8s + (size_t) pos * (kR / 64), kR, 1, s);
+        else rmsnorm_f16(tmp1, ly.kva_norm, kEps, ly.lat + (size_t) pos * kR, kR, 1, s);
         // the indexer's caches and, when a pool completes, its pooled key
         gemv(ly.iwqb, q_resid, iq, kIdxH * kIdxD, kQLora, 1, s);
         gemv(ly.iwk, xn, tmp1, kIdxD, kEmbd, 1, s);
@@ -1583,7 +1593,7 @@ struct Engine {
         {   // the keys split over blocks: 64 keys a split at least, 16 splits at most
             const int nk = std::min(pos + 1, kSelLd);
             const int nsplit = std::max(1, std::min(kMlaSplit, (nk + 127) / 128));
-            mla_attend_tc(qa, ly.lat, use, sel_cnt, kSelLd, pos, 1.0f / std::sqrt((float) kDk), ctx, 1, nsplit, mla_part, s);
+            mla_attend_tc(qa, ly.lat, ly.lat8, ly.lat8s, use, sel_cnt, kSelLd, pos, 1.0f / std::sqrt((float) kDk), ctx, 1, nsplit, mla_part, s);
         }
         mla_value(ctx, ly.kvb, vo, kMlaH, kDk, kDv, kR, s);
         gemv(ly.wo, vo, y, kEmbd, kMlaH * kDv, 1, s);
@@ -2008,7 +2018,7 @@ int main(int argc, char** argv) {
     float skip_disk = 0.f;
     std::string teacher_path, step_logits_path;   // decode forced to these tokens; every step's logits written out
     int pf_copies = 2, pf_reads = 4;
-    bool pf_stage_on = false, ram_lru = false;
+    bool pf_stage_on = false, ram_lru = false, latent_i8 = false;
     long long rebalance_vram = 32, rebalance_ram = 64;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -2034,6 +2044,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-prefetch") no_prefetch = true;
         else if (a == "--pf-stage") pf_stage_on = true;
         else if (a == "--ram-lru") ram_lru = true;
+        else if (a == "--latent-i8") latent_i8 = true;
         else if (a == "--pf-copies") pf_copies = std::atoi(next().c_str());
         else if (a == "--pf-reads") pf_reads = std::atoi(next().c_str());
         else if (a == "--dense-bf16") dense_bf16 = true;
@@ -2069,6 +2080,7 @@ int main(int argc, char** argv) {
     e.max_ctx = max_ctx;
     e.dense_fp8 = !dense_bf16;
     e.chunk_cap = chunk;
+    e.latent_i8 = latent_i8;
     e.lru = policy == "lru";
     e.excl = ram_exclusive;
     e.skip_disk = skip_disk;

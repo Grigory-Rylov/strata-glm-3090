@@ -33,6 +33,7 @@ void ck(const char* what) {
 
 // grid (T, 64 / kHG, nsplit); part (nsplit > 1): per (t, split, head) its unnormalized O [512], max and sum
 __global__ void __launch_bounds__(kThreads) mla_tc_kernel(const float* __restrict__ qa, const f16* __restrict__ lat,
+                                                          const int8_t* __restrict__ lat8, const float* __restrict__ lat8s,
                                                           const int32_t* __restrict__ sel, const int32_t* __restrict__ cnt,
                                                           int sel_ld, int pos0, float scale, float* __restrict__ ctx,
                                                           float* __restrict__ part, int nsplit) {
@@ -62,10 +63,21 @@ __global__ void __launch_bounds__(kThreads) mla_tc_kernel(const float* __restric
     for (int i = tid; i < kHG * kR; i += kThreads) Qs[(i / kR) * kLd + (i % kR)] = __float2half(q[i] / qsc);
     if (tid < kHG) { mh[tid] = -FLT_MAX; lh[tid] = 0.f; }
     auto load_tile = [&](int kb) {   // keys kb..kb+63 (zero rows past k1)
-        for (int i = tid; i < kKT * (kR / 8); i += kThreads) {   // 8 halves at a time, straight from the cache
+        for (int i = tid; i < kKT * (kR / 8); i += kThreads) {   // 8 values at a time
             const int r = i / (kR / 8), c8 = i % (kR / 8), k = kb + r;
             uint4 v = make_uint4(0u, 0u, 0u, 0u);
-            if (k < k1) v = ((const uint4*) (lat + (size_t) (st ? st[k] : k) * kR))[c8];
+            if (k < k1) {
+                const size_t row = (size_t) (st ? st[k] : k);
+                if (lat8) {   // int8 with a scale per 64 values, to FP16
+                    const uint2 b = ((const uint2*) (lat8 + row * kR))[c8];
+                    const float sc = lat8s[row * (kR / 64) + c8 / 8];
+                    const int8_t* q8 = (const int8_t*) &b;
+                    __half2* d = (__half2*) &v;
+                    for (int u = 0; u < 4; ++u) d[u] = __floats2half2_rn(q8[2 * u] * sc, q8[2 * u + 1] * sc);
+                } else {
+                    v = ((const uint4*) (lat + row * kR))[c8];
+                }
+            }
             *(uint4*) (Ks + r * kLd + c8 * 8) = v;
         }
     };
@@ -176,7 +188,7 @@ __global__ void mla_merge_kernel(const float* __restrict__ part, float* __restri
 
 size_t mla_tc_part_floats(int T, int nsplit) { return nsplit > 1 ? (size_t) T * nsplit * 64 * (kR + 2) : 0; }
 
-void mla_attend_tc(const float* qa, const f16* lat, const int32_t* sel, const int32_t* cnt, int sel_ld, int pos0,
+void mla_attend_tc(const float* qa, const f16* lat, const int8_t* lat8, const float* lat8s, const int32_t* sel, const int32_t* cnt, int sel_ld, int pos0,
                    float scale, float* ctx, int T, int nsplit, float* part, cudaStream_t s) {
     static bool attr = false;
     if (!attr) {
@@ -184,7 +196,7 @@ void mla_attend_tc(const float* qa, const f16* lat, const int32_t* sel, const in
         attr = true;
     }
     nsplit = nsplit < 1 ? 1 : (nsplit > 64 ? 64 : nsplit);
-    mla_tc_kernel<<<dim3((unsigned) T, 64 / kHG, (unsigned) nsplit), kThreads, kSmem, s>>>(qa, lat, sel, cnt, sel_ld, pos0,
+    mla_tc_kernel<<<dim3((unsigned) T, 64 / kHG, (unsigned) nsplit), kThreads, kSmem, s>>>(qa, lat, lat8, lat8s, sel, cnt, sel_ld, pos0,
                                                                                           scale, ctx, part, nsplit);
     ck("mla_tc");
     if (nsplit > 1) {

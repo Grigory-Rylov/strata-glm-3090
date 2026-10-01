@@ -45,6 +45,8 @@ void fill(float* p, float v, int n, cudaStream_t s);
 void rmsnorm(const float* x, const bf16* w, float eps, float* out, int n, int nrows, cudaStream_t s);
 /// the same into FP16 (the MLA latent cache)
 void rmsnorm_f16(const float* x, const bf16* w, float eps, f16* out, int n, int nrows, cudaStream_t s);
+/// the same into int8 with a float scale per 64 values (n % 64 == 0): out [nrows][n], scale [nrows][n / 64]
+void rmsnorm_i8(const float* x, const bf16* w, float eps, int8_t* out, float* scale, int n, int nrows, cudaStream_t s);
 /// LayerNorm with BF16 weight and bias (the indexer's k_norm).
 void layernorm(const float* x, const bf16* w, const bf16* b, float eps, float* out, int n, cudaStream_t s);
 
@@ -155,7 +157,8 @@ void scale_entry_wts(float* wts, const int32_t* dst, const int32_t* rb, int n, c
 /// MLA attention on tensor cores (glm_mla.cu), 64 heads x 512: ctx[t][h] over query t's keys (sel / cnt, or every
 /// position <= pos0 + t when sel is null). nsplit > 1 (decode) splits the keys over blocks and needs `part`
 /// (mla_tc_part_floats(T, nsplit) floats).
-void mla_attend_tc(const float* qa, const f16* lat, const int32_t* sel, const int32_t* cnt, int sel_ld, int pos0,
+/// lat8 / lat8s (not null): the latent as int8 with a scale per 64 values instead of FP16 `lat`
+void mla_attend_tc(const float* qa, const f16* lat, const int8_t* lat8, const float* lat8s, const int32_t* sel, const int32_t* cnt, int sel_ld, int pos0,
                    float scale, float* ctx, int T, int nsplit, float* part, cudaStream_t s);
 size_t mla_tc_part_floats(int T, int nsplit);
 /// conv_silu_seq's scratch (C x T floats) up front / back

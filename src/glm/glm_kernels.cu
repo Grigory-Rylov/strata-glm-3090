@@ -478,6 +478,37 @@ void rmsnorm(const float* x, const bf16* w, float eps, float* out, int n, int nr
     check("rmsnorm");
 }
 
+// a row of n (<= 1024, n % 64 == 0) per block: normalize, then int8 with each 64-value block's absmax / 127
+__global__ void rmsnorm_i8_kernel(const float* __restrict__ x, const bf16* __restrict__ w, float eps, int8_t* __restrict__ out,
+                                  float* __restrict__ scale, int n) {
+    __shared__ float vals[1024];
+    __shared__ unsigned int bmax[16];
+    const float* xr = x + (size_t) blockIdx.x * n;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += xr[i] * xr[i];
+    const float inv = rsqrtf(block_sum(ss) / (float) n + eps);
+    if (threadIdx.x < 16) bmax[threadIdx.x] = 0u;
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = xr[i] * inv * (w ? bf(w[i]) : 1.f);
+        vals[i] = v;
+        atomicMax(&bmax[i / 64], __float_as_uint(fabsf(v)));   // non-negative floats order as their bits
+    }
+    __syncthreads();
+    int8_t* o = out + (size_t) blockIdx.x * n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float m = __uint_as_float(bmax[i / 64]);
+        const float sc = m > 0.f ? m / 127.f : 1.f;
+        o[i] = (int8_t) __float2int_rn(fminf(fmaxf(vals[i] / sc, -127.f), 127.f));
+        if (i % 64 == 0) scale[(size_t) blockIdx.x * (n / 64) + i / 64] = sc;
+    }
+}
+
+void rmsnorm_i8(const float* x, const bf16* w, float eps, int8_t* out, float* scale, int n, int nrows, cudaStream_t s) {
+    rmsnorm_i8_kernel<<<nrows, 256, 0, s>>>(x, w, eps, out, scale, n);
+    check("rmsnorm_i8");
+}
+
 void rmsnorm_f16(const float* x, const bf16* w, float eps, f16* out, int n, int nrows, cudaStream_t s) {
     rmsnorm_f16_kernel<<<nrows, 256, 0, s>>>(x, w, eps, (__half*) out, n);
     check("rmsnorm_f16");
