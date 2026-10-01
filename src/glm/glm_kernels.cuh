@@ -161,6 +161,11 @@ void idx_select_rows(const float* score, int ld, int pos0, int kpool, int budget
 /// [r0 + rb[j], r0 + rb[j+1]) (rb relative, on the device).
 /// tails: out[4j..4j+3] = blob j's {s_gate, s_up, s_down, 0}
 void gather_tails(const uint8_t* base, size_t stride, size_t tail_off, int n, float* out, cudaStream_t s);
+/// GLM_FAKE3 (an accuracy test, not a format): the n_groups[0] (<= cap) NVFP4 expert blobs at grp_ptr re-rounded in
+/// place to 3 bits a value (sign + {0, 1, 2, 3} x a UE4M3 scale per 16 - what a 3.5-bit format would hold); `nvb`
+/// blocks of 64 values before the 16-byte tail; a blob is marked done in the tail's 4th float.
+void fake3_groups(const unsigned long long* grp_ptr, const int32_t* n_groups, int cap, size_t nvb, size_t tail_off,
+                  cudaStream_t s);
 /// h[r] = silu(clamp(gate * s_gate)) * clamp(up * s_up) from MMQ's gate|up rows gu[r] (2 ff wide)
 void swiglu_rows(const float* gu, float* h, const int32_t* rb, int n, const float* tails, long long r0, int nr, int ff,
                  float lim, cudaStream_t s);

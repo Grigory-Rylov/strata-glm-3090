@@ -717,6 +717,7 @@ struct Engine {
     // exclusive tiers (default with lru): a RAM hit moving to VRAM gives its RAM slot back (at the next layer, once
     // its copy has run), and an expert leaving VRAM without a RAM copy is written back (D2H: the idle direction)
     bool excl = false;   // --ram-exclusive
+    const bool fake3 = std::getenv("GLM_FAKE3") != nullptr;   // tests: experts re-rounded to 3 bits (glm_moe.cu)
     // --vram-static F: the hottest F of VRAM's slots (by the prompt's routing, at each rebalance) are never evicted
     // and give their RAM copies up, so RAM caches that many more experts and the disk is read less; the rest of
     // VRAM stays an LRU over RAM. No write-backs while decoding (an expert leaving the static part at a rebalance is
@@ -1581,6 +1582,7 @@ struct Engine {
             CK(cudaMemcpyAsync(c_ngroups, &ng, sizeof(int32_t), cudaMemcpyHostToDevice, s));
             CK(cudaMemcpyAsync(c_ent_tok, et.data(), et.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s));
             CK(cudaMemcpyAsync(c_ent_dst, ed.data(), ed.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+            if (fake3) glm::fake3_groups(c_grp_ptr, c_ngroups, ng, XL.tail_off / 36, XL.tail_off, s);
             strata::kernels::native_expert_grouped_f32(XL, c_grp_ptr, c_grp_start, c_ngroups, c_ent_dst, c_ent_tok, ng,
                                                        (int64_t) T * kK, c_xn, c_xscratch, c_rows, s);
             CK(cudaStreamSynchronize(s));   // the host vectors above, and the staging slots are free again
@@ -2045,6 +2047,7 @@ struct Engine {
                 gea[kK] = na;
                 if (na > 0) {
                     if (pfc_pending) { CK(cudaStreamWaitEvent(s, ev_pfc, 0)); pfc_pending = false; }
+                    if (fake3) glm::fake3_groups(gqa, gea + kK, kK, XL.tail_off / 36, XL.tail_off, s);
                     strata::kernels::native_expert_grouped_f32(XL, gqa, grp_start, gea + kK, gea, ent_tok, kK, kK, xn,
                                                                xscratch, rows, s);
                 }
@@ -2250,7 +2253,10 @@ struct Engine {
             }
             if (timing) CK(cudaEventRecord(tev[(size_t) m * 3 + 1], s));
             if (ng > 0)
+            {
+                if (fake3) glm::fake3_groups(gq, ge + kK, kK, XL.tail_off / 36, XL.tail_off, s);
                 strata::kernels::native_expert_grouped_f32(XL, gq, grp_start, ge + kK, ge, ent_tok, kK, kK, xn, xscratch, rows, s);
+            }
             if (ncpu > 0) {
                 cpux.wait();
                 for (int c = 0; c < ncpu; ++c)

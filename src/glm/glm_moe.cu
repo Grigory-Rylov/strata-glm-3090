@@ -20,6 +20,66 @@ void ck(const char* what) {
     }
 }
 
+__device__ __forceinline__ float ue4m3_raw(int x) {   // the scale without ggml's 0.5 (it cancels here)
+    if (x <= 0 || x >= 0x7F) return 0.0f;
+    const int e = (x >> 3) & 0xF, m = x & 7;
+    return e == 0 ? ldexpf((float) m, -9) : ldexpf(1.0f + (float) m / 8.0f, e - 7);
+}
+
+// a thread per 16 values: decode (doubled E2M1 x scale), then the scale (of 3 around amax / 3) whose {0,1,2,3}
+// rounding has the least squared error; codes 0..3 are the doubled E2M1 values 0..3, +8 for the sign
+__global__ void fake3_kernel(const unsigned long long* grp_ptr, const int32_t* n_groups, int cap, size_t nvb, size_t tail_off) {
+    const int g = blockIdx.y;
+    if (g >= min(cap, n_groups[0])) return;
+    uint8_t* blob = (uint8_t*) grp_ptr[g];
+    if (((const float*) (blob + tail_off))[3] != 0.0f) return;   // already done
+    const size_t sb = (size_t) blockIdx.x * blockDim.x + threadIdx.x;   // a sub-block of 16
+    if (sb >= nvb * 4) return;
+    uint8_t* b = blob + (sb / 4) * 36;   // {d[4], qs[32]}
+    const int s = (int) (sb % 4);
+    const float kv[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    const float d = ue4m3_raw(b[s]);
+    float x[16], amax = 0.f;
+    for (int j = 0; j < 8; ++j) {
+        const uint8_t q = b[4 + s * 8 + j];
+        x[j] = kv[q & 15] * d;
+        x[j + 8] = kv[q >> 4] * d;
+    }
+    for (int j = 0; j < 16; ++j) amax = fmaxf(amax, fabsf(x[j]));
+    if (amax == 0.f) return;
+    int c0 = 1;   // the UE4M3 code nearest amax / 3
+    float best_d = 1e30f;
+    for (int c = 1; c < 0x7F; ++c) {
+        const float r = fabsf(ue4m3_raw(c) - amax / 3.f);
+        if (r < best_d) { best_d = r; c0 = c; }
+    }
+    int bc = c0;
+    float be = 1e30f;
+    for (int c = max(1, c0 - 1); c <= min(0x7E, c0 + 1); ++c) {
+        const float dn = ue4m3_raw(c);
+        float e = 0.f;
+        for (int j = 0; j < 16; ++j) {
+            const float k = fminf(rintf(fabsf(x[j]) / dn), 3.f);
+            const float dd = fabsf(x[j]) - k * dn;
+            e += dd * dd;
+        }
+        if (e < be) { be = e; bc = c; }
+    }
+    const float dn = ue4m3_raw(bc);
+    b[s] = (uint8_t) bc;
+    for (int j = 0; j < 8; ++j) {
+        const int k0 = (int) fminf(rintf(fabsf(x[j]) / dn), 3.f), k1 = (int) fminf(rintf(fabsf(x[j + 8]) / dn), 3.f);
+        const int c0q = k0 | (x[j] < 0.f && k0 ? 8 : 0), c1q = k1 | (x[j + 8] < 0.f && k1 ? 8 : 0);
+        b[4 + s * 8 + j] = (uint8_t) (c0q | (c1q << 4));
+    }
+}
+
+__global__ void fake3_mark_kernel(const unsigned long long* grp_ptr, const int32_t* n_groups, int cap, size_t tail_off) {
+    const int g = threadIdx.x;
+    if (g >= min(cap, n_groups[0])) return;
+    ((float*) ((uint8_t*) grp_ptr[g] + tail_off))[3] = 1.0f;
+}
+
 __global__ void gather_tails_kernel(const uint8_t* base, size_t stride, size_t tail_off, int n, float* out) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= 4 * n) return;
@@ -51,6 +111,14 @@ __global__ void scale_entry_wts_kernel(float* wts, const int32_t* dst, const int
 }
 
 }  // namespace
+
+void fake3_groups(const unsigned long long* grp_ptr, const int32_t* n_groups, int cap, size_t nvb, size_t tail_off,
+                  cudaStream_t s) {
+    if (cap <= 0) return;
+    fake3_kernel<<<dim3((unsigned) ((nvb * 4 + 255) / 256), (unsigned) cap), 256, 0, s>>>(grp_ptr, n_groups, cap, nvb, tail_off);
+    fake3_mark_kernel<<<1, 32, 0, s>>>(grp_ptr, n_groups, cap, tail_off);
+    ck("fake3");
+}
 
 void gather_tails(const uint8_t* base, size_t stride, size_t tail_off, int n, float* out, cudaStream_t s) {
     gather_tails_kernel<<<(unsigned) ((4 * n + 63) / 64), 64, 0, s>>>(base, stride, tail_off, n, out);
