@@ -1558,6 +1558,24 @@ struct Engine {
                 vlru.touch(sl);
                 return sl;
             };
+            // the most confident predictions for the next layer already in RAM, to VRAM on xs: issued right after this
+            // layer's RAM copies when it waits for the disk anyway (the copy engine would idle), else after the event
+            // the expert kernel waits for (beside the kernel and the next attention)
+            bool pf_copied = false;
+            auto pf_copy = [&]() {
+                pf_copied = true;
+                const int mn = m + 1;
+                for (int i = 0; i < 3 && pf_vn < pf_copy_max; ++i) {
+                    const int32_t q = mn * kNE + pf_ids[i];
+                    if (res[(size_t) q] >= 0 || !tier.has_copy(mn, pf_ids[i])) continue;
+                    pf_vrank[pf_vn] = i;
+                    const int32_t sl = vram_slot(q);
+                    CK(cudaMemcpyAsync(vslot[(size_t) sl], tier.stable_blob(mn, pf_ids[i]), XL.bytes, cudaMemcpyHostToDevice, xs));
+                    rlru.touch(q);
+                    pf_vpair[pf_vn++] = q;
+                    ++pf_copies;
+                }
+            };
             bool done[kK] = {};
             uint8_t* dslot[kK] = {};
             for (int i = 0; i < pf_vn; ++i) {
@@ -1638,6 +1656,10 @@ struct Engine {
             if (pf) {
                 CK(cudaEventSynchronize(ev_pred));
                 const int mn = m + 1;
+                bool waits = false;
+                for (int j = 0; j < kK; ++j) waits |= dslot[j] != nullptr || pfj[j] >= 0;
+                if (waits) pf_copy();
+
                 for (int i = 0; i < pf_read_max && pf_n < kK; ++i) {
                     const int32_t q = mn * kNE + pf_ids[i];
                     if (res[(size_t) q] >= 0 || tier.has_copy(mn, pf_ids[i])) continue;
@@ -1685,22 +1707,6 @@ struct Engine {
                 ++ts.file;
                 if (excl) pending_free.push_back(pj[j]);
             }
-            if (pf) {   // the next layer's predicted RAM experts into VRAM, on cs, behind all of this layer's copies
-                const int mn = m + 1;
-                bool any = false;
-                for (int i = 0; i < kK && pf_vn < pf_copy_max; ++i) {
-                    const int32_t q = mn * kNE + pf_ids[i];
-                    if (res[(size_t) q] >= 0 || !tier.has_copy(mn, pf_ids[i])) continue;
-                    pf_vrank[pf_vn] = i;
-                    if (!any) { CK(cudaEventRecord(ev_cur, s)); CK(cudaStreamWaitEvent(cs, ev_cur, 0)); any = true; }
-                    const int32_t sl = vram_slot(q);
-                    CK(cudaMemcpyAsync(vslot[(size_t) sl], tier.stable_blob(mn, pf_ids[i]), XL.bytes, cudaMemcpyHostToDevice, cs));
-                    rlru.touch(q);
-                    pf_vpair[pf_vn++] = q;
-                    ++pf_copies;
-                }
-                if (any) { CK(cudaEventRecord(ev_pf, cs)); pf_pending = true; }
-            }
             // the GPU's groups: every expert but the CPU's, each writing its own row of `rows`
             unsigned long long* gq = gq_host + (size_t) m * kK;
             int32_t* ge = ge_host + (size_t) m * (kK + 1);
@@ -1716,6 +1722,7 @@ struct Engine {
             ge[kK] = ng;
             CK(cudaEventRecord(ev_xs, xs));   // the expert kernel waits for this layer's copies, nothing else does
             CK(cudaStreamWaitEvent(s, ev_xs, 0));
+            if (pf && !pf_copied) pf_copy();   // no disk wait here: beside this layer's kernel and the next attention
             CK(cudaMemcpyAsync(grp_ptr, gq, kK * sizeof(unsigned long long), cudaMemcpyHostToDevice, s));
             CK(cudaMemcpyAsync(d_ent, ge, (kK + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, s));
             {
@@ -1851,7 +1858,7 @@ int main(int argc, char** argv) {
     bool no_prefetch = false, dense_bf16 = false, prompt_f32 = false, ram_exclusive = false;
     float skip_disk = 0.f;
     std::string teacher_path, step_logits_path;   // decode forced to these tokens; every step's logits written out
-    int pf_copies = 0, pf_reads = 4;
+    int pf_copies = 2, pf_reads = 4;
     long long rebalance_vram = 32, rebalance_ram = 64;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
