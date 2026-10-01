@@ -1252,6 +1252,76 @@ struct Engine {
         }
     }
 
+    // --vram-static during decode: every few tokens the static part follows the RAM policy's estimate of use (decayed
+    // decode uses + prompt frequency + prior). A pair whose estimate beats the coldest static one's by `hyst` swaps
+    // in (from the VRAM LRU part: a change of role; from RAM: copied in), at most max_moves a call; the one swapped
+    // out joins the LRU part with its RAM copy written back. Replay: chat_code's PCIe copies -7%, ~2 write-backs a
+    // token (Strata-data/glm/policy/hybrid_resel.py).
+    long long restatic_moves = 0;
+    void restatic(int max_moves, double hyst) {
+        if (!(tiered && lru && !excl && vram_static > 0) || pn.empty() || static_n == 0) return;
+        const size_t np = (size_t) kMoe * kNE, nv = vslot.size();
+        const size_t ns = std::min((size_t) static_n, nv);
+        auto sc = [&](int32_t p) { return pn[(size_t) p] + pbase[(size_t) p]; };
+        std::vector<int32_t> ord(np);
+        for (size_t i = 0; i < np; ++i) ord[i] = (int32_t) i;
+        std::nth_element(ord.begin(), ord.begin() + (long long) ns, ord.end(), [&](int32_t a, int32_t b) { return sc(a) > sc(b); });
+        std::vector<int32_t> in, out;
+        for (size_t i = 0; i < ns; ++i) {
+            const int32_t p = ord[i], r = res[(size_t) p];
+            if (r >= 0 ? !is_static(r) : tier.has_copy(p / kNE, p % kNE)) in.push_back(p);
+        }
+        std::vector<uint8_t> top(np, 0);
+        for (size_t i = 0; i < ns; ++i) top[(size_t) ord[i]] = 1;
+        for (size_t sl = 0; sl < nv; ++sl)
+            if (slot_static[sl] && slot_pair[sl] >= 0 && !top[(size_t) slot_pair[sl]]) out.push_back(slot_pair[sl]);
+        std::sort(in.begin(), in.end(), [&](int32_t a, int32_t b) { return sc(a) > sc(b); });
+        std::sort(out.begin(), out.end(), [&](int32_t a, int32_t b) { return sc(a) < sc(b); });
+        const int32_t none[kK] = {-1, -1, -1, -1, -1, -1, -1, -1};
+        for (size_t k = 0; k < std::min({in.size(), out.size(), (size_t) max_moves}); ++k) {
+            const int32_t pi = in[k], po = out[k];
+            if (sc(pi) <= hyst * sc(po)) break;
+            const int32_t so = res[(size_t) po];
+            // out: into the LRU part, with its RAM copy back (or out of VRAM if RAM has no room for it)
+            slot_static[(size_t) so] = 0;
+            --static_n;
+            if (!tier.has_copy(po / kNE, po % kNE)) {
+                if (tier.spares() == 0) {
+                    const int32_t v = ram_pick(none);
+                    if (v >= 0) { tier.promote_done(v / kNE, v % kNE); rlru.remove(v); }
+                }
+                if (uint8_t* d = tier.demote_begin(po / kNE, po % kNE)) {
+                    CK(cudaMemcpy(d, vslot[(size_t) so], XL.bytes, cudaMemcpyDeviceToHost));
+                    tier.demote_commit(po / kNE, po % kNE);
+                    rlru.touch(po);
+                } else {
+                    res[(size_t) po] = -1;
+                    slot_pair[(size_t) so] = -1;
+                }
+            }
+            vlru.touch(so);
+            // in: a resident of the LRU part changes role; one in RAM is copied into the LRU part's least recent slot
+            int32_t r = res[(size_t) pi];
+            if (r < 0) {
+                r = vlru.tail;
+                if (r < 0) break;
+                const int32_t vv = slot_pair[(size_t) r];
+                if (vv >= 0) {
+                    res[(size_t) vv] = -1;
+                    if (tier.has_copy(vv / kNE, vv % kNE)) pol_cand(vv);
+                }
+                CK(cudaMemcpy(vslot[(size_t) r], tier.stable_blob(pi / kNE, pi % kNE), XL.bytes, cudaMemcpyHostToDevice));
+                slot_pair[(size_t) r] = pi;
+                res[(size_t) pi] = r;
+            }
+            vlru.remove(r);
+            slot_static[(size_t) r] = 1;
+            ++static_n;
+            if (tier.has_copy(pi / kNE, pi % kNE)) { tier.promote_done(pi / kNE, pi % kNE); rlru.remove(pi); }
+            ++restatic_moves;
+        }
+    }
+
     // After the prompt: its buffers (and the staging slots LRU decode does not use) back to the expert tier.
     void release_prompt() {
         if (chunk == 0) return;
@@ -1987,10 +2057,12 @@ struct Engine {
                     ++skipped;
                     continue;
                 }
-                const int32_t v = ram_pick(pj);
-                if (v < 0) continue;   // nothing to evict: staged below through the tier's own read
-                tier.promote_done(v / kNE, v % kNE);   // its slot becomes the spare demote_begin takes
-                rlru.remove(v);
+                if (tier.spares() == 0) {   // a spare first (one a static expert gave up), else the policy's victim
+                    const int32_t v = ram_pick(pj);
+                    if (v < 0) continue;   // nothing to evict: staged below through the tier's own read
+                    tier.promote_done(v / kNE, v % kNE);   // its slot becomes the spare demote_begin takes
+                    rlru.remove(v);
+                }
                 uint8_t* d = tier.demote_begin(m, hid[j]);
                 if (d == nullptr) continue;
                 reader.start(j, strata::kernels::cpu::expert_layout().blob_offset(m, hid[j]), XL.bytes, d);
@@ -2048,10 +2120,12 @@ struct Engine {
                     bool busy = false;
                     for (int x = 0; x < kK; ++x) busy |= pf_pair[x] == q;
                     if (busy) continue;
-                    const int32_t v = ram_pick(pj);
-                    if (v < 0) break;
-                    tier.promote_done(v / kNE, v % kNE);
-                    rlru.remove(v);
+                    if (tier.spares() == 0) {
+                        const int32_t v = ram_pick(pj);
+                        if (v < 0) break;
+                        tier.promote_done(v / kNE, v % kNE);
+                        rlru.remove(v);
+                    }
                     uint8_t* d = tier.demote_begin(mn, pf_ids[i]);
                     if (d == nullptr) continue;
                     int job = 0;
@@ -2294,6 +2368,7 @@ int main(int argc, char** argv) {
     int cpu_threads = 14;
     bool no_prefetch = false, dense_bf16 = false, prompt_f32 = false, ram_exclusive = false;
     double vram_static = 0.7;   // --vram-static 0: VRAM all LRU (inclusive)
+    int restatic_every = 8;     // --restatic N: the static part follows the decode every N tokens (0: fixed at the prompt)
     float skip_disk = 0.f, skip_ram = 0.f;
     std::string teacher_path, step_logits_path;   // decode forced to these tokens; every step's logits written out
     int pf_copies = 2, pf_reads = 6;   // reads 6: chat_uk +1.3%, chat_code +0.7% over 4 (8: no better)
@@ -2339,6 +2414,7 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-f32") prompt_f32 = true;
         else if (a == "--ram-exclusive") ram_exclusive = true;
         else if (a == "--vram-static") vram_static = std::atof(next().c_str());
+        else if (a == "--restatic") restatic_every = std::atoi(next().c_str());
         else if (a == "--skip-disk") skip_disk = (float) std::atof(next().c_str());
         else if (a == "--skip-ram") skip_ram = (float) std::atof(next().c_str());
         else if (a == "--teacher") teacher_path = next();
@@ -2465,6 +2541,7 @@ int main(int argc, char** argv) {
         e.timing_token(std::chrono::duration<double>(std::chrono::steady_clock::now() - tf).count());
         ++steps;
         if (e.tiered && rebalance_every > 0 && steps % rebalance_every == 0) e.rebalance(rebalance_vram, rebalance_ram, false);
+        if (e.tiered && restatic_every > 0 && steps % restatic_every == 0) e.restatic(16, 1.5);
         if (steps % 32 == 0) {   // the machine is also a desktop: say so when RAM runs low
             const double avail = strata::core::available_ram_bytes() / 1073741824.0;
             if (avail > 0 && avail < 8) std::fprintf(stderr, "strata-glm: only %.1f GiB of RAM left for Windows\n", avail);
