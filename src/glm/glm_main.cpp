@@ -884,6 +884,13 @@ struct Engine {
     // decode's copies into VRAM slots run on xs, not behind the shared expert and the prediction on s
     cudaStream_t xs = nullptr;
     cudaEvent_t ev_xs = nullptr;
+    // the experts already in VRAM run before the layer's copies land (their own launch); its blobs and rows are read
+    // by the kernel straight from pinned memory (UVA), like the second launch's - no small H2D copies queued behind
+    // the expert copies. ev_pfc: after the last speculative copies, which a resident expert may still be waiting for.
+    unsigned long long* gqa_host = nullptr;
+    int32_t* gea_host = nullptr;
+    cudaEvent_t ev_pfc = nullptr;
+    bool pfc_pending = false;
     // GLM_PREDICT=1 (measurement): layer l+1's experts predicted by its own hc_pre, norm and router applied to the
     // streams (A) as layer l's router sees them, (B) after layer l; scored against what layer l+1 then routes
     bool predict = false;
@@ -1050,6 +1057,9 @@ struct Engine {
         }
         CK(cudaStreamCreateWithFlags(&xs, cudaStreamNonBlocking));
         CK(cudaEventCreateWithFlags(&ev_xs, cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&ev_pfc, cudaEventDisableTiming));
+        CK(cudaMallocHost(&gqa_host, (size_t) kMoe * kK * sizeof(unsigned long long)));
+        CK(cudaMallocHost(&gea_host, (size_t) kMoe * (kK + 1) * sizeof(int32_t)));
         CK(cudaMalloc(&stage, (size_t) kStage * XL.bytes + (1 << 20)));   // + MMQ's read past the last expert
         CK(cudaMemset(stage, 0, (size_t) kStage * XL.bytes + (1 << 20)));
         CK(cudaMallocHost(&x_host, kEmbd * sizeof(float)));
@@ -1921,6 +1931,7 @@ struct Engine {
                     pf_vpair[pf_vn++] = q;
                     ++pf_copies;
                 }
+                if (pf_vn > 0) { CK(cudaEventRecord(ev_pfc, xs)); pfc_pending = true; }
             };
             bool done[kK] = {};
             uint8_t* dslot[kK] = {};
@@ -1953,6 +1964,20 @@ struct Engine {
                 pol_use(pj[j]);
                 done[j] = true;
                 ++ts.vram;
+            }
+            bool in_a[kK] = {};
+            {   // the experts in VRAM now, beside this layer's copies (a speculative copy may still be landing: ev_pfc)
+                unsigned long long* gqa = gqa_host + (size_t) m * kK;
+                int32_t* gea = gea_host + (size_t) m * (kK + 1);
+                int32_t na = 0;
+                for (int j = 0; j < kK; ++j)
+                    if (done[j]) { gqa[na] = gp[j]; gea[na] = j; in_a[j] = true; ++na; }
+                gea[kK] = na;
+                if (na > 0) {
+                    if (pfc_pending) { CK(cudaStreamWaitEvent(s, ev_pfc, 0)); pfc_pending = false; }
+                    strata::kernels::native_expert_grouped_f32(XL, gqa, grp_start, gea + kK, gea, ent_tok, kK, kK, xn,
+                                                               xscratch, rows, s);
+                }
             }
             bool skipj[kK] = {};
             for (int j = 0; j < kK; ++j) {   // on the disk: into the RAM slot of the least recent member outside VRAM
@@ -2124,7 +2149,7 @@ struct Engine {
             int32_t* ge = ge_host + (size_t) m * (kK + 1);
             int32_t ng = 0;
             for (int j = 0; j < kK; ++j) {
-                bool cpu = skipj[j];
+                bool cpu = skipj[j] || in_a[j];
                 for (int c = 0; c < ncpu; ++c) cpu |= cj[c] == j;
                 if (cpu) continue;
                 gq[ng] = gp[j];
@@ -2132,11 +2157,11 @@ struct Engine {
                 ++ng;
             }
             ge[kK] = ng;
-            CK(cudaEventRecord(ev_xs, xs));   // the expert kernel waits for this layer's copies, nothing else does
-            CK(cudaStreamWaitEvent(s, ev_xs, 0));
+            if (ng > 0) {   // the expert kernel waits for this layer's copies, nothing else does
+                CK(cudaEventRecord(ev_xs, xs));
+                CK(cudaStreamWaitEvent(s, ev_xs, 0));
+            }
             if (pf && !pf_copied) pf_copy();   // no disk wait here: beside this layer's kernel and the next attention
-            CK(cudaMemcpyAsync(grp_ptr, gq, kK * sizeof(unsigned long long), cudaMemcpyHostToDevice, s));
-            CK(cudaMemcpyAsync(d_ent, ge, (kK + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, s));
             {
                 float wall = 0.f, wkeep = 0.f;
                 bool any = false;
@@ -2151,8 +2176,7 @@ struct Engine {
             }
             if (timing) CK(cudaEventRecord(tev[(size_t) m * 3 + 1], s));
             if (ng > 0)
-                strata::kernels::native_expert_grouped_f32(XL, grp_ptr, grp_start, d_ent + kK, d_ent, ent_tok, kK, kK, xn,
-                                                           xscratch, rows, s);
+                strata::kernels::native_expert_grouped_f32(XL, gq, grp_start, ge + kK, ge, ent_tok, kK, kK, xn, xscratch, rows, s);
             if (ncpu > 0) {
                 cpux.wait();
                 for (int c = 0; c < ncpu; ++c)
