@@ -2483,7 +2483,9 @@ int main(int argc, char** argv) {
     bool no_prefetch = false, dense_bf16 = false, prompt_f32 = false, ram_exclusive = false;
     double vram_static = 0.7;   // --vram-static 0: VRAM all LRU (inclusive)
     int restatic_every = 8;     // --restatic N: the static part follows the decode every N tokens (0: fixed at the prompt)
-    float skip_disk = 0.f, skip_ram = 0.f;
+    // --skip-disk 0.1 by default: a routed expert only on the disk, not prefetched, under 10% of the routing weight
+    // is left out (KL to BF16: 0.018 -> 0.017 short, 0.021 long; +13-15% tok/s); --skip-disk 0 restores exactness
+    float skip_disk = 0.1f, skip_ram = 0.f;
     std::string teacher_path, step_logits_path;   // decode forced to these tokens; every step's logits written out
     int pf_copies = 2, pf_reads = 6;   // reads 6: chat_uk +1.3%, chat_code +0.7% over 4 (8: no better)
     // formats (KL to BF16 dense + FP16 latent, 48 teacher-forced steps after a 2600-token prompt, median): int8 dense
