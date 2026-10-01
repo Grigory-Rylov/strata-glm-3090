@@ -6,6 +6,7 @@
 #include "glm_kernels.cuh"
 
 #include <cuda_fp16.h>
+#include <cuda_fp4.h>
 #include <cuda_fp8.h>
 
 #include <cstdio>
@@ -74,6 +75,124 @@ __global__ void __launch_bounds__(256) gemv_fp8_kernel(const uint8_t* __restrict
     }
 }
 
+__device__ __forceinline__ float2 e2m1x2(uint32_t byte) {   // two e2m1 codes (the low nibble first) -> floats
+    const __half2_raw h = __nv_cvt_fp4x2_to_halfraw2((__nv_fp4x2_storage_t) (byte & 0xffu), __NV_E2M1);
+    return __half22float2(*(const __half2*) &h);
+}
+
+// a warp per row, 32 weights (16 bytes, two blocks) per lane per step; each block's dot product times its scale
+template <int NT>
+__global__ void __launch_bounds__(256) gemv_nvfp4_kernel(const uint8_t* __restrict__ W, const uint8_t* __restrict__ bsc,
+                                                         const float* __restrict__ scale, const float* __restrict__ x,
+                                                         float* __restrict__ y, int rows, int cols, int x_ld, int y_ld) {
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= rows) return;
+    const uint4* wr = (const uint4*) (W + (size_t) row * (cols / 2));
+    const uint16_t* sr = (const uint16_t*) (bsc + (size_t) row * (cols / 16));
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.f;
+    for (int c32 = lane; c32 < cols / 32; c32 += 32) {
+        const uint4 u = __ldg(wr + c32);
+        const float2 bs = e4m3x2(__ldg(sr + c32));
+        const uint32_t w4[4] = {u.x, u.y, u.z, u.w};
+        float wf[32];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                const float2 v = e2m1x2(w4[j] >> (8 * b));
+                wf[8 * j + 2 * b] = v.x;
+                wf[8 * j + 2 * b + 1] = v.y;
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            const float4* xv = (const float4*) (x + (size_t) t * x_ld + (size_t) c32 * 32);
+            float a0 = 0.f, a1 = 0.f;
+#pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const float4 v = xv[q], v2 = xv[q + 4];
+                a0 += wf[4 * q] * v.x + wf[4 * q + 1] * v.y + wf[4 * q + 2] * v.z + wf[4 * q + 3] * v.w;
+                a1 += wf[16 + 4 * q] * v2.x + wf[16 + 4 * q + 1] * v2.y + wf[16 + 4 * q + 2] * v2.z + wf[16 + 4 * q + 3] * v2.w;
+            }
+            acc[t] += a0 * bs.x + a1 * bs.y;
+        }
+    }
+    const float sc = scale[row];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+        const float v = wsum(acc[t]);
+        if (lane == 0) y[(size_t) t * y_ld + row] = v * sc;
+    }
+}
+
+__device__ __forceinline__ int e2m1_code(float v) {   // the nearest e2m1 value's code (sign in bit 3)
+    const float a = fabsf(v);
+    const int m = a < 0.25f ? 0 : a < 0.75f ? 1 : a < 1.25f ? 2 : a < 1.75f ? 3 : a < 2.5f ? 4 : a < 3.5f ? 5 : a < 5.f ? 6 : 7;
+    return m | (v < 0.f && m ? 8 : 0);
+}
+
+__device__ __forceinline__ float e2m1_val(int c) {
+    const float mag[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    return (c & 8) ? -mag[c & 7] : mag[c & 7];
+}
+
+__device__ __forceinline__ float e4m3_val(int c) {
+    const __half_raw h = __nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t) c, __NV_E4M3);
+    return __half2float(*(const __half*) &h);
+}
+
+// a block per row: its amax gives the row scale; then a thread per 16-value block tries 4 E4M3 scales around
+// amax / 6 (a lower one clips the largest value but can round the rest closer) and keeps the least squared error
+__global__ void quant_nvfp4_kernel(const bf16* __restrict__ w, int cols, uint8_t* __restrict__ q, uint8_t* __restrict__ bsc,
+                                   float* __restrict__ scale) {
+    const size_t r = blockIdx.x;
+    const bf16* wr = w + r * cols;
+    float m = 0.f;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) m = fmaxf(m, fabsf(bfv(wr[c])));
+    __shared__ float part[32];
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = m;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = threadIdx.x < (blockDim.x >> 5) ? part[threadIdx.x] : 0.f;
+        for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+        if (threadIdx.x == 0) part[0] = v;
+    }
+    __syncthreads();
+    const float s2 = part[0] > 0.f ? part[0] / (6.f * 448.f) : 1.f;
+    if (threadIdx.x == 0) scale[r] = s2;
+    for (int b = threadIdx.x; b < cols / 16; b += blockDim.x) {
+        float v[16], bm = 0.f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            v[i] = bfv(wr[b * 16 + i]);
+            bm = fmaxf(bm, fabsf(v[i]));
+        }
+        const int c0 = (int) __nv_cvt_float_to_fp8(bm / 6.f / s2, __NV_SATFINITE, __NV_E4M3);
+        int best = 0;
+        float best_err = 0.f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) best_err += v[i] * v[i];   // scale 0: every code 0
+        for (int c = max(1, c0 - 2); c <= min(0x7e, c0 + 1); ++c) {
+            const float sb = e4m3_val(c) * s2, inv = 1.f / sb;
+            float err = 0.f;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const float d = v[i] - e2m1_val(e2m1_code(v[i] * inv)) * sb;
+                err += d * d;
+            }
+            if (err < best_err) { best_err = err; best = c; }
+        }
+        bsc[r * (cols / 16) + b] = (uint8_t) best;
+        const float inv = best ? 1.f / (e4m3_val(best) * s2) : 0.f;
+#pragma unroll
+        for (int i = 0; i < 16; i += 2)
+            q[r * (cols / 2) + b * 8 + i / 2] = (uint8_t) (e2m1_code(v[i] * inv) | (e2m1_code(v[i + 1] * inv) << 4));
+    }
+}
+
 __global__ void quant_fp8_kernel(const bf16* __restrict__ w, int cols, uint8_t* __restrict__ q, float* __restrict__ scale) {
     const size_t r = blockIdx.x;
     const bf16* wr = w + r * cols;
@@ -137,6 +256,24 @@ __global__ void fill_kernel(float* p, float v, int n) {
 }  // namespace
 
 void gemv(const Mat& W, const float* x, float* y, int rows, int cols, int nt, cudaStream_t s, int x_ld, int y_ld) {
+    if (W.bsc) {
+        if (cols % 32) { std::fprintf(stderr, "gemv nvfp4: cols %d not a multiple of 32\n", cols); std::exit(1); }
+        x_ld = x_ld ? x_ld : cols;
+        y_ld = y_ld ? y_ld : rows;
+        const dim3 g((unsigned) ((rows + 7) / 8));
+        const uint8_t* w = (const uint8_t*) W.w;
+        switch (nt) {
+            case 1: gemv_nvfp4_kernel<1><<<g, 256, 0, s>>>(w, W.bsc, W.scale, x, y, rows, cols, x_ld, y_ld); break;
+            case 2: gemv_nvfp4_kernel<2><<<g, 256, 0, s>>>(w, W.bsc, W.scale, x, y, rows, cols, x_ld, y_ld); break;
+            case 4: gemv_nvfp4_kernel<4><<<g, 256, 0, s>>>(w, W.bsc, W.scale, x, y, rows, cols, x_ld, y_ld); break;
+            default:
+                for (int t = 0; t < nt; ++t)
+                    gemv_nvfp4_kernel<1><<<g, 256, 0, s>>>(w, W.bsc, W.scale, x + (size_t) t * x_ld, y + (size_t) t * y_ld,
+                                                          rows, cols, x_ld, y_ld);
+        }
+        ck("gemv nvfp4");
+        return;
+    }
     if (!W.fp8) {
         gemv_bf16(W.b16(), x, y, rows, cols, nt, s, x_ld, y_ld);
         if (W.scale) scale_cols(y, W.scale, rows, nt, y_ld ? y_ld : rows, s);
@@ -162,6 +299,11 @@ void gemv(const Mat& W, const float* x, float* y, int rows, int cols, int nt, cu
 void quant_fp8_rows(const bf16* w, int rows, int cols, uint8_t* q, float* scale, cudaStream_t s) {
     quant_fp8_kernel<<<(unsigned) rows, 256, 0, s>>>(w, cols, q, scale);
     ck("quant_fp8_rows");
+}
+
+void quant_nvfp4_rows(const bf16* w, int rows, int cols, uint8_t* q, uint8_t* bsc, float* scale, cudaStream_t s) {
+    quant_nvfp4_kernel<<<(unsigned) rows, 256, 0, s>>>(w, cols, q, bsc, scale);
+    ck("quant_nvfp4_rows");
 }
 
 void fp8_to_bf16(const uint8_t* q, bf16* out, size_t n, cudaStream_t s) {

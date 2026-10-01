@@ -27,12 +27,18 @@ struct Mat {
     const void* w = nullptr;
     const float* scale = nullptr;   ///< per row (output), or null
     bool fp8 = false;
+    /// NVFP4: w is [rows][cols / 2] e2m1 codes (the even column in the low nibble), bsc the E4M3 scales of each
+    /// 16 values [rows][cols / 16]
+    const uint8_t* bsc = nullptr;
     const bf16* b16() const { return (const bf16*) w; }
 };
 /// y[t][r] = scale[r] * sum_c W[r][c] * x[t][c], as gemv_bf16 (cols % 16 == 0 for FP8).
 void gemv(const Mat& W, const float* x, float* y, int rows, int cols, int nt, cudaStream_t s, int x_ld = 0, int y_ld = 0);
 /// W (BF16) -> q (E4M3) and scale[r] = amax(row r) / 448, once at load.
 void quant_fp8_rows(const bf16* w, int rows, int cols, uint8_t* q, float* scale, cudaStream_t s);
+/// W (BF16) -> NVFP4 (cols % 32 == 0): codes q [rows][cols / 2], block scales bsc [rows][cols / 16], scale[r] =
+/// amax(row r) / (6 * 448); each block's E4M3 scale the one of 4 near its amax / 6 with the least squared error.
+void quant_nvfp4_rows(const bf16* w, int rows, int cols, uint8_t* q, uint8_t* bsc, float* scale, cudaStream_t s);
 /// E4M3 -> BF16, exactly (every E4M3 value is a BF16 value); the prompt path's GEMMs read the result.
 void fp8_to_bf16(const uint8_t* q, bf16* out, size_t n, cudaStream_t s);
 /// Y[t][n] *= scale[n] for t < T (row stride ldy).

@@ -372,13 +372,32 @@ struct Engine {
     // --dense-bf16: keep the checkpoint's BF16; default: FP8 E4M3 with a scale per row, quantized here once
     bool dense_fp8 = true;
     bool latent_i8 = false;   // --latent-i8: the MLA latent cache in int8 (half of FP16) - "k8" for an MLA, K and V one tensor
-    glm::Mat mat(const std::string& name) {
+    // --dense-fp4 attn,shared,head: those matrices in NVFP4 (blocks of 16, a scale per row) instead of FP8 - half the
+    // VRAM and the per-token read, lossy (the leading dense MLP is NVFP4 in the checkpoint: kept as it is)
+    bool fp4_attn = false, fp4_shared = false, fp4_head = false;
+    size_t fp4_saved = 0;
+    glm::Mat mat(const std::string& name, bool fp4 = false) {
         glm::Mat m;
         const TensorRef& r = ck.ref(name);
         glm::bf16* w = ck.bf(name);
         m.w = w;
         if (!dense_fp8 || r.shape.size() != 2 || r.shape[1] % 16) return m;
         const int rows = (int) r.shape[0], cols = (int) r.shape[1];
+        if (fp4 && cols % 32 == 0 && (size_t) rows * cols >= ((size_t) 1 << 20)) {   // the small gates stay FP8
+            uint8_t *q = nullptr, *bs = nullptr;
+            float* sc = nullptr;
+            CK(cudaMalloc(&q, (size_t) rows * cols / 2));
+            CK(cudaMalloc(&bs, (size_t) rows * cols / 16));
+            CK(cudaMalloc(&sc, (size_t) rows * sizeof(float)));
+            glm::quant_nvfp4_rows(w, rows, cols, q, bs, sc, nullptr);
+            CK(cudaDeviceSynchronize());
+            CK(cudaFree(w));
+            m.w = q;
+            m.bsc = bs;
+            m.scale = sc;
+            fp4_saved += (size_t) rows * cols * 7 / 16;
+            return m;
+        }
         uint8_t* q = nullptr;
         float* sc = nullptr;
         CK(cudaMalloc(&q, (size_t) rows * cols));
@@ -391,24 +410,20 @@ struct Engine {
         m.fp8 = true;
         return m;
     }
-    // an NVFP4 matrix held exactly in BF16 (e2m1 x e4m3), weight_scale_2 as the row scale
+    // an NVFP4 matrix of the checkpoint as it is (codes, E4M3 block scales), weight_scale_2 as the row scale
     glm::Mat nvfp4_mat(const std::string& prefix, int rows, int cols) {
         uint8_t* w = ck.dev<uint8_t>(prefix + ".weight", "U8");
         uint8_t* sc = ck.dev<uint8_t>(prefix + ".weight_scale", "F8_E4M3");
         const auto s2b = ck.read(prefix + ".weight_scale_2");
         float s2 = 0.f;
         std::memcpy(&s2, s2b.data(), 4);
-        glm::bf16* out = nullptr;
         float* scale = nullptr;
-        CK(cudaMalloc(&out, (size_t) rows * cols * sizeof(glm::bf16)));
         CK(cudaMalloc(&scale, (size_t) rows * sizeof(float)));
-        glm::nvfp4_to_bf16(w, sc, out, rows, cols, nullptr);
         glm::fill(scale, s2, rows, nullptr);
         CK(cudaDeviceSynchronize());
-        cudaFree(w);
-        cudaFree(sc);
         glm::Mat m;
-        m.w = out;
+        m.w = w;
+        m.bsc = sc;
         m.scale = scale;
         return m;
     }
@@ -658,6 +673,15 @@ struct Engine {
     // exclusive tiers (default with lru): a RAM hit moving to VRAM gives its RAM slot back (at the next layer, once
     // its copy has run), and an expert leaving VRAM without a RAM copy is written back (D2H: the idle direction)
     bool excl = false;   // --ram-exclusive
+    // --vram-static F: the hottest F of VRAM's slots (by the prompt's routing, at each rebalance) are never evicted
+    // and give their RAM copies up, so RAM caches that many more experts and the disk is read less; the rest of
+    // VRAM stays an LRU over RAM. No write-backs while decoding (an expert leaving the static part at a rebalance is
+    // written back to RAM then). An offline replay: 1100 of 1735 cut the disk reads a token 32-39% for 8-20% more
+    // RAM -> VRAM copies (Strata-data/glm/policy/hybrid_sim.py).
+    double vram_static = 0;
+    std::vector<uint8_t> slot_static;
+    long long static_n = 0;
+    bool is_static(int32_t sl) const { return (size_t) sl < slot_static.size() && slot_static[(size_t) sl]; }
     // --skip-disk W (lossy, opt-in): a routed expert that is only on the disk and whose normalized routing weight is
     // below W is left out (the others' weights rescaled to the same sum) instead of waited for
     float skip_disk = 0.f;
@@ -938,7 +962,7 @@ struct Engine {
         for (size_t s = 0; s < vslot.size(); ++s) if (slot_pair[s] < 0) vlru.touch((int32_t) s);   // empty: the tail
         for (size_t i = hot_first.size(); i-- > 0;) {                                              // the hottest last
             const int32_t p = hot_first[i];
-            if (res[(size_t) p] >= 0) vlru.touch(res[(size_t) p]);
+            if (res[(size_t) p] >= 0 && !is_static(res[(size_t) p])) vlru.touch(res[(size_t) p]);
             if (tier.has_copy(p / kNE, p % kNE)) rlru.touch(p);
         }
     }
@@ -1069,6 +1093,26 @@ struct Engine {
         for (size_t i = 0; i < np; ++i) rank[(size_t) order[i]] = (int32_t) i;
         tier.rerank(rank);
         const size_t nv = vslot.size();
+        const bool hybrid = lru && !excl && vram_static > 0;
+        const size_t ns = hybrid ? (size_t) (vram_static * (double) nv) : 0;
+        slot_static.resize(nv, 0);
+        long long unstatic = 0;
+        for (size_t sl = 0; sl < nv; ++sl) {   // static experts ranked below the new static part: back to inclusive
+            if (!slot_static[sl]) continue;
+            const int32_t o = slot_pair[sl];
+            if (o >= 0 && (size_t) rank[(size_t) o] < ns) continue;
+            slot_static[sl] = 0;
+            --static_n;
+            if (o < 0 || tier.has_copy(o / kNE, o % kNE)) continue;
+            if (uint8_t* d = tier.demote_begin(o / kNE, o % kNE)) {
+                CK(cudaMemcpy(d, vslot[sl], XL.bytes, cudaMemcpyDeviceToHost));
+                tier.demote_commit(o / kNE, o % kNE);
+                ++unstatic;
+            } else {   // no RAM slot for it: out of VRAM too (file-backed)
+                res[(size_t) o] = -1;
+                slot_pair[sl] = -1;
+            }
+        }
         std::vector<int32_t> in, out;   // out: slots - the empty ones, then those of the coldest residents
         for (size_t i = 0; i < nv; ++i) if (res[(size_t) order[i]] < 0) in.push_back(order[i]);
         for (size_t sl = 0; sl < nv; ++sl) if (slot_pair[sl] < 0) out.push_back((int32_t) sl);
@@ -1114,10 +1158,19 @@ struct Engine {
                 if (slot_pair[sl] >= 0 && tier.has_copy(slot_pair[sl] / kNE, slot_pair[sl] % kNE))
                     tier.promote_done(slot_pair[sl] / kNE, slot_pair[sl] % kNE);
         pending_free.clear();
+        for (size_t i = 0; i < ns; ++i) {   // the hottest residents become static: their RAM copies are spares now
+            const int32_t p = order[i], sl = res[(size_t) p];
+            if (sl < 0 || slot_static[(size_t) sl]) continue;
+            slot_static[(size_t) sl] = 1;
+            ++static_n;
+            if (tier.has_copy(p / kNE, p % kNE)) tier.promote_done(p / kNE, p % kNE);
+        }
         std::vector<std::pair<int32_t, int32_t>> want;
         const size_t cap = (size_t) tier.tier_slots(), r0 = lru && !excl ? 0 : nv;
-        for (size_t i = r0; i < std::min(np, r0 + cap) && (long long) want.size() < max_ram; ++i) {
+        for (size_t i = r0, held = 0; i < np && held < cap && (long long) want.size() < max_ram; ++i) {
             const int32_t p = order[i];
+            if (res[(size_t) p] >= 0 && is_static(res[(size_t) p])) continue;
+            ++held;
             if (((lru && !excl) || res[(size_t) p] < 0) && !tier.has_copy(p / kNE, p % kNE)) want.emplace_back(p / kNE, p % kNE);
         }
         const int64_t admitted = want.empty() ? 0 : tier.admit_from_file(want, 16, err);
@@ -1131,6 +1184,8 @@ struct Engine {
             std::fprintf(stderr, "strata-glm: rebalance: VRAM %zu in (%lld from RAM, %zu from disk; %lld moved back to "
                                  "RAM), RAM %lld of %zu read in, %.2f s\n", moves, from_ram, from_file.size(), demoted,
                          (long long) admitted, want.size(), sec);
+            if (hybrid) std::fprintf(stderr, "strata-glm: VRAM: %lld static (not in RAM), %zu LRU; %lld left the static part\n",
+                                     static_n, nv - (size_t) static_n, unstatic);
         }
     }
 
@@ -1568,20 +1623,22 @@ struct Engine {
             y.post_norm = ck.bf(p + "post_attention_layernorm.weight");
             const std::string a = p + "self_attn.";
             if (!is_dsa(l)) {
-                y.wq = mat(a + "q_proj.weight"); y.wk = mat(a + "k_proj.weight"); y.wv = mat(a + "v_proj.weight");
+                y.wq = mat(a + "q_proj.weight", fp4_attn); y.wk = mat(a + "k_proj.weight", fp4_attn);
+                y.wv = mat(a + "v_proj.weight", fp4_attn);
                 y.q_conv = ck.f32(a + "q_conv1d.weight"); y.k_conv = ck.f32(a + "k_conv1d.weight"); y.v_conv = ck.f32(a + "v_conv1d.weight");
                 y.fa = mat(a + "f_a_proj.weight"); y.fb = mat(a + "f_b_proj.weight");
                 y.dt_bias = ck.f32(a + "dt_bias"); y.A_log = ck.f32(a + "A_log");
                 y.bproj = mat(a + "b_proj.weight"); y.ga = mat(a + "g_a_proj.weight"); y.gb = mat(a + "g_b_proj.weight");
-                y.onorm = ck.bf(a + "o_norm.weight"); y.wo = mat(a + "o_proj.weight");
+                y.onorm = ck.bf(a + "o_norm.weight"); y.wo = mat(a + "o_proj.weight", fp4_attn);
                 CK(cudaMalloc(&y.S, (size_t) kKdaH * kKdaD * kKdaD * sizeof(float)));
                 CK(cudaMalloc(&y.conv, (size_t) 3 * kKdaC * 3 * sizeof(float)));
             } else {
-                y.qa = mat(a + "q_a_proj.weight"); y.qa_norm = ck.bf(a + "q_a_layernorm.weight"); y.qb = mat(a + "q_b_proj.weight");
-                y.kva = mat(a + "kv_a_proj_with_mqa.weight"); y.kva_norm = ck.bf(a + "kv_a_layernorm.weight"); y.kvb = ck.bf(a + "kv_b_proj.weight");
-                y.wo = mat(a + "o_proj.weight");
+                y.qa = mat(a + "q_a_proj.weight", fp4_attn); y.qa_norm = ck.bf(a + "q_a_layernorm.weight");
+                y.qb = mat(a + "q_b_proj.weight", fp4_attn);
+                y.kva = mat(a + "kv_a_proj_with_mqa.weight", fp4_attn); y.kva_norm = ck.bf(a + "kv_a_layernorm.weight"); y.kvb = ck.bf(a + "kv_b_proj.weight");
+                y.wo = mat(a + "o_proj.weight", fp4_attn);
                 const std::string ip = a + "indexer.";
-                y.iwqb = mat(ip + "wq_b.weight"); y.iwk = mat(ip + "wk.weight"); y.ik_w = ck.bf(ip + "k_norm.weight");
+                y.iwqb = mat(ip + "wq_b.weight", fp4_attn); y.iwk = mat(ip + "wk.weight"); y.ik_w = ck.bf(ip + "k_norm.weight");
                 y.ik_b = ck.bf(ip + "k_norm.bias"); y.iwp = mat(ip + "weights_proj.weight");
                 y.igate = mat(ip + "index_kpool_compress_gate"); y.iape = ck.bf(ip + "index_kpool_compress_ape");
                 if (latent_i8) {
@@ -1602,13 +1659,14 @@ struct Engine {
             } else {
                 y.router = ck.bf(m + "gate.weight");
                 y.router_bias = ck.f32(m + "gate.e_score_correction_bias");
-                y.sg = mat(m + "shared_experts.gate_proj.weight");
-                y.su = mat(m + "shared_experts.up_proj.weight");
-                y.sd = mat(m + "shared_experts.down_proj.weight");
+                y.sg = mat(m + "shared_experts.gate_proj.weight", fp4_shared);
+                y.su = mat(m + "shared_experts.up_proj.weight", fp4_shared);
+                y.sd = mat(m + "shared_experts.down_proj.weight", fp4_shared);
             }
         }
         final_norm = ck.bf("model.language_model.norm.weight");
-        lm_head = mat("lm_head.weight");
+        lm_head = mat("lm_head.weight", fp4_head);
+        if (fp4_saved) std::fprintf(stderr, "strata-glm: dense NVFP4 saves %.2f GB of VRAM\n", fp4_saved / 1e9);
         {
             const auto b = ck.read("model.language_model.embed_tokens.weight");
             embed.resize(b.size() / 2);
@@ -1836,7 +1894,7 @@ struct Engine {
                 const int32_t r = res[(size_t) pj[j]];
                 if (r < 0) continue;
                 gp[j] = (unsigned long long) vslot[(size_t) r];
-                vlru.touch(r);
+                if (!is_static(r)) vlru.touch(r);
                 if (rlru.in[(size_t) pj[j]]) rlru.touch(pj[j]);
                 pol_use(pj[j]);
                 done[j] = true;
@@ -2144,10 +2202,12 @@ int main(int argc, char** argv) {
     double cpu_share = 0;
     int cpu_threads = 14;
     bool no_prefetch = false, dense_bf16 = false, prompt_f32 = false, ram_exclusive = false;
+    double vram_static = 0;
     float skip_disk = 0.f;
     std::string teacher_path, step_logits_path;   // decode forced to these tokens; every step's logits written out
     int pf_copies = 2, pf_reads = 4;
     bool pf_stage_on = false, ram_lru = false, latent_i8 = false;
+    std::string dense_fp4;
     long long rebalance_vram = 32, rebalance_ram = 64;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -2174,11 +2234,13 @@ int main(int argc, char** argv) {
         else if (a == "--pf-stage") pf_stage_on = true;
         else if (a == "--ram-lru") ram_lru = true;
         else if (a == "--latent-i8") latent_i8 = true;
+        else if (a == "--dense-fp4" && i + 1 < argc) dense_fp4 = argv[++i];
         else if (a == "--pf-copies") pf_copies = std::atoi(next().c_str());
         else if (a == "--pf-reads") pf_reads = std::atoi(next().c_str());
         else if (a == "--dense-bf16") dense_bf16 = true;
         else if (a == "--prompt-f32") prompt_f32 = true;
         else if (a == "--ram-exclusive") ram_exclusive = true;
+        else if (a == "--vram-static") vram_static = std::atof(next().c_str());
         else if (a == "--skip-disk") skip_disk = (float) std::atof(next().c_str());
         else if (a == "--teacher") teacher_path = next();
         else if (a == "--dump-step-logits") step_logits_path = next();
@@ -2210,8 +2272,16 @@ int main(int argc, char** argv) {
     e.dense_fp8 = !dense_bf16;
     e.chunk_cap = chunk;
     e.latent_i8 = latent_i8;
+    for (const char* c : {"attn", "shared", "head", "all"}) {
+        if (dense_fp4.find(c) == std::string::npos) continue;
+        const bool all = std::string(c) == "all";
+        if (all || std::string(c) == "attn") e.fp4_attn = true;
+        if (all || std::string(c) == "shared") e.fp4_shared = true;
+        if (all || std::string(c) == "head") e.fp4_head = true;
+    }
     e.lru = policy == "lru";
     e.excl = ram_exclusive;
+    e.vram_static = vram_static;
     e.skip_disk = skip_disk;
     e.mirrors = mirrors;
     e.cpu_share = cpu_share;
