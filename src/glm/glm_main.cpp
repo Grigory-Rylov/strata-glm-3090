@@ -56,7 +56,7 @@ namespace {
 // identical copies on several drives (--mirror) each blob goes to the drive whose queue drains first at its speed.
 class DiskReader {
 public:
-    static constexpr int kParts = 4, kJobs = 64, kDrives = 4;
+    static constexpr int kParts = 4, kJobs = 80, kDrives = 4;
     ~DiskReader() { close(); }
     /// paths: identical copies of experts.bin; gbps: each one's read rate (GB/s), for the balance
     bool open(const std::vector<std::string>& paths, const std::vector<double>& gbps, int threads) {
@@ -640,6 +640,20 @@ struct Engine {
     size_t ring_pos = 0;                                             // the prompt path's reads so far (ring order)
     uint8_t* pf_dst[kK];
     long long pf_reads = 0, pf_used = 0;
+    // the less confident predictions (ranks pf_read_max..7) on the disk are read into a small pinned pool of their
+    // own, not the RAM tier: a hit is copied from there, a miss costs the read and nothing else (no RAM member evicted)
+    static constexpr int kSpool = 8, kSpoolJob0 = 64;
+    bool pf_stage = false;                                           // --pf-stage: on (measured slower)
+    uint8_t* spool = nullptr;
+    size_t spool_stride = 0;
+    int32_t sp_pair[kSpool] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    cudaEvent_t sp_ev[kSpool] = {};
+    long long sp_reads = 0, sp_used = 0;
+    void init_spool() {
+        spool_stride = ((size_t) XL.bytes + 8192 + 4095) / 4096 * 4096;
+        CK(cudaHostAlloc((void**) &spool, (size_t) kSpool * spool_stride, cudaHostAllocPortable));
+        for (auto& ev : sp_ev) CK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+    }
     // RAM -> VRAM prefetch on its own stream: layer l+1's predicted RAM experts copied into VRAM slots behind layer
     // l's own copies, overlapping layer l's kernel and l+1's attention; layer l+1 waits for them before it copies
     cudaStream_t cs = nullptr;
@@ -833,6 +847,7 @@ struct Engine {
             for (const auto& mp : mirrors) { paths.push_back(mp); gbps.push_back(7.0); }
             reader.open(paths, gbps, 8);
         }
+        if (lru && pf_stage) init_spool();
         if (lru) {
             if (cpu_share > 0) cpux.init(cpu_threads, strata::kernels::cpu::expert_layout().fmt[0]);
             std::vector<int32_t> hot_first;
@@ -1590,10 +1605,12 @@ struct Engine {
             for (const int32_t q : pending_free)   // their copies to VRAM ran before this layer's router
                 if (res[(size_t) q] >= 0 && tier.has_copy(q / kNE, q % kNE)) { tier.promote_done(q / kNE, q % kNE); rlru.remove(q); }
             pending_free.clear();
-            int pfj[kK];   // the prefetch job already reading j's expert, or -1: it lands like a critical read
+            int pfj[kK], spj[kK];   // the prefetch job (RAM tier) / staging slot already holding j's expert, or -1
             for (int j = 0; j < kK; ++j) {
-                pfj[j] = -1;
+                pfj[j] = spj[j] = -1;
                 for (int i = 0; i < kK; ++i) if (pf_pair[i] == pj[j]) pfj[j] = i;
+                if (spool && res[(size_t) pj[j]] < 0 && !tier.has_copy(m, hid[j]))
+                    for (int x = 0; x < kSpool; ++x) if (sp_pair[x] == pj[j]) spj[j] = x;
             }
             for (int j = 0; j < kK; ++j) {   // in VRAM already
                 const int32_t r = res[(size_t) pj[j]];
@@ -1606,7 +1623,7 @@ struct Engine {
             }
             bool skipj[kK] = {};
             for (int j = 0; j < kK; ++j) {   // on the disk: into the RAM slot of the least recent member outside VRAM
-                if (done[j] || tier.has_copy(m, hid[j]) || pfj[j] >= 0) continue;
+                if (done[j] || tier.has_copy(m, hid[j]) || pfj[j] >= 0 || spj[j] >= 0) continue;
                 if (skip_disk > 0 && wts_pin[j] / kRouteScale < skip_disk) { skipj[j] = done[j] = true; ++skipped; continue; }
                 int32_t v = rlru.tail;
                 while (v >= 0 && (res[(size_t) v] >= 0 || in_sel(v))) v = rlru.prev[(size_t) v];
@@ -1622,14 +1639,14 @@ struct Engine {
             int ncpu = 0, cj[kK];
             if (cpu_share > 0 && cpux.ready()) {
                 int nram = 0;
-                for (int j = 0; j < kK; ++j) if (!done[j] && dslot[j] == nullptr && pfj[j] < 0 && tier.has_copy(m, hid[j])) ++nram;
+                for (int j = 0; j < kK; ++j) if (!done[j] && dslot[j] == nullptr && pfj[j] < 0 && spj[j] < 0 && tier.has_copy(m, hid[j])) ++nram;
                 cpu_acc += cpu_share * nram;
                 const int want = (int) cpu_acc;
                 cpu_acc -= want;
                 const uint8_t* cb[kK];
                 float* co[kK];
                 for (int j = kK; j-- > 0 && ncpu < want;) {
-                    if (done[j] || dslot[j] != nullptr || pfj[j] >= 0 || !tier.has_copy(m, hid[j])) continue;
+                    if (done[j] || dslot[j] != nullptr || pfj[j] >= 0 || spj[j] >= 0 || !tier.has_copy(m, hid[j])) continue;
                     cj[ncpu] = j;
                     cb[ncpu] = tier.stable_blob(m, hid[j]);
                     co[ncpu] = cpu_rows + (size_t) j * kEmbd;
@@ -1641,7 +1658,7 @@ struct Engine {
                 if (ncpu > 0) cpux.start(x_host, cb, co, ncpu);
             }
             for (int j = 0; j < kK; ++j) {   // in RAM: copied into a VRAM slot (it was going to the GPU anyway)
-                if (done[j] || dslot[j] != nullptr || pfj[j] >= 0) continue;
+                if (done[j] || dslot[j] != nullptr || pfj[j] >= 0 || spj[j] >= 0) continue;
                 const uint8_t* b = tier.has_copy(m, hid[j]) ? tier.stable_blob(m, hid[j]) : tier.blob(m, hid[j]);
                 if (b == nullptr) { std::fprintf(stderr, "strata-glm: no bytes for expert %d of layer %d\n", hid[j], l); std::exit(1); }
                 const bool in_ram = tier.has_copy(m, hid[j]);
@@ -1657,7 +1674,7 @@ struct Engine {
                 CK(cudaEventSynchronize(ev_pred));
                 const int mn = m + 1;
                 bool waits = false;
-                for (int j = 0; j < kK; ++j) waits |= dslot[j] != nullptr || pfj[j] >= 0;
+                for (int j = 0; j < kK; ++j) waits |= dslot[j] != nullptr || pfj[j] >= 0 || spj[j] >= 0;
                 if (waits) pf_copy();
 
                 for (int i = 0; i < pf_read_max && pf_n < kK; ++i) {
@@ -1681,6 +1698,51 @@ struct Engine {
                     ++pf_n;
                     ++pf_reads;
                 }
+                if (spool) {   // free the slots this layer did not use (a used one: once its copy has run)
+                    for (int x = 0; x < kSpool; ++x) {
+                        if (sp_pair[x] == -1) continue;
+                        if (sp_pair[x] <= -2) {   // copied out at an earlier layer: free once that copy has run
+                            if (cudaEventQuery(sp_ev[x]) == cudaSuccess) sp_pair[x] = -1;
+                            else (void) cudaGetLastError();   // "not ready" is not an error to report later
+                            continue;
+                        }
+                        bool mine = false;
+                        for (int j = 0; j < kK; ++j) mine |= spj[j] == x;
+                        if (mine || !reader.done(kSpoolJob0 + x)) continue;   // this layer lands it below / still reading
+                        sp_pair[x] = -1;
+                    }
+                    for (int i = pf_read_max; i < kK; ++i) {
+                        const int32_t q = mn * kNE + pf_ids[i];
+                        if (res[(size_t) q] >= 0 || tier.has_copy(mn, pf_ids[i])) continue;
+                        bool busy = false;
+                        for (int x = 0; x < kK; ++x) busy |= pf_pair[x] == q;
+                        for (int x = 0; x < kSpool; ++x) busy |= sp_pair[x] == q;
+                        if (busy) continue;
+                        int x = 0;
+                        while (x < kSpool && sp_pair[x] >= 0) ++x;
+                        if (x == kSpool) break;
+                        reader.start(kSpoolJob0 + x, strata::kernels::cpu::expert_layout().blob_offset(mn, pf_ids[i]), XL.bytes,
+                                     spool + (size_t) x * spool_stride, false);
+                        sp_pair[x] = q;
+                        ++sp_reads;
+                    }
+                }
+            }
+            for (int j = 0; j < kK; ++j) {   // this layer's experts staged in the pool
+                if (spj[j] < 0) continue;
+                const int x = spj[j];
+                const auto t = std::chrono::steady_clock::now();
+                if (!reader.wait(kSpoolJob0 + x)) { std::fprintf(stderr, "strata-glm: a staged read failed\n"); std::exit(1); }
+                ts.pf_wait_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+                const int32_t sl = vram_slot(pj[j]);
+                CK(cudaMemcpyAsync(vslot[(size_t) sl], spool + (size_t) x * spool_stride +
+                                   strata::kernels::cpu::expert_layout().blob_offset(m, hid[j]) % 4096, XL.bytes,
+                                   cudaMemcpyHostToDevice, xs));
+                CK(cudaEventRecord(sp_ev[x], xs));
+                sp_pair[x] = -2 - x;   // used: free once the copy has run (next layer)
+                gp[j] = (unsigned long long) vslot[(size_t) sl];
+                ++sp_used;
+                ++ts.file;
             }
             for (int j = 0; j < kK; ++j) {   // this layer's experts a prefetch was already reading
                 if (pfj[j] < 0) continue;
@@ -1859,6 +1921,7 @@ int main(int argc, char** argv) {
     float skip_disk = 0.f;
     std::string teacher_path, step_logits_path;   // decode forced to these tokens; every step's logits written out
     int pf_copies = 2, pf_reads = 4;
+    bool pf_stage_on = false;
     long long rebalance_vram = 32, rebalance_ram = 64;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1882,6 +1945,7 @@ int main(int argc, char** argv) {
         else if (a == "--cpu-share") cpu_share = std::atof(next().c_str());
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--no-prefetch") no_prefetch = true;
+        else if (a == "--pf-stage") pf_stage_on = true;
         else if (a == "--pf-copies") pf_copies = std::atoi(next().c_str());
         else if (a == "--pf-reads") pf_reads = std::atoi(next().c_str());
         else if (a == "--dense-bf16") dense_bf16 = true;
@@ -1925,6 +1989,7 @@ int main(int argc, char** argv) {
     e.cpu_threads = cpu_threads;
     e.prefetch = !no_prefetch;
     e.pf_copy_max = pf_copies;
+    e.pf_stage = pf_stage_on;
     e.pf_read_max = std::min(pf_reads, kK);
     e.load(pack);
     std::vector<Engine::Route> routes;
@@ -2035,6 +2100,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata-glm: prefetch: %lld disk reads for the next layer, %.1f%% of them routed there; "
                              "%lld copies RAM -> VRAM, %.1f%% routed there\n", e.pf_reads, 100.0 * e.pf_used / e.pf_reads,
                      e.pf_copies, 100.0 * e.pf_copies_used / std::max(1LL, e.pf_copies));
+    if (e.sp_reads > 0)
+        std::fprintf(stderr, "strata-glm: staged prefetch: %lld reads, %.1f%% of them routed there\n", e.sp_reads,
+                     100.0 * e.sp_used / e.sp_reads);
     if (e.prefetch && e.pf_copies > 0) {
         std::fprintf(stderr, "strata-glm: prefetch copies routed there, by predicted rank:");
         for (int i = 0; i < kK; ++i)
