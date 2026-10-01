@@ -32,7 +32,7 @@ void ck(const char* what) {
 }
 
 // grid (T, 64 / kHG, nsplit); part (nsplit > 1): per (t, split, head) its unnormalized O [512], max and sum
-__global__ void __launch_bounds__(kThreads) mla_tc_kernel(const float* __restrict__ qa, const float* __restrict__ lat,
+__global__ void __launch_bounds__(kThreads) mla_tc_kernel(const float* __restrict__ qa, const f16* __restrict__ lat,
                                                           const int32_t* __restrict__ sel, const int32_t* __restrict__ cnt,
                                                           int sel_ld, int pos0, float scale, float* __restrict__ ctx,
                                                           float* __restrict__ part, int nsplit) {
@@ -62,13 +62,11 @@ __global__ void __launch_bounds__(kThreads) mla_tc_kernel(const float* __restric
     for (int i = tid; i < kHG * kR; i += kThreads) Qs[(i / kR) * kLd + (i % kR)] = __float2half(q[i] / qsc);
     if (tid < kHG) { mh[tid] = -FLT_MAX; lh[tid] = 0.f; }
     auto load_tile = [&](int kb) {   // keys kb..kb+63 (zero rows past k1)
-        for (int i = tid; i < kKT * (kR / 4); i += kThreads) {
-            const int r = i / (kR / 4), c4 = i % (kR / 4), k = kb + r;
-            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (k < k1) v = ((const float4*) (lat + (size_t) (st ? st[k] : k) * kR))[c4];
-            __half2* d = (__half2*) (Ks + r * kLd + c4 * 4);
-            d[0] = __floats2half2_rn(v.x, v.y);
-            d[1] = __floats2half2_rn(v.z, v.w);
+        for (int i = tid; i < kKT * (kR / 8); i += kThreads) {   // 8 halves at a time, straight from the cache
+            const int r = i / (kR / 8), c8 = i % (kR / 8), k = kb + r;
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (k < k1) v = ((const uint4*) (lat + (size_t) (st ? st[k] : k) * kR))[c8];
+            *(uint4*) (Ks + r * kLd + c8 * 8) = v;
         }
     };
     auto scores = [&]() {   // Ss[h][k] = Q . K^T, warp w: keys 16w..16w+15
@@ -178,7 +176,7 @@ __global__ void mla_merge_kernel(const float* __restrict__ part, float* __restri
 
 size_t mla_tc_part_floats(int T, int nsplit) { return nsplit > 1 ? (size_t) T * nsplit * 64 * (kR + 2) : 0; }
 
-void mla_attend_tc(const float* qa, const float* lat, const int32_t* sel, const int32_t* cnt, int sel_ld, int pos0,
+void mla_attend_tc(const float* qa, const f16* lat, const int32_t* sel, const int32_t* cnt, int sel_ld, int pos0,
                    float scale, float* ctx, int T, int nsplit, float* part, cudaStream_t s) {
     static bool attr = false;
     if (!attr) {

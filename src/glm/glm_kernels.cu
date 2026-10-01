@@ -1,6 +1,8 @@
 // src/glm/glm_kernels.cu - see glm_kernels.cuh.  M1: correct first; FP32 math throughout.
 #include "glm_kernels.cuh"
 
+#include <cuda_fp16.h>
+
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
@@ -99,6 +101,16 @@ __global__ void rmsnorm_kernel(const float* __restrict__ x, const bf16* __restri
     for (int i = threadIdx.x; i < n; i += blockDim.x) ss += xr[i] * xr[i];
     const float inv = rsqrtf(block_sum(ss) / (float) n + eps);
     for (int i = threadIdx.x; i < n; i += blockDim.x) o[i] = xr[i] * inv * (w ? bf(w[i]) : 1.f);
+}
+
+__global__ void rmsnorm_f16_kernel(const float* __restrict__ x, const bf16* __restrict__ w, float eps, __half* __restrict__ out,
+                                   int n) {
+    const float* xr = x + (size_t) blockIdx.x * n;
+    __half* o = out + (size_t) blockIdx.x * n;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += xr[i] * xr[i];
+    const float inv = rsqrtf(block_sum(ss) / (float) n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) o[i] = __float2half_rn(xr[i] * inv * (w ? bf(w[i]) : 1.f));
 }
 
 __global__ void layernorm_kernel(const float* __restrict__ x, const bf16* __restrict__ w, const bf16* __restrict__ b,
@@ -431,6 +443,11 @@ void gemv_f32(const float* W, const float* x, float* y, int rows, int cols, int 
 void rmsnorm(const float* x, const bf16* w, float eps, float* out, int n, int nrows, cudaStream_t s) {
     rmsnorm_kernel<<<nrows, 256, 0, s>>>(x, w, eps, out, n);
     check("rmsnorm");
+}
+
+void rmsnorm_f16(const float* x, const bf16* w, float eps, f16* out, int n, int nrows, cudaStream_t s) {
+    rmsnorm_f16_kernel<<<nrows, 256, 0, s>>>(x, w, eps, (__half*) out, n);
+    check("rmsnorm_f16");
 }
 
 void layernorm(const float* x, const bf16* w, const bf16* b, float eps, float* out, int n, cudaStream_t s) {

@@ -12,6 +12,7 @@
 namespace glm {
 
 using bf16 = uint16_t;   // raw BF16 bits (weights as the checkpoint stores them)
+using f16 = uint16_t;    // raw FP16 bits (the MLA latent cache)
 
 /// y[t][r] = sum_c W[r][c] * x[t][c] for t < nt (nt <= 8); W is BF16 [rows][cols] (cols % 8 == 0), x and y FP32.
 /// `x_ld` / `y_ld`: row strides of x and y (0 = cols / rows).
@@ -42,6 +43,8 @@ void fill(float* p, float v, int n, cudaStream_t s);
 
 /// out = x * rsqrt(mean(x^2) + eps) * w (w BF16, or none) over rows of n; nrows rows.
 void rmsnorm(const float* x, const bf16* w, float eps, float* out, int n, int nrows, cudaStream_t s);
+/// the same into FP16 (the MLA latent cache)
+void rmsnorm_f16(const float* x, const bf16* w, float eps, f16* out, int n, int nrows, cudaStream_t s);
 /// LayerNorm with BF16 weight and bias (the indexer's k_norm).
 void layernorm(const float* x, const bf16* w, const bf16* b, float eps, float* out, int n, cudaStream_t s);
 
@@ -125,8 +128,9 @@ void kda_out_norm_rows(float* o, const bf16* w, const float* gate, float eps, in
 void mla_attend_rows(const float* qa, const float* lat, const int32_t* sel, const int32_t* cnt, int sel_ld, int pos0,
                      int max_sel, float scale, float* ctx, int H, int R, int T, cudaStream_t s);
 /// the pooled keys of pools [p0, p0 + np): pooled[p] from key/gate rows 4p..4p+3
+/// key / gate rows from pool p0 (relative to their window) on; the pools go to pooled rows out_p0.. (out_p0 < 0: p0)
 void idx_pool_rows(const float* key, const float* gate, const bf16* ape, float* pooled, int p0, int np, int kpool, int dim,
-                   cudaStream_t s);
+                   cudaStream_t s, int out_p0 = -1);
 /// scores [T][n_pool] for queries at positions pos0..; a pool is visible when its last token <= the query's position,
 /// invisible ones get -FLT_MAX
 void idx_scores_rows(const float* q, const float* w, const float* pooled, float* score, int n_pool, int H, int dim,
@@ -148,7 +152,7 @@ void scale_entry_wts(float* wts, const int32_t* dst, const int32_t* rb, int n, c
 /// MLA attention on tensor cores (glm_mla.cu), 64 heads x 512: ctx[t][h] over query t's keys (sel / cnt, or every
 /// position <= pos0 + t when sel is null). nsplit > 1 (decode) splits the keys over blocks and needs `part`
 /// (mla_tc_part_floats(T, nsplit) floats).
-void mla_attend_tc(const float* qa, const float* lat, const int32_t* sel, const int32_t* cnt, int sel_ld, int pos0,
+void mla_attend_tc(const float* qa, const f16* lat, const int32_t* sel, const int32_t* cnt, int sel_ld, int pos0,
                    float scale, float* ctx, int T, int nsplit, float* part, cudaStream_t s);
 size_t mla_tc_part_floats(int T, int nsplit);
 /// route_topk for T tokens: logits [T][n], ids / wts [T][k]

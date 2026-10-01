@@ -244,7 +244,8 @@ __global__ void mla_attend_rows_kernel(const float* __restrict__ qa, const float
 }
 
 __global__ void idx_pool_rows_kernel(const float* __restrict__ key, const float* __restrict__ gate,
-                                     const bf16* __restrict__ ape, float* __restrict__ pooled, int p0, int kpool, int dim) {
+                                     const bf16* __restrict__ ape, float* __restrict__ pooled, int p0, int kpool, int dim,
+                                     int out_p0) {
     const int p = p0 + blockIdx.x, d = threadIdx.x;
     if (d >= dim) return;
     const float* kr = key + (size_t) p * kpool * dim;
@@ -257,7 +258,7 @@ __global__ void idx_pool_rows_kernel(const float* __restrict__ key, const float*
         s += e;
         acc += e * kr[(size_t) j * dim + d];
     }
-    pooled[(size_t) p * dim + d] = acc / s;
+    pooled[(size_t) (out_p0 + blockIdx.x) * dim + d] = acc / s;
 }
 
 __global__ void idx_scores_rows_kernel(const float* __restrict__ q, const float* __restrict__ w,
@@ -387,9 +388,9 @@ void mla_attend_rows(const float* qa, const float* lat, const int32_t* sel, cons
 }
 
 void idx_pool_rows(const float* key, const float* gate, const bf16* ape, float* pooled, int p0, int np, int kpool, int dim,
-                   cudaStream_t s) {
+                   cudaStream_t s, int out_p0) {
     if (np <= 0) return;
-    idx_pool_rows_kernel<<<np, dim, 0, s>>>(key, gate, ape, pooled, p0, kpool, dim);
+    idx_pool_rows_kernel<<<np, dim, 0, s>>>(key, gate, ape, pooled, p0, kpool, dim, out_p0 < 0 ? p0 : out_p0);
     check("idx_pool_rows");
 }
 

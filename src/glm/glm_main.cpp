@@ -357,7 +357,8 @@ struct Layer {
     float* router_bias = nullptr;
     // state
     float *S = nullptr, *conv = nullptr;                           // KDA: [H][dh][dh], [3][C][3]
-    float *lat = nullptr, *ikc = nullptr, *igc = nullptr, *pooled = nullptr;   // DSA caches
+    glm::f16* lat = nullptr;                                       // DSA: the MLA latent of every position (FP16)
+    float *ikc = nullptr, *igc = nullptr, *pooled = nullptr;       // the indexer's key / gate window, its pools
 };
 
 struct Engine {
@@ -409,6 +410,25 @@ struct Engine {
     }
     std::vector<glm::bf16> embed;                                   // host, BF16 [vocab][embd]
     int max_ctx = 8192;
+    // the indexer's key / gate rows are needed only until their pool of kKpool completes: a window of ic_win rows
+    // from position ic_base (a pool boundary), its incomplete tail moved to the front before each step
+    int chunk_cap = 1, ic_win = 0;
+    long long ic_base = 0;
+    void ic_prepare(long long pos0, int T) {
+        const long long P = pos0 - pos0 % kKpool;
+        if (P != ic_base) {
+            const long long src = P - ic_base;
+            for (Layer& ly : L) {
+                if (!ly.ikc) continue;
+                for (long long r = 0; r < pos0 - P; ++r) {
+                    CK(cudaMemcpyAsync(ly.ikc + (size_t) r * kIdxD, ly.ikc + (size_t) (src + r) * kIdxD, kIdxD * sizeof(float), cudaMemcpyDeviceToDevice, s));
+                    CK(cudaMemcpyAsync(ly.igc + (size_t) r * kIdxD, ly.igc + (size_t) (src + r) * kIdxD, kIdxD * sizeof(float), cudaMemcpyDeviceToDevice, s));
+                }
+            }
+            ic_base = P;
+        }
+        if (pos0 - ic_base + T > ic_win) { std::fprintf(stderr, "strata-glm: indexer window %d too small\n", ic_win); std::exit(1); }
+    }
     // buffers
     float *streams, *mix, *x, *xn, *post, *comb, *y, *tmp1, *tmp2, *tmp3, *q, *k, *v, *gf, *b, *o, *gate;
     float *q_resid, *qm, *qa, *ctx, *vo, *iq, *ik, *ig, *iw, *score, *logits, *rows, *wts;
@@ -1000,13 +1020,14 @@ struct Engine {
         rmsnorm(c_t1, ly.qa_norm, kEps, c_qr, kQLora, T, s);
         gm.wmat(ly.qb, c_qr, c_qm, kMlaH * kDk, kQLora, T);
         gm.wmat(ly.kva, c_xn, c_t1, kR, kEmbd, T);
-        rmsnorm(c_t1, ly.kva_norm, kEps, ly.lat + (size_t) pos0 * kR, kR, T, s);
+        rmsnorm_f16(c_t1, ly.kva_norm, kEps, ly.lat + (size_t) pos0 * kR, kR, T, s);
         gm.wmat(ly.iwqb, c_qr, c_iq, kIdxH * kIdxD, kQLora, T);
         gm.wmat(ly.iwk, c_xn, c_t1, kIdxD, kEmbd, T);
-        layernorm_rows(c_t1, ly.ik_w, ly.ik_b, 1e-6f, ly.ikc + (size_t) pos0 * kIdxD, kIdxD, T, s);
-        gm.wmat(ly.igate, c_xn, ly.igc + (size_t) pos0 * kIdxD, kIdxD, kEmbd, T);
+        layernorm_rows(c_t1, ly.ik_w, ly.ik_b, 1e-6f, ly.ikc + (size_t) (pos0 - ic_base) * kIdxD, kIdxD, T, s);
+        gm.wmat(ly.igate, c_xn, ly.igc + (size_t) (pos0 - ic_base) * kIdxD, kIdxD, kEmbd, T);
         const int pool_lo = pos0 / kKpool, pool_hi = (pos0 + T) / kKpool;   // the pools this chunk completes
-        idx_pool_rows(ly.ikc, ly.igc, ly.iape, ly.pooled, pool_lo, pool_hi - pool_lo, kKpool, kIdxD, s);
+        idx_pool_rows(ly.ikc, ly.igc, ly.iape, ly.pooled, pool_lo - (int) (ic_base / kKpool), pool_hi - pool_lo, kKpool, kIdxD, s,
+                      pool_lo);
         const int budget = kIdxTopk / kKpool;
         const int32_t* sel = nullptr;
         int max_sel = pos0 + T;
@@ -1021,12 +1042,8 @@ struct Engine {
         }
         const long long ws = (long long) (kDk + kDv) * kR;
         gm.heads16(ly.kvb, ws, false, c_qm, kMlaH * kDk, c_qa, kMlaH * kR, kR, kDk, T, kMlaH);
-        static const bool old_mla = std::getenv("GLM_MLA_OLD") != nullptr;
-        if (old_mla)
-            mla_attend_rows(c_qa, ly.lat, sel, c_cnt, kSelLd, pos0, max_sel, 1.0f / std::sqrt((float) kDk), c_ctx, kMlaH, kR,
-                            T, s);
-        else
-            mla_attend_tc(c_qa, ly.lat, sel, c_cnt, kSelLd, pos0, 1.0f / std::sqrt((float) kDk), c_ctx, T, 1, nullptr, s);
+        (void) max_sel;
+        mla_attend_tc(c_qa, ly.lat, sel, c_cnt, kSelLd, pos0, 1.0f / std::sqrt((float) kDk), c_ctx, T, 1, nullptr, s);
         gm.heads16(ly.kvb + (size_t) kDk * kR, ws, true, c_ctx, kMlaH * kR, c_vo, kMlaH * kDv, kDv, kR, T, kMlaH);
         gm.wmat(ly.wo, c_vo, c_y, kEmbd, kMlaH * kDv, T);
     }
@@ -1271,6 +1288,7 @@ struct Engine {
     void forward_chunk(const int* toks, int T, int pos0, const std::string& dump_dir) {
         using namespace glm;
         heat_tokens += T;
+        ic_prepare(pos0, T);
         for (int t = 0; t < T; ++t)
             CK(cudaMemcpyAsync(c_emb + (size_t) t * kEmbd, embed.data() + (size_t) toks[t] * kEmbd, kEmbd * sizeof(bf16),
                                cudaMemcpyHostToDevice, s));
@@ -1308,6 +1326,7 @@ struct Engine {
     }
 
     void load(const std::string& pack) {
+        ic_win = std::max(chunk_cap, 1) + 2 * kKpool;
         std::string err;
         if (!ck.open(pack, err)) { std::fprintf(stderr, "strata-glm: %s\n", err.c_str()); std::exit(1); }
         const auto t0 = std::chrono::steady_clock::now();
@@ -1337,9 +1356,9 @@ struct Engine {
                 y.iwqb = mat(ip + "wq_b.weight"); y.iwk = mat(ip + "wk.weight"); y.ik_w = ck.bf(ip + "k_norm.weight");
                 y.ik_b = ck.bf(ip + "k_norm.bias"); y.iwp = mat(ip + "weights_proj.weight");
                 y.igate = mat(ip + "index_kpool_compress_gate"); y.iape = ck.bf(ip + "index_kpool_compress_ape");
-                CK(cudaMalloc(&y.lat, (size_t) max_ctx * kR * sizeof(float)));
-                CK(cudaMalloc(&y.ikc, (size_t) max_ctx * kIdxD * sizeof(float)));
-                CK(cudaMalloc(&y.igc, (size_t) max_ctx * kIdxD * sizeof(float)));
+                CK(cudaMalloc(&y.lat, (size_t) max_ctx * kR * sizeof(glm::f16)));
+                CK(cudaMalloc(&y.ikc, (size_t) ic_win * kIdxD * sizeof(float)));
+                CK(cudaMalloc(&y.igc, (size_t) ic_win * kIdxD * sizeof(float)));
                 CK(cudaMalloc(&y.pooled, (size_t) (max_ctx / kKpool + 1) * kIdxD * sizeof(float)));
             }
             const std::string m = p + "mlp.";
@@ -1442,15 +1461,16 @@ struct Engine {
         rmsnorm(tmp1, ly.qa_norm, kEps, q_resid, kQLora, 1, s);
         gemv(ly.qb, q_resid, qm, kMlaH * kDk, kQLora, 1, s);
         gemv(ly.kva, xn, tmp1, kR, kEmbd, 1, s);
-        rmsnorm(tmp1, ly.kva_norm, kEps, ly.lat + (size_t) pos * kR, kR, 1, s);
+        rmsnorm_f16(tmp1, ly.kva_norm, kEps, ly.lat + (size_t) pos * kR, kR, 1, s);
         // the indexer's caches and, when a pool completes, its pooled key
         gemv(ly.iwqb, q_resid, iq, kIdxH * kIdxD, kQLora, 1, s);
         gemv(ly.iwk, xn, tmp1, kIdxD, kEmbd, 1, s);
-        layernorm(tmp1, ly.ik_w, ly.ik_b, 1e-6f, ly.ikc + (size_t) pos * kIdxD, kIdxD, s);
-        gemv(ly.igate, xn, ly.igc + (size_t) pos * kIdxD, kIdxD, kEmbd, 1, s);
+        layernorm(tmp1, ly.ik_w, ly.ik_b, 1e-6f, ly.ikc + (size_t) (pos - ic_base) * kIdxD, kIdxD, s);
+        gemv(ly.igate, xn, ly.igc + (size_t) (pos - ic_base) * kIdxD, kIdxD, kEmbd, 1, s);
         if (pos % kKpool == kKpool - 1) {
             const int p0 = pos - (kKpool - 1);
-            idx_pool(ly.ikc + (size_t) p0 * kIdxD, ly.igc + (size_t) p0 * kIdxD, ly.iape, ly.pooled + (size_t) (pos / kKpool) * kIdxD,
+            idx_pool(ly.ikc + (size_t) (p0 - ic_base) * kIdxD, ly.igc + (size_t) (p0 - ic_base) * kIdxD, ly.iape,
+                     ly.pooled + (size_t) (pos / kKpool) * kIdxD,
                      kKpool, kIdxD, s);
         }
         // the selection (on the GPU): every visible token up to the budget of pools, then the top-scoring pools and
@@ -1464,10 +1484,7 @@ struct Engine {
             use = sel;
         }
         mla_absorb_q(qm, ly.kvb, qa, kMlaH, kDk, kDv, kR, s);
-        static const bool old_mla = std::getenv("GLM_MLA_OLD") != nullptr;
-        if (old_mla) {
-            mla_attend_rows(qa, ly.lat, use, sel_cnt, kSelLd, pos, kSelLd, 1.0f / std::sqrt((float) kDk), ctx, kMlaH, kR, 1, s);
-        } else {   // the keys split over blocks: 64 keys a split at least, 16 splits at most
+        {   // the keys split over blocks: 64 keys a split at least, 16 splits at most
             const int nk = std::min(pos + 1, kSelLd);
             const int nsplit = std::max(1, std::min(kMlaSplit, (nk + 127) / 128));
             mla_attend_tc(qa, ly.lat, use, sel_cnt, kSelLd, pos, 1.0f / std::sqrt((float) kDk), ctx, 1, nsplit, mla_part, s);
@@ -1781,6 +1798,7 @@ struct Engine {
     void forward(int token, int pos, const std::string& dump_dir) {
         using namespace glm;
         ++heat_tokens;
+        ic_prepare(pos, 1);
         CK(cudaMemcpyAsync(emb_row, embed.data() + (size_t) token * kEmbd, kEmbd * sizeof(bf16), cudaMemcpyHostToDevice, s));
         bf16_to_f32(emb_row, x, kEmbd, s);
         for (int j = 0; j < kHc; ++j) CK(cudaMemcpyAsync(streams + (size_t) j * kEmbd, x, kEmbd * sizeof(float), cudaMemcpyDeviceToDevice, s));
@@ -1888,6 +1906,7 @@ int main(int argc, char** argv) {
     Engine e;
     e.max_ctx = max_ctx;
     e.dense_fp8 = !dense_bf16;
+    e.chunk_cap = chunk;
     e.lru = policy == "lru";
     e.excl = ram_exclusive;
     e.skip_disk = skip_disk;
