@@ -43,6 +43,7 @@
 #include <deque>
 #include <fstream>
 #include <map>
+#include <queue>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -603,6 +604,78 @@ struct Engine {
         while ((int) vfree.size() < kVPool) evict_one(nullptr);
         CK(cudaStreamSynchronize(wb));
     }
+    // RAM tier eviction (default; --ram-lru: least recent): the RAM-only member with the lowest estimate of use - its
+    // uses this decode (weighted 2^(t/512), so recent ones count more) plus its prompt frequency and the boot
+    // profile's prior. Reuse barely depends on recency here (an offline replay: ARC, 2Q, LIRS ~ LRU), but ranking the
+    // rarely used by their prior cut the disk misses 7-10% (tools: Strata-data/glm/policy).
+    bool ram_freq = true;
+    std::vector<double> pn, pbase;
+    std::vector<uint32_t> plast, pver;
+    struct PE { double k; uint32_t last, ver; int32_t p; };
+    struct PGt { bool operator()(const PE& a, const PE& b) const { return a.k != b.k ? a.k > b.k : a.last > b.last; } };
+    std::priority_queue<PE, std::vector<PE>, PGt> pheap;
+    double pt0 = 0, dec_tok = 0;
+    uint32_t pclk = 0;
+    void pol_cand(int32_t p) { pheap.push({pn[(size_t) p] + pbase[(size_t) p], plast[(size_t) p], ++pver[(size_t) p], p}); }
+    void pol_rebuild() {
+        pheap = {};
+        for (int32_t p = 0; p < (int32_t) pn.size(); ++p)
+            if (res[(size_t) p] < 0 && tier.has_copy(p / kNE, p % kNE)) pol_cand(p);
+    }
+    void pol_reset(double prompt_tokens) {   // after the prompt's rebalance, from its routing counts (heat)
+        const size_t np = (size_t) kMoe * kNE;
+        pn.assign(np, 0.0);
+        pbase.resize(np);
+        plast.assign(np, 0);
+        pver.assign(np, 0);
+        pt0 = dec_tok;
+        for (size_t q = 0; q < np; ++q) {
+            const double r = std::min<double>(prior[q], (double) np);
+            pbase[q] = 8.0 * heat[q] / std::max(1.0, prompt_tokens) + 64.0 * 2.0 * 8.0 / 288.0 * (1.0 - r / (double) np) + 0.01;
+        }
+        pol_rebuild();
+    }
+    void pol_use(int32_t p) {
+        if (pn.empty()) return;
+        pn[(size_t) p] += std::exp2((dec_tok - pt0) / 512.0);
+        plast[(size_t) p] = ++pclk;
+        if ((dec_tok - pt0) / 512.0 > 60) {   // rescale before the weights overflow
+            const double f = std::exp2(-(dec_tok - pt0) / 512.0);
+            for (size_t q = 0; q < pn.size(); ++q) { pn[q] *= f; pbase[q] *= f; }
+            pt0 = dec_tok;
+            pol_rebuild();
+        }
+    }
+    int32_t pol_victim(const int32_t* pj) {
+        PE held[kK];
+        int nh = 0;
+        int32_t v = -1;
+        while (!pheap.empty()) {
+            const PE e = pheap.top();
+            pheap.pop();
+            if (e.ver != pver[(size_t) e.p] || res[(size_t) e.p] >= 0 || !tier.has_copy(e.p / kNE, e.p % kNE)) continue;
+            bool sel = false;
+            for (int j = 0; j < kK; ++j) sel |= pj[j] == e.p;
+            if (sel) { if (nh < kK) held[nh++] = e; continue; }
+            ++pver[(size_t) e.p];
+            v = e.p;
+            break;
+        }
+        while (nh > 0) pheap.push(held[--nh]);
+        if (pheap.size() > (size_t) 4 * kMoe * kNE) pol_rebuild();
+        return v;
+    }
+    int32_t ram_pick(const int32_t* pj) {   // the RAM member a disk read replaces (outside VRAM and this selection)
+        if (ram_freq && !pn.empty()) return pol_victim(pj);
+        int32_t v = rlru.tail;
+        while (v >= 0) {
+            bool sel = false;
+            for (int j = 0; j < kK; ++j) sel |= pj[j] == v;
+            if (res[(size_t) v] < 0 && !sel) break;
+            v = rlru.prev[(size_t) v];
+        }
+        return v;
+    }
     int32_t ram_victim(const int32_t* pj) {   // the least recent RAM member outside VRAM and this layer's selection
         int32_t v = rlru.tail;
         while (v >= 0) {
@@ -688,6 +761,7 @@ struct Engine {
         if (wait_s) *wait_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
         tier.demote_commit(q / kNE, q % kNE, (size_t) (strata::kernels::cpu::expert_layout().blob_offset(q / kNE, q % kNE) % 4096));
         rlru.touch(q);
+        if (!pn.empty()) pol_cand(q);
         pf_pair[i] = -1;
         --pf_n;
     }
@@ -935,6 +1009,7 @@ struct Engine {
             if (((lru && !excl) || res[(size_t) p] < 0) && !tier.has_copy(p / kNE, p % kNE)) want.emplace_back(p / kNE, p % kNE);
         }
         const int64_t admitted = want.empty() ? 0 : tier.admit_from_file(want, 16, err);
+        if (lru && ram_freq && !excl) pol_reset((double) heat_tokens);   // heat: the prompt's counts, before the decay
         const float f = (float) std::pow(0.5, (double) heat_tokens / kHalfLife);
         for (float& h : heat) h *= f;
         heat_tokens = 0;
@@ -1570,7 +1645,10 @@ struct Engine {
                         ++writebacks;
                     }
                 }
-                if (vv >= 0) res[(size_t) vv] = -1;
+                if (vv >= 0) {
+                    res[(size_t) vv] = -1;
+                    if (!pn.empty() && tier.has_copy(vv / kNE, vv % kNE)) pol_cand(vv);   // only in RAM now
+                }
                 slot_pair[(size_t) sl] = p;
                 res[(size_t) p] = sl;
                 vlru.touch(sl);
@@ -1621,6 +1699,7 @@ struct Engine {
                 gp[j] = (unsigned long long) vslot[(size_t) r];
                 vlru.touch(r);
                 if (rlru.in[(size_t) pj[j]]) rlru.touch(pj[j]);
+                pol_use(pj[j]);
                 done[j] = true;
                 ++ts.vram;
             }
@@ -1628,8 +1707,7 @@ struct Engine {
             for (int j = 0; j < kK; ++j) {   // on the disk: into the RAM slot of the least recent member outside VRAM
                 if (done[j] || tier.has_copy(m, hid[j]) || pfj[j] >= 0 || spj[j] >= 0) continue;
                 if (skip_disk > 0 && wts_pin[j] / kRouteScale < skip_disk) { skipj[j] = done[j] = true; ++skipped; continue; }
-                int32_t v = rlru.tail;
-                while (v >= 0 && (res[(size_t) v] >= 0 || in_sel(v))) v = rlru.prev[(size_t) v];
+                const int32_t v = ram_pick(pj);
                 if (v < 0) continue;   // nothing to evict: staged below through the tier's own read
                 tier.promote_done(v / kNE, v % kNE);   // its slot becomes the spare demote_begin takes
                 rlru.remove(v);
@@ -1655,6 +1733,8 @@ struct Engine {
                     co[ncpu] = cpu_rows + (size_t) j * kEmbd;
                     done[j] = true;
                     rlru.touch(pj[j]);
+                    pol_use(pj[j]);
+                    if (!pn.empty()) pol_cand(pj[j]);   // it stays only in RAM
                     ++ts.cpu;
                     ++ncpu;
                 }
@@ -1670,6 +1750,7 @@ struct Engine {
                 if (!in_ram) CK(cudaStreamSynchronize(xs));   // a mapped-file page, not ours to keep
                 gp[j] = (unsigned long long) vslot[(size_t) sl];
                 if (in_ram) { rlru.touch(pj[j]); ++ts.ram; if (excl) pending_free.push_back(pj[j]); } else ++ts.file;
+                pol_use(pj[j]);
             }
             prefetch_commit_landed(pj);
             // the next layer's predicted experts on the disk (low priority), after this layer's work is queued
@@ -1686,8 +1767,7 @@ struct Engine {
                     bool busy = false;
                     for (int x = 0; x < kK; ++x) busy |= pf_pair[x] == q;
                     if (busy) continue;
-                    int32_t v = rlru.tail;
-                    while (v >= 0 && (res[(size_t) v] >= 0 || in_sel(v))) v = rlru.prev[(size_t) v];
+                    const int32_t v = ram_pick(pj);
                     if (v < 0) break;
                     tier.promote_done(v / kNE, v % kNE);
                     rlru.remove(v);
@@ -1745,12 +1825,14 @@ struct Engine {
                 sp_pair[x] = -2 - x;   // used: free once the copy has run (next layer)
                 gp[j] = (unsigned long long) vslot[(size_t) sl];
                 ++sp_used;
+                pol_use(pj[j]);
                 ++ts.file;
             }
             for (int j = 0; j < kK; ++j) {   // this layer's experts a prefetch was already reading
                 if (pfj[j] < 0) continue;
                 ++pf_used;
                 prefetch_land(pfj[j], &ts.pf_wait_s);
+                pol_use(pj[j]);
                 const int32_t sl = vram_slot(pj[j]);
                 CK(cudaMemcpyAsync(vslot[(size_t) sl], tier.stable_blob(m, hid[j]), XL.bytes, cudaMemcpyHostToDevice, xs));
                 gp[j] = (unsigned long long) vslot[(size_t) sl];
@@ -1766,6 +1848,7 @@ struct Engine {
                 const size_t pad = (size_t) (strata::kernels::cpu::expert_layout().blob_offset(m, hid[j]) % 4096);
                 tier.demote_commit(m, hid[j], pad);
                 rlru.touch(pj[j]);
+                pol_use(pj[j]);
                 const int32_t sl = vram_slot(pj[j]);
                 CK(cudaMemcpyAsync(vslot[(size_t) sl], dslot[j] + pad, XL.bytes, cudaMemcpyHostToDevice, xs));
                 gp[j] = (unsigned long long) vslot[(size_t) sl];
@@ -1873,6 +1956,7 @@ struct Engine {
     void forward(int token, int pos, const std::string& dump_dir) {
         using namespace glm;
         ++heat_tokens;
+        ++dec_tok;
         ic_prepare(pos, 1);
         CK(cudaMemcpyAsync(emb_row, embed.data() + (size_t) token * kEmbd, kEmbd * sizeof(bf16), cudaMemcpyHostToDevice, s));
         bf16_to_f32(emb_row, x, kEmbd, s);
@@ -1924,7 +2008,7 @@ int main(int argc, char** argv) {
     float skip_disk = 0.f;
     std::string teacher_path, step_logits_path;   // decode forced to these tokens; every step's logits written out
     int pf_copies = 2, pf_reads = 4;
-    bool pf_stage_on = false;
+    bool pf_stage_on = false, ram_lru = false;
     long long rebalance_vram = 32, rebalance_ram = 64;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1949,6 +2033,7 @@ int main(int argc, char** argv) {
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--no-prefetch") no_prefetch = true;
         else if (a == "--pf-stage") pf_stage_on = true;
+        else if (a == "--ram-lru") ram_lru = true;
         else if (a == "--pf-copies") pf_copies = std::atoi(next().c_str());
         else if (a == "--pf-reads") pf_reads = std::atoi(next().c_str());
         else if (a == "--dense-bf16") dense_bf16 = true;
@@ -1993,6 +2078,7 @@ int main(int argc, char** argv) {
     e.prefetch = !no_prefetch;
     e.pf_copy_max = pf_copies;
     e.pf_stage = pf_stage_on;
+    e.ram_freq = !ram_lru;
     e.pf_read_max = std::min(pf_reads, kK);
     e.load(pack);
     std::vector<Engine::Route> routes;
