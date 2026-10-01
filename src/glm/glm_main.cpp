@@ -2223,13 +2223,15 @@ int main(int argc, char** argv) {
     double cpu_share = 0;
     int cpu_threads = 14;
     bool no_prefetch = false, dense_bf16 = false, prompt_f32 = false, ram_exclusive = false;
-    double vram_static = 0;
+    double vram_static = 0.7;   // --vram-static 0: VRAM all LRU (inclusive)
     float skip_disk = 0.f;
     std::string teacher_path, step_logits_path;   // decode forced to these tokens; every step's logits written out
     int pf_copies = 2, pf_reads = 4;
-    bool pf_stage_on = false, ram_lru = false, latent_i8 = false;
-    std::string dense_fp4;
-    bool dense_i8 = false;
+    // defaults that trade a little accuracy for VRAM (KL to BF16 dense over 129 teacher-forced steps: FP8 0.023 ->
+    // this mix ~0.02-0.03; --dense-fp4 none --dense-fp8 --latent-f16 restore the FP8 / FP16 formats)
+    bool pf_stage_on = false, ram_lru = false, latent_i8 = true;
+    std::string dense_fp4 = "kdaqk,mla,shared,head";   // KDA's v/o stay 8-bit: NVFP4 there doubled the median KL
+    bool dense_i8 = true;
     long long rebalance_vram = 32, rebalance_ram = 64;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -2256,8 +2258,10 @@ int main(int argc, char** argv) {
         else if (a == "--pf-stage") pf_stage_on = true;
         else if (a == "--ram-lru") ram_lru = true;
         else if (a == "--latent-i8") latent_i8 = true;
+        else if (a == "--latent-f16") latent_i8 = false;
         else if (a == "--dense-fp4" && i + 1 < argc) dense_fp4 = argv[++i];
         else if (a == "--dense-i8") dense_i8 = true;
+        else if (a == "--dense-fp8") dense_i8 = false;
         else if (a == "--pf-copies") pf_copies = std::atoi(next().c_str());
         else if (a == "--pf-reads") pf_reads = std::atoi(next().c_str());
         else if (a == "--dense-bf16") dense_bf16 = true;
@@ -2274,7 +2278,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: strata-glm --pack DIR --tokens FILE [--max-new N] [--max-context C] [--chunk T]\n"
                              "                  [--profile P [--vram-experts N] [--ram-gib G] [--ram-reserve-gib R] [--vram-reserve-mib M]\n"
                              "                   [--policy lru|rebalance] [--rebalance-every N] [--rebalance-moves M]]\n"
-                             "                  [--dump-dir D] [--dump-logits F] [--routes F]\n");
+                             "                  [--dump-dir D] [--dump-logits F] [--routes F]\n"
+                             "                  [--dense-fp4 GROUPS|none] [--dense-fp8] [--latent-f16] [--vram-static F]\n");
         return 2;
     }
     std::vector<int> prompt;
