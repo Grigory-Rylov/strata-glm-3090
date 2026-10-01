@@ -600,6 +600,9 @@ struct Engine {
     int32_t* ge_host = nullptr;                                      // pinned, per MoE layer: their rows, then the count
     int32_t* d_ent = nullptr;                                        // device: kK rows + the count
     cudaEvent_t ev_ids = nullptr;
+    // decode's copies into VRAM slots run on xs, not behind the shared expert and the prediction on s
+    cudaStream_t xs = nullptr;
+    cudaEvent_t ev_xs = nullptr;
     // GLM_PREDICT=1 (measurement): layer l+1's experts predicted by its own hc_pre, norm and router applied to the
     // streams (A) as layer l's router sees them, (B) after layer l; scored against what layer l+1 then routes
     bool predict = false;
@@ -749,6 +752,8 @@ struct Engine {
             std::fprintf(stderr, "strata-glm: %s\n", err.c_str());
             std::exit(1);
         }
+        CK(cudaStreamCreateWithFlags(&xs, cudaStreamNonBlocking));
+        CK(cudaEventCreateWithFlags(&ev_xs, cudaEventDisableTiming));
         CK(cudaMalloc(&stage, (size_t) kStage * XL.bytes + (1 << 20)));   // + MMQ's read past the last expert
         CK(cudaMemset(stage, 0, (size_t) kStage * XL.bytes + (1 << 20)));
         CK(cudaMallocHost(&x_host, kEmbd * sizeof(float)));
@@ -1498,7 +1503,7 @@ struct Engine {
                     if (vfree.empty()) evict_one(pj);
                     const auto [f, ev] = vfree.front();
                     vfree.pop_front();
-                    if (ev >= 0) CK(cudaStreamWaitEvent(s, wb_ev[ev], 0));   // its previous expert is written back
+                    if (ev >= 0) CK(cudaStreamWaitEvent(xs, wb_ev[ev], 0));   // its previous expert is written back
                     slot_pair[(size_t) f] = p;
                     res[(size_t) p] = f;
                     vlru.touch(f);
@@ -1594,8 +1599,8 @@ struct Engine {
                 if (b == nullptr) { std::fprintf(stderr, "strata-glm: no bytes for expert %d of layer %d\n", hid[j], l); std::exit(1); }
                 const bool in_ram = tier.has_copy(m, hid[j]);
                 const int32_t sl = vram_slot(pj[j]);
-                CK(cudaMemcpyAsync(vslot[(size_t) sl], b, XL.bytes, cudaMemcpyHostToDevice, s));
-                if (!in_ram) CK(cudaStreamSynchronize(s));   // a mapped-file page, not ours to keep
+                CK(cudaMemcpyAsync(vslot[(size_t) sl], b, XL.bytes, cudaMemcpyHostToDevice, xs));
+                if (!in_ram) CK(cudaStreamSynchronize(xs));   // a mapped-file page, not ours to keep
                 gp[j] = (unsigned long long) vslot[(size_t) sl];
                 if (in_ram) { rlru.touch(pj[j]); ++ts.ram; if (excl) pending_free.push_back(pj[j]); } else ++ts.file;
             }
@@ -1631,7 +1636,7 @@ struct Engine {
                 ++pf_used;
                 prefetch_land(pfj[j], &ts.pf_wait_s);
                 const int32_t sl = vram_slot(pj[j]);
-                CK(cudaMemcpyAsync(vslot[(size_t) sl], tier.stable_blob(m, hid[j]), XL.bytes, cudaMemcpyHostToDevice, s));
+                CK(cudaMemcpyAsync(vslot[(size_t) sl], tier.stable_blob(m, hid[j]), XL.bytes, cudaMemcpyHostToDevice, xs));
                 gp[j] = (unsigned long long) vslot[(size_t) sl];
                 ++ts.file;
                 if (excl) pending_free.push_back(pj[j]);
@@ -1646,7 +1651,7 @@ struct Engine {
                 tier.demote_commit(m, hid[j], pad);
                 rlru.touch(pj[j]);
                 const int32_t sl = vram_slot(pj[j]);
-                CK(cudaMemcpyAsync(vslot[(size_t) sl], dslot[j] + pad, XL.bytes, cudaMemcpyHostToDevice, s));
+                CK(cudaMemcpyAsync(vslot[(size_t) sl], dslot[j] + pad, XL.bytes, cudaMemcpyHostToDevice, xs));
                 gp[j] = (unsigned long long) vslot[(size_t) sl];
                 ++ts.file;
                 if (excl) pending_free.push_back(pj[j]);
@@ -1680,6 +1685,8 @@ struct Engine {
                 ++ng;
             }
             ge[kK] = ng;
+            CK(cudaEventRecord(ev_xs, xs));   // the expert kernel waits for this layer's copies, nothing else does
+            CK(cudaStreamWaitEvent(s, ev_xs, 0));
             CK(cudaMemcpyAsync(grp_ptr, gq, kK * sizeof(unsigned long long), cudaMemcpyHostToDevice, s));
             CK(cudaMemcpyAsync(d_ent, ge, (kK + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, s));
             if (timing) CK(cudaEventRecord(tev[(size_t) m * 3 + 1], s));
