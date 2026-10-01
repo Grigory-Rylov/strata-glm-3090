@@ -15,7 +15,7 @@ There is no server / chat integration — the engine takes token ids and prints 
 | | prefill | decode |
 | --- | ---: | ---: |
 | llama.cpp, UD-IQ4_XS GGUF, both SSDs (the starting point) | 29 tok/s | 2.4–2.9 tok/s |
-| strata-glm, chat prompt (~1–1.4K tokens), 192 decode steps | — | **18.0** (Ukrainian chat) / **14.8** (code) |
+| strata-glm, chat prompt (~1–1.4K tokens), 192 decode steps | — | **18.0** (Cyrillic chat) / **14.8** (code) |
 | strata-glm, same, exact mode (`--skip-disk 0`) | — | 16.5 / 12.9 |
 | strata-glm, 64K-token prompt at `--max-context 262144` | **~1000 tok/s** | 15.3 (exact mode) |
 | strata-glm, opt-in `--skip-disk 0.15 --skip-ram 0.05` | — | 20.3 / 16.4 |
