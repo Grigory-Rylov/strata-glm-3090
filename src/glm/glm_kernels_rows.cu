@@ -340,10 +340,26 @@ void hc_post_rows(const float* y, const float* streams_in, const float* post, co
     check("hc_post_rows");
 }
 
+static float* g_conv_tmp = nullptr;
+static size_t g_conv_cap = 0;
+
+void conv_silu_reserve(size_t n) {   // the scratch up front, before the expert tier sizes itself to the free VRAM
+    if (n <= g_conv_cap) return;
+    if (g_conv_tmp) cudaFree(g_conv_tmp);
+    if (cudaMalloc(&g_conv_tmp, n * sizeof(float)) != cudaSuccess) { std::fprintf(stderr, "conv_silu_reserve: no memory\n"); std::exit(1); }
+    g_conv_cap = n;
+}
+
+void conv_silu_release() {
+    if (g_conv_tmp) cudaFree(g_conv_tmp);
+    g_conv_tmp = nullptr;
+    g_conv_cap = 0;
+}
+
 void conv_silu_seq(const float* x, const float* w, float* state, float* out, int C, int T, cudaStream_t s) {
     // out may alias x: the outputs go to a scratch first, then the state (from x) is updated, then copied back
-    static float* tmp = nullptr;
-    static size_t cap = 0;
+    float*& tmp = g_conv_tmp;
+    size_t& cap = g_conv_cap;
     const size_t n = (size_t) C * T;
     if (n > cap) {
         if (tmp) cudaFree(tmp);

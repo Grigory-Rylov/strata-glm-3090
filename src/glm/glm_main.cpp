@@ -793,7 +793,7 @@ struct Engine {
         // VRAM: the profile's head, as many slots as the free memory holds after the reserve
         size_t fr = 0, tot = 0;
         CK(cudaMemGetInfo(&fr, &tot));
-        const size_t keep = (size_t) (vram_reserve_mib * 1048576.0);
+        const size_t keep = (size_t) ((vram_reserve_mib + (chunk > 0 ? 512 : 0)) * 1048576.0);
         long long nv = vram_experts >= 0 ? vram_experts : (long long) (fr > keep ? (fr - keep) / XL.bytes : 0);
         nv = std::min<long long>(nv, (long long) profile.size());
         constexpr int kBlock = 32;   // slots per allocation: WDDM places smaller blocks more readily
@@ -944,6 +944,7 @@ struct Engine {
                         (void*) b_ptr[0], (void*) b_ptr[1], (void*) m_tails[0], (void*) m_tails[1]})
             if (q) cudaFree(q);
         gm.release();
+        glm::conv_silu_release();
         if (lru && stage) { cudaFree(stage); stage = nullptr; }
         chunk = 0;
     }
@@ -990,6 +991,8 @@ struct Engine {
             CK(cudaMallocHost(&layer_host, (size_t) kNE * XL.bytes));
         }
         CK(cudaMalloc(&c_xscratch, strata::kernels::native_expert_scratch_bytes((int64_t) T * kK, kFF)));
+        glm::conv_silu_reserve((size_t) T * kKdaC);
+        gm.reserve_w((size_t) kEmbd * kMlaH * kDv);   // the largest FP8 matrix the prompt multiplies (MLA's o_proj)
         size_t fr = 0, tot = 0;
         cudaMemGetInfo(&fr, &tot);
         std::fprintf(stderr, "strata-glm: prompt path up to %d tokens a chunk; %.1f GiB of VRAM free\n", T, fr / 1073741824.0);

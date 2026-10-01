@@ -155,6 +155,9 @@ void scale_entry_wts(float* wts, const int32_t* dst, const int32_t* rb, int n, c
 void mla_attend_tc(const float* qa, const f16* lat, const int32_t* sel, const int32_t* cnt, int sel_ld, int pos0,
                    float scale, float* ctx, int T, int nsplit, float* part, cudaStream_t s);
 size_t mla_tc_part_floats(int T, int nsplit);
+/// conv_silu_seq's scratch (C x T floats) up front / back
+void conv_silu_reserve(size_t n);
+void conv_silu_release();
 /// route_topk for T tokens: logits [T][n], ids / wts [T][k]
 void route_rows(const float* logits, const float* bias, int n_expert, int k, float scaling, int32_t* ids, float* wts,
                 int T, cudaStream_t s);

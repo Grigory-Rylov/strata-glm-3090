@@ -27,6 +27,12 @@ public:
     void heads16(const bf16* W, long long w_stride, bool transW, const float* X, int ldx, float* Y, int ldy, int Nd,
                     int Kd, int T, int H);
     cublasHandle_t handle() const { return h_; }
+    void reserve_w(size_t n) {   // the FP8 -> BF16 scratch for the largest matrix, up front
+        if (n <= wcap_) return;
+        if (wbuf_) cudaFree(wbuf_);
+        if (cudaMalloc(&wbuf_, n * sizeof(bf16)) != cudaSuccess) { wbuf_ = nullptr; wcap_ = 0; return; }
+        wcap_ = n;
+    }
     void release() {   // the activation splits and the FP8 scratch (the prompt is done)
         if (hi_) cudaFree(hi_);
         if (lo_) cudaFree(lo_);
