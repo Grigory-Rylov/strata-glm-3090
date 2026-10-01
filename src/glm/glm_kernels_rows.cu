@@ -151,54 +151,63 @@ __global__ void kda_prep_rows_kernel(float* __restrict__ q, float* __restrict__ 
 
 // one block per head, S (dh x dh) in shared memory, the tokens in order
 // The value columns of S are independent (delta_c = beta (v_c - sum_i S[i][c] k_i) touches column c only; the
-// decay scales rows), so a head's 128 columns split over 4 warps, each thread holding its column in registers.
+// decay scales rows), so a head spreads over 8 warps of 16 columns, two lanes a column (lane and lane + 16, 64 rows
+// each, their sums joined by one shuffle) - 64 floats of state a thread stay in registers (128 went to the stack).
+// The scan is a chain over tokens, so the next token's inputs are loaded while this one computes.
 template <int DH>
 __global__ void __launch_bounds__(32) kda_scan_kernel(float* __restrict__ S, const float* __restrict__ q,
                                                       const float* __restrict__ k, const float* __restrict__ v,
                                                       const float* __restrict__ g, const float* __restrict__ beta,
                                                       float* __restrict__ o, int H, int T) {
-    __shared__ float qs[DH], ks[DH], eg[DH];
-    const int h = blockIdx.x, lane = threadIdx.x, c = blockIdx.y * 32 + lane;
+    constexpr int R = DH / 2;
+    static_assert(DH == 128, "a 128-wide head");
+    __shared__ float qs[2][DH], ks[2][DH], eg[2][DH];
+    const int h = blockIdx.x, lane = threadIdx.x, c = blockIdx.y * 16 + (lane & 15), r0 = (lane >> 4) * R;
     float* Sg = S + (size_t) h * DH * DH;
-    float st[DH];
+    float st[R];
 #pragma unroll
-    for (int i = 0; i < DH; ++i) st[i] = Sg[(size_t) i * DH + c];
+    for (int i = 0; i < R; ++i) st[i] = Sg[(size_t) (r0 + i) * DH + c];
+    float rq0 = 0.f, rq1 = 0.f, rq2 = 0.f, rq3 = 0.f, rk0 = 0.f, rk1 = 0.f, rk2 = 0.f, rk3 = 0.f;
+    float rg0 = 0.f, rg1 = 0.f, rg2 = 0.f, rg3 = 0.f, rv = 0.f, rb = 0.f;
+#define KDA_FETCH(tt)                                                                                        do {                                                                                                         const size_t base_ = ((size_t) (tt) * H + h) * DH + lane;                                                rq0 = q[base_]; rq1 = q[base_ + 32]; rq2 = q[base_ + 64]; rq3 = q[base_ + 96];                           rk0 = k[base_]; rk1 = k[base_ + 32]; rk2 = k[base_ + 64]; rk3 = k[base_ + 96];                           rg0 = g[base_]; rg1 = g[base_ + 32]; rg2 = g[base_ + 64]; rg3 = g[base_ + 96];                           rv = v[((size_t) (tt) * H + h) * DH + c];                                                                rb = beta[(size_t) (tt) * H + h];                                                                    } while (0)
+    if (T > 0) KDA_FETCH(0);
     for (int t = 0; t < T; ++t) {
-        const size_t base = ((size_t) t * H + h) * DH;
+        const int b = t & 1;
+        qs[b][lane] = rq0; qs[b][lane + 32] = rq1; qs[b][lane + 64] = rq2; qs[b][lane + 96] = rq3;
+        ks[b][lane] = rk0; ks[b][lane + 32] = rk1; ks[b][lane + 64] = rk2; ks[b][lane + 96] = rk3;
+        eg[b][lane] = expf(rg0); eg[b][lane + 32] = expf(rg1); eg[b][lane + 64] = expf(rg2); eg[b][lane + 96] = expf(rg3);
+        const float vt = rv, bt = rb;
         __syncwarp();
+        if (t + 1 < T) KDA_FETCH(t + 1);   // in flight while this token computes
+        const float* egb = eg[b] + r0;
+        const float* ksb = ks[b] + r0;
+        const float* qsb = qs[b] + r0;
+        float kv0 = 0.f, kv1 = 0.f;
 #pragma unroll
-        for (int j = lane; j < DH; j += 32) {
-            eg[j] = expf(g[base + j]);
-            ks[j] = k[base + j];
-            qs[j] = q[base + j];
+        for (int i = 0; i < R; i += 2) {   // decay this half of the column, then its part of kv = S^T k
+            st[i] *= egb[i];
+            st[i + 1] *= egb[i + 1];
+            kv0 += st[i] * ksb[i];
+            kv1 += st[i + 1] * ksb[i + 1];
         }
-        __syncwarp();
-        float kv0 = 0.f, kv1 = 0.f, kv2 = 0.f, kv3 = 0.f;
+        float kv = kv0 + kv1;
+        kv += __shfl_xor_sync(0xffffffffu, kv, 16);
+        const float delta = (vt - kv) * bt;
+        float a0 = 0.f, a1 = 0.f;
 #pragma unroll
-        for (int i = 0; i < DH; i += 4) {   // decay the column, then kv = S^T k
-            st[i] *= eg[i]; st[i + 1] *= eg[i + 1]; st[i + 2] *= eg[i + 2]; st[i + 3] *= eg[i + 3];
-            kv0 += st[i] * ks[i];
-            kv1 += st[i + 1] * ks[i + 1];
-            kv2 += st[i + 2] * ks[i + 2];
-            kv3 += st[i + 3] * ks[i + 3];
+        for (int i = 0; i < R; i += 2) {
+            st[i] += ksb[i] * delta;
+            st[i + 1] += ksb[i + 1] * delta;
+            a0 += st[i] * qsb[i];
+            a1 += st[i + 1] * qsb[i + 1];
         }
-        const float delta = (v[base + c] - ((kv0 + kv1) + (kv2 + kv3))) * beta[(size_t) t * H + h];
-        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-#pragma unroll
-        for (int i = 0; i < DH; i += 4) {
-            st[i] += ks[i] * delta;
-            st[i + 1] += ks[i + 1] * delta;
-            st[i + 2] += ks[i + 2] * delta;
-            st[i + 3] += ks[i + 3] * delta;
-            a0 += st[i] * qs[i];
-            a1 += st[i + 1] * qs[i + 1];
-            a2 += st[i + 2] * qs[i + 2];
-            a3 += st[i + 3] * qs[i + 3];
-        }
-        o[base + c] = (a0 + a1) + (a2 + a3);
+        float a = a0 + a1;
+        a += __shfl_xor_sync(0xffffffffu, a, 16);
+        if (lane < 16) o[((size_t) t * H + h) * DH + c] = a;
     }
 #pragma unroll
-    for (int i = 0; i < DH; ++i) Sg[(size_t) i * DH + c] = st[i];
+    for (int i = 0; i < R; ++i) Sg[(size_t) (r0 + i) * DH + c] = st[i];
+#undef KDA_FETCH
 }
 
 __global__ void kda_out_norm_rows_kernel(float* __restrict__ o, const bf16* __restrict__ w, const float* __restrict__ gate,
@@ -381,7 +390,7 @@ void kda_prep_rows(float* q, float* k, float* gf, const float* dt_bias, const fl
 void kda_scan(float* S, const float* q, const float* k, const float* v, const float* g, const float* beta, float* o, int H,
               int dh, int T, cudaStream_t s) {
     if (dh != 128) { std::fprintf(stderr, "kda_scan: head dim %d (128 only)\n", dh); std::exit(1); }
-    kda_scan_kernel<128><<<dim3((unsigned) H, 128 / 32), 32, 0, s>>>(S, q, k, v, g, beta, o, H, T);
+    kda_scan_kernel<128><<<dim3((unsigned) H, 128 / 16), 32, 0, s>>>(S, q, k, v, g, beta, o, H, T);
     check("kda_scan");
 }
 
