@@ -48,6 +48,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -1083,6 +1084,7 @@ struct Engine {
             const long long n = std::min<long long>(kBlock, nv - i);
             uint8_t* p = nullptr;
             if (cudaMalloc(&p, (size_t) n * XL.bytes) != cudaSuccess) { (void) cudaGetLastError(); break; }
+            vblocks.push_back({vslot.size(), (size_t) n, p});
             for (long long j = 0; j < n; ++j) vslot.push_back(p + (size_t) j * XL.bytes);
         }
         nv = (long long) vslot.size();
@@ -1258,6 +1260,79 @@ struct Engine {
     // in (from the VRAM LRU part: a change of role; from RAM: copied in), at most max_moves a call; the one swapped
     // out joins the LRU part with its RAM copy written back. Replay: chat_code's PCIe copies -7%, ~2 write-backs a
     // token (Strata-data/glm/policy/hybrid_resel.py).
+    // The context caches (each DSA layer's latent and indexer pools) grow with the context instead of holding
+    // max_ctx from the start (~1.9 GB at 262K): a short conversation keeps that VRAM for ~135 more expert slots. A
+    // growth that does not fit takes the VRAM tier's last block of 32 slots (their experts stay in or go back to RAM).
+    const int kCtxStep = std::getenv("GLM_CTX_STEP") ? std::atoi(std::getenv("GLM_CTX_STEP")) : 8192;   // env: tests
+    int ctx_cap = 0;
+    double vreserve_mib = 1500;
+    struct VBlock { size_t start, n; uint8_t* base; };
+    std::vector<VBlock> vblocks;
+    void ctx_alloc(Layer& y, int cap, int keep) {   // cap positions, the first `keep` carried over
+        auto grow = [&](auto*& ptr, size_t elem, size_t n_new, size_t n_keep) {
+            void* q = nullptr;
+            CK(cudaMalloc(&q, n_new * elem));
+            if (ptr && n_keep) CK(cudaMemcpy(q, ptr, n_keep * elem, cudaMemcpyDeviceToDevice));
+            if (ptr) CK(cudaFree(ptr));
+            ptr = (std::remove_reference_t<decltype(ptr)>) q;
+        };
+        if (latent_i8) {
+            grow(y.lat8, (size_t) kR, (size_t) cap, (size_t) keep);
+            grow(y.lat8s, (size_t) (kR / 64) * sizeof(float), (size_t) cap, (size_t) keep);
+        } else {
+            grow(y.lat, (size_t) kR * sizeof(glm::f16), (size_t) cap, (size_t) keep);
+        }
+        grow(y.pooled, (size_t) kIdxD * sizeof(float), (size_t) (cap / kKpool + 1), keep ? (size_t) (keep / kKpool + 1) : 0);
+    }
+    size_t ctx_bytes(int cap) const {   // one DSA layer's context caches for cap positions
+        const size_t per = latent_i8 ? (size_t) kR + (kR / 64) * sizeof(float) : (size_t) kR * sizeof(glm::f16);
+        return (size_t) cap * per + (size_t) (cap / kKpool + 1) * kIdxD * sizeof(float);
+    }
+    bool retire_block() {   // the VRAM tier's last block back to the device
+        if (vblocks.empty()) return false;
+        const VBlock b = vblocks.back();
+        for (size_t sl = b.start; sl < b.start + b.n; ++sl) {
+            const int32_t p = slot_pair[sl];
+            if (p >= 0) {
+                if (!tier.has_copy(p / kNE, p % kNE))
+                    if (uint8_t* d = tier.demote_begin(p / kNE, p % kNE)) {
+                        CK(cudaMemcpy(d, vslot[sl], XL.bytes, cudaMemcpyDeviceToHost));
+                        tier.demote_commit(p / kNE, p % kNE);
+                        if (!rlru.in.empty()) rlru.touch(p);
+                    }
+                res[(size_t) p] = -1;
+                if (!pn.empty() && tier.has_copy(p / kNE, p % kNE)) pol_cand(p);
+            }
+            if (sl < vlru.in.size()) vlru.remove((int32_t) sl);
+            if (sl < slot_static.size() && slot_static[sl]) { slot_static[sl] = 0; --static_n; }
+        }
+        CK(cudaFree(b.base));
+        vslot.resize(b.start);
+        slot_pair.resize(b.start);
+        if (slot_static.size() > b.start) slot_static.resize(b.start);
+        vblocks.pop_back();
+        ++retired_blocks;
+        return true;
+    }
+    long long retired_blocks = 0;
+    void ensure_ctx(int need) {   // at a token / chunk boundary
+        if (need <= ctx_cap || ctx_cap >= max_ctx) return;
+        int cap = std::max(need, ctx_cap + std::max(kCtxStep, ctx_cap / 4));
+        cap = std::min(max_ctx, (cap + 4095) / 4096 * 4096);
+        CK(cudaDeviceSynchronize());
+        int nd = 0;
+        for (const Layer& y : L) nd += y.pooled != nullptr;
+        const size_t add = (size_t) nd * (ctx_bytes(cap) - ctx_bytes(ctx_cap)) + ctx_bytes(cap);   // + one layer in transit
+        const size_t keep = (size_t) (vreserve_mib * 1048576.0);
+        for (;;) {
+            size_t fr = 0, tot = 0;
+            CK(cudaMemGetInfo(&fr, &tot));
+            if (fr >= add + keep || !retire_block()) break;
+        }
+        for (Layer& y : L)
+            if (y.pooled) ctx_alloc(y, cap, ctx_cap);
+        ctx_cap = cap;
+    }
     long long restatic_moves = 0;
     void restatic(int max_moves, double hyst) {
         if (!(tiered && lru && !excl && vram_static > 0) || pn.empty() || static_n == 0) return;
@@ -1352,6 +1427,7 @@ struct Engine {
         while (fr > keep + (size_t) kBlock * XL.bytes) {
             uint8_t* q = nullptr;
             if (cudaMalloc(&q, (size_t) kBlock * XL.bytes) != cudaSuccess) { (void) cudaGetLastError(); break; }
+            vblocks.push_back({vslot.size(), (size_t) kBlock, q});
             for (int j = 0; j < kBlock; ++j) { vslot.push_back(q + (size_t) j * XL.bytes); slot_pair.push_back(-1); }
             added += kBlock;
             fr -= (size_t) kBlock * XL.bytes;
@@ -1702,6 +1778,7 @@ struct Engine {
 
     // T tokens at positions pos0..: the last one's next-token logits in `logits`
     void forward_chunk(const int* toks, int T, int pos0, const std::string& dump_dir) {
+        ensure_ctx(pos0 + T);
         using namespace glm;
         heat_tokens += T;
         ic_prepare(pos0, T);
@@ -1776,15 +1853,10 @@ struct Engine {
                 y.iwqb = mat(ip + "wq_b.weight", fp4_mla); y.iwk = mat(ip + "wk.weight"); y.ik_w = ck.bf(ip + "k_norm.weight");
                 y.ik_b = ck.bf(ip + "k_norm.bias"); y.iwp = mat(ip + "weights_proj.weight");
                 y.igate = mat(ip + "index_kpool_compress_gate"); y.iape = ck.bf(ip + "index_kpool_compress_ape");
-                if (latent_i8) {
-                    CK(cudaMalloc(&y.lat8, (size_t) max_ctx * kR));
-                    CK(cudaMalloc(&y.lat8s, (size_t) max_ctx * (kR / 64) * sizeof(float)));
-                } else {
-                    CK(cudaMalloc(&y.lat, (size_t) max_ctx * kR * sizeof(glm::f16)));
-                }
+                ctx_cap = std::min(max_ctx, kCtxStep);
+                ctx_alloc(y, ctx_cap, 0);
                 CK(cudaMalloc(&y.ikc, (size_t) ic_win * kIdxD * sizeof(float)));
                 CK(cudaMalloc(&y.igc, (size_t) ic_win * kIdxD * sizeof(float)));
-                CK(cudaMalloc(&y.pooled, (size_t) (max_ctx / kKpool + 1) * kIdxD * sizeof(float)));
             }
             const std::string m = p + "mlp.";
             if (l < kDenseLead) {
@@ -2323,6 +2395,7 @@ struct Engine {
     // one token at position pos: the next token's logits in `logits`
     void forward(int token, int pos, const std::string& dump_dir) {
         using namespace glm;
+        ensure_ctx(pos + 1);
         ++heat_tokens;
         ++dec_tok;
         ic_prepare(pos, 1);
@@ -2451,6 +2524,7 @@ int main(int argc, char** argv) {
     if (rebalance_every < 0) rebalance_every = policy == "lru" ? 0 : 16;
     Engine e;
     e.max_ctx = max_ctx;
+    e.vreserve_mib = vram_reserve_mib;
     e.dense_fp8 = !dense_bf16;
     e.chunk_cap = chunk;
     e.latent_i8 = latent_i8;
