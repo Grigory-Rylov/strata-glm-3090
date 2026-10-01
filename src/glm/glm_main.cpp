@@ -523,6 +523,11 @@ struct Engine {
     // exclusive tiers (default with lru): a RAM hit moving to VRAM gives its RAM slot back (at the next layer, once
     // its copy has run), and an expert leaving VRAM without a RAM copy is written back (D2H: the idle direction)
     bool excl = false;   // --ram-exclusive
+    // --skip-disk W (lossy, opt-in): a routed expert that is only on the disk and whose normalized routing weight is
+    // below W is left out (the others' weights rescaled to the same sum) instead of waited for
+    float skip_disk = 0.f;
+    float* wts_pin = nullptr;
+    long long skipped = 0;
     std::vector<int32_t> pending_free;                               // RAM copies of experts that moved to VRAM
     long long writebacks = 0;
     // a few free VRAM slots: a new expert takes one at once; the LRU victim that replaces it in the pool is written
@@ -1372,6 +1377,7 @@ struct Engine {
         logits = buf(kVocab); rows = buf(kK * kEmbd); wts = buf(kK);
         CK(cudaMalloc(&ids, kK * sizeof(int32_t)));
         CK(cudaMallocHost(&hid_pin, kK * sizeof(int32_t)));
+        CK(cudaMallocHost(&wts_pin, 2 * kK * sizeof(float)));
         CK(cudaEventCreateWithFlags(&ev_ids, cudaEventDisableTiming));
         CK(cudaMalloc(&sel, (size_t) kSelLd * sizeof(int32_t)));
         CK(cudaMalloc(&sel_cnt, sizeof(int32_t)));
@@ -1475,6 +1481,7 @@ struct Engine {
         gemv_bf16(ly.router, xn, tmp1, kNE, kEmbd, 1, s);
         route_topk(tmp1, ly.router_bias, kNE, kK, kRouteScale, ids, wts, s);
         CK(cudaMemcpyAsync(hid_pin, ids, kK * sizeof(int32_t), cudaMemcpyDeviceToHost, s));
+        if (skip_disk > 0) CK(cudaMemcpyAsync(wts_pin, wts, kK * sizeof(float), cudaMemcpyDeviceToHost, s));
         if (cpu_share > 0) CK(cudaMemcpyAsync(x_host, xn, kEmbd * sizeof(float), cudaMemcpyDeviceToHost, s));
         CK(cudaEventRecord(ev_ids, s));
         const bool pf = prefetch && l + 1 < kLayers;
@@ -1559,8 +1566,10 @@ struct Engine {
                 done[j] = true;
                 ++ts.vram;
             }
+            bool skipj[kK] = {};
             for (int j = 0; j < kK; ++j) {   // on the disk: into the RAM slot of the least recent member outside VRAM
                 if (done[j] || tier.has_copy(m, hid[j]) || pfj[j] >= 0) continue;
+                if (skip_disk > 0 && wts_pin[j] / kRouteScale < skip_disk) { skipj[j] = done[j] = true; ++skipped; continue; }
                 int32_t v = rlru.tail;
                 while (v >= 0 && (res[(size_t) v] >= 0 || in_sel(v))) v = rlru.prev[(size_t) v];
                 if (v < 0) continue;   // nothing to evict: staged below through the tier's own read
@@ -1677,7 +1686,7 @@ struct Engine {
             int32_t* ge = ge_host + (size_t) m * (kK + 1);
             int32_t ng = 0;
             for (int j = 0; j < kK; ++j) {
-                bool cpu = false;
+                bool cpu = skipj[j];
                 for (int c = 0; c < ncpu; ++c) cpu |= cj[c] == j;
                 if (cpu) continue;
                 gq[ng] = gp[j];
@@ -1689,6 +1698,18 @@ struct Engine {
             CK(cudaStreamWaitEvent(s, ev_xs, 0));
             CK(cudaMemcpyAsync(grp_ptr, gq, kK * sizeof(unsigned long long), cudaMemcpyHostToDevice, s));
             CK(cudaMemcpyAsync(d_ent, ge, (kK + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+            {
+                float wall = 0.f, wkeep = 0.f;
+                bool any = false;
+                for (int j = 0; j < kK; ++j) { wall += wts_pin[j]; if (skipj[j]) any = true; else wkeep += wts_pin[j]; }
+                if (any) {
+                    float* nw = wts_pin + kK;
+                    for (int j = 0; j < kK; ++j) nw[j] = skipj[j] ? 0.f : wts_pin[j] * (wkeep > 0 ? wall / wkeep : 0.f);
+                    CK(cudaMemcpyAsync(wts, nw, kK * sizeof(float), cudaMemcpyHostToDevice, s));
+                    for (int j = 0; j < kK; ++j)
+                        if (skipj[j]) CK(cudaMemsetAsync(rows + (size_t) j * kEmbd, 0, kEmbd * sizeof(float), s));
+                }
+            }
             if (timing) CK(cudaEventRecord(tev[(size_t) m * 3 + 1], s));
             if (ng > 0)
                 strata::kernels::native_expert_grouped_f32(XL, grp_ptr, grp_start, d_ent + kK, d_ent, ent_tok, kK, kK, xn,
@@ -1807,6 +1828,8 @@ int main(int argc, char** argv) {
     double cpu_share = 0;
     int cpu_threads = 14;
     bool no_prefetch = false, dense_bf16 = false, prompt_f32 = false, ram_exclusive = false;
+    float skip_disk = 0.f;
+    std::string teacher_path, step_logits_path;   // decode forced to these tokens; every step's logits written out
     int pf_copies = 0, pf_reads = 4;
     long long rebalance_vram = 32, rebalance_ram = 64;
     for (int i = 1; i < argc; ++i) {
@@ -1836,6 +1859,9 @@ int main(int argc, char** argv) {
         else if (a == "--dense-bf16") dense_bf16 = true;
         else if (a == "--prompt-f32") prompt_f32 = true;
         else if (a == "--ram-exclusive") ram_exclusive = true;
+        else if (a == "--skip-disk") skip_disk = (float) std::atof(next().c_str());
+        else if (a == "--teacher") teacher_path = next();
+        else if (a == "--dump-step-logits") step_logits_path = next();
         else if (a == "--rebalance-moves") { rebalance_vram = std::atoll(next().c_str()); rebalance_ram = 2 * rebalance_vram; }
         else { std::fprintf(stderr, "strata-glm: unknown argument %s\n", a.c_str()); return 2; }
     }
@@ -1864,6 +1890,7 @@ int main(int argc, char** argv) {
     e.dense_fp8 = !dense_bf16;
     e.lru = policy == "lru";
     e.excl = ram_exclusive;
+    e.skip_disk = skip_disk;
     e.mirrors = mirrors;
     e.cpu_share = cpu_share;
     e.cpu_threads = cpu_threads;
@@ -1919,8 +1946,17 @@ int main(int argc, char** argv) {
     const bool nsys = nsys_env && std::atoi(nsys_env) == 1;
     if (nsys) CK(cudaProfilerStart());
     const auto t1 = std::chrono::steady_clock::now();
+    std::vector<int> teacher;
+    if (!teacher_path.empty()) {
+        std::ifstream in(teacher_path);
+        int t;
+        while (in >> t) teacher.push_back(t);
+    }
+    std::FILE* step_f = step_logits_path.empty() ? nullptr : std::fopen(step_logits_path.c_str(), "wb");
     for (int n = 0; n < max_new && pos < max_ctx; ++n) {
-        const int tok = (int) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+        if (step_f) std::fwrite(lg.data(), sizeof(float), lg.size(), step_f);
+        if (!teacher.empty() && n >= (int) teacher.size()) break;
+        const int tok = teacher.empty() ? (int) (std::max_element(lg.begin(), lg.end()) - lg.begin()) : teacher[(size_t) n];
         out.push_back(tok);
         if (tok == 154820 || tok == 154827 || tok == 154829) break;   // eos ids (config.json)
         const auto tf = std::chrono::steady_clock::now();
@@ -1936,6 +1972,8 @@ int main(int argc, char** argv) {
     }
     const double td = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
     if (nsys) CK(cudaProfilerStop());
+    if (step_f) std::fclose(step_f);
+    if (e.skipped > 0 && steps > 0) std::fprintf(stderr, "strata-glm: skipped %.1f disk experts a token\n", (double) e.skipped / steps);
     if (!routes_path.empty()) {   // layer, then T*K ids per record (the prompt's chunks, then each decode step)
         if (std::FILE* f = std::fopen(routes_path.c_str(), "ab")) {
             for (const auto& r : routes) {
@@ -1959,6 +1997,10 @@ int main(int argc, char** argv) {
         for (int d = 0; d < e.reader.drives(); ++d) std::fprintf(stderr, "%s drive %d: %lld", d ? "," : ";", d, e.reader.reads(d));
         std::fprintf(stderr, ")\n");
     }
+    if (e.tiered && steps > 0)
+        std::fprintf(stderr, "strata-glm: disk waits a token: %.1f ms for unpredicted experts, %.1f ms for prefetches not landed yet "
+                             "(%lld prefetch reads used)\n", 1e3 * (e.ts.file_wait_s - ts0.file_wait_s) / steps,
+                     1e3 * (e.ts.pf_wait_s - ts0.pf_wait_s) / steps, e.pf_used);
     if (e.excl && steps > 0) std::fprintf(stderr, "strata-glm: exclusive tiers: %.1f writebacks a token\n", (double) e.writebacks / steps);
     if (e.prefetch && e.pf_reads > 0)
         std::fprintf(stderr, "strata-glm: prefetch: %lld disk reads for the next layer, %.1f%% of them routed there; "
