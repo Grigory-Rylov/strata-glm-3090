@@ -513,6 +513,115 @@ struct Engine {
         mq::iota(m_ident, (int64_t) E, s);
         mmq_ctx = std::make_unique<mq::Context>();
     }
+    // The streamed prompt MoE (chunks of >= kStreamMin tokens: every expert of a layer is routed to): a pool with a
+    // slot per expert id, filled from the start of each MoE layer - VRAM's experts device to device, RAM's over
+    // PCIe, the disk's through the pinned ring - while the layer's attention computes; MMQ then runs over 16
+    // consecutive ids at a time (an id nobody routes to has no rows). The pool waits for the previous layer's kernels.
+    static constexpr int kStreamMin = 512;
+    uint8_t* ppool = nullptr;
+    size_t ps_stride = 0;
+    cudaEvent_t ev_moe = nullptr;
+    int ps_m = -1;
+    std::vector<int> ps_disk;                                        // the staged layer's disk experts, by id
+    size_t ps_next = 0;                                              // reads issued so far
+    void init_prompt_pool() {   // before the expert tier sizes itself to the free VRAM
+        ps_stride = (XL.bytes + 143) / 144 * 144;   // whole NVFP4 blocks between experts (MMQ steps in blocks)
+        size_t fr = 0, tot = 0;
+        CK(cudaMemGetInfo(&fr, &tot));
+        const size_t need = (size_t) kNE * ps_stride + (1 << 20);
+        if (fr < need + (size_t) 4 * 1073741824ull) return;   // keep room for the tier and the reserve
+        if (cudaMalloc(&ppool, need) != cudaSuccess) { (void) cudaGetLastError(); ppool = nullptr; return; }
+        CK(cudaMemset(ppool, 0, need));
+        CK(cudaEventCreateWithFlags(&ev_moe, cudaEventDisableTiming));
+    }
+    void ps_issue_reads(size_t upto) {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        for (; ps_next < ps_disk.size() && ps_next < upto; ++ps_next) {
+            const int slot = (int) ((ring_pos + ps_next) % kRing);
+            CK(cudaEventSynchronize(ev_ring[slot]));
+            reader.start(kRingJob0 + slot, lay.blob_offset(ps_m, ps_disk[ps_next]), XL.bytes, pring + (size_t) slot * ring_stride);
+        }
+    }
+    void prestage(int m) {   // before layer m's attention: every expert of the layer toward the pool
+        if (!ppool || !tiered) return;
+        CK(cudaStreamWaitEvent(pcs, ev_moe, 0));   // the previous layer's expert kernels have read the pool
+        ps_m = m;
+        ps_disk.clear();
+        ps_next = 0;
+        for (int e = 0; e < kNE; ++e) {
+            const int32_t q = m * kNE + e;
+            uint8_t* dst = ppool + (size_t) e * ps_stride;
+            if (res[(size_t) q] >= 0) CK(cudaMemcpyAsync(dst, vslot[(size_t) res[(size_t) q]], XL.bytes, cudaMemcpyDeviceToDevice, pcs));
+            else if (tier.has_copy(m, e)) CK(cudaMemcpyAsync(dst, tier.stable_blob(m, e), XL.bytes, cudaMemcpyHostToDevice, pcs));
+            else ps_disk.push_back(e);
+        }
+        ps_issue_reads(kRing);
+    }
+    void moe_chunk_stream(int m, int T, const std::vector<std::vector<int32_t>>& by) {
+        namespace mq = strata::prefill::mmq;
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        const auto& f = lay.fmt[(size_t) m];
+        const size_t S = ps_stride;
+        CK(cudaEventSynchronize(ev_done[0]));   // the pinned arrays' previous uploads have run
+        CK(cudaEventSynchronize(ev_done[1]));
+        int32_t r = 0;
+        for (int e = 0; e < kNE; ++e) {
+            h_bounds[e] = r;
+            for (const int32_t en : by[(size_t) e]) { h_src[r] = en / kK; h_dstv[r] = en; ++r; }
+        }
+        h_bounds[kNE] = r;
+        CK(cudaMemcpyAsync(m_src, h_src, (size_t) r * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(m_dst, h_dstv, (size_t) r * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+        CK(cudaMemcpyAsync(m_bounds, h_bounds, (kNE + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+        mq::quantize(c_xn, m_src, m_xq, XL.gu_type, kEmbd, kEmbd, r, s);
+        size_t di = 0;   // the disk experts landed so far (by id order)
+        for (int b0 = 0, bi = 0; b0 < kNE; b0 += kBatch, ++bi) {
+            const int h = bi & 1, nb = std::min(kBatch, kNE - b0);
+            // this batch's disk experts: wait for their reads, copy them into their slots
+            while (di < ps_disk.size() && ps_disk[di] < b0 + nb) {
+                const int e = ps_disk[di];
+                ps_issue_reads(di + kRing);
+                const int slot = (int) ((ring_pos + di) % kRing);
+                const auto t = std::chrono::steady_clock::now();
+                if (!reader.wait(kRingJob0 + slot)) { std::fprintf(stderr, "strata-glm: a prompt read failed\n"); std::exit(1); }
+                ts.file_wait_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
+                CK(cudaMemcpyAsync(ppool + (size_t) e * S, pring + (size_t) slot * ring_stride + lay.blob_offset(m, e) % 4096,
+                                   XL.bytes, cudaMemcpyHostToDevice, pcs));
+                CK(cudaEventRecord(ev_ring[slot], pcs));
+                ++di;
+            }
+            const int32_t r0 = h_bounds[b0], nr = h_bounds[b0 + nb] - r0;
+            if (nr == 0) continue;
+            int32_t maxr = 0;
+            for (int k = 0; k < nb; ++k) maxr = std::max<int32_t>(maxr, h_bounds[b0 + k + 1] - h_bounds[b0 + k]);
+            CK(cudaEventSynchronize(ev_done[h]));
+            for (int k = 0; k <= nb; ++k) h_rb[h][k] = h_bounds[b0 + k] - r0;
+            CK(cudaEventRecord(ev_copy[h], pcs));
+            CK(cudaMemcpyAsync(m_rb[h], h_rb[h], (size_t) (nb + 1) * sizeof(int32_t), cudaMemcpyHostToDevice, s));
+            CK(cudaStreamWaitEvent(s, ev_copy[h], 0));
+            uint8_t* base = ppool + (size_t) b0 * S;
+            glm::gather_tails(base, S, f.tail_off, nb, m_tails[h], s);
+            mq::Product gu;
+            gu.w = base; gu.type = XL.gu_type; gu.w_rows = 2 * kFF; gu.w_cols = kEmbd; gu.expert_bytes = S;
+            gu.n = nb; gu.xq = m_xq; gu.bounds = m_bounds + b0; gu.ids = m_ident; gu.total_rows = r; gu.max_rows = maxr;
+            gu.dst = m_gu; gu.ld_dst = 2 * kFF;
+            mmq_ctx->run(gu, s);
+            glm::swiglu_rows(m_gu, m_h, m_rb[h], nb, m_tails[h], r0, nr, kFF, kSwigluLimit, s);
+            mq::quantize(m_h + (size_t) r0 * kFF, nullptr, m_hq, XL.d_type, kFF, kFF, nr, s);
+            mq::Product dn;
+            dn.w = base + f.down_off; dn.type = XL.d_type; dn.w_rows = kEmbd; dn.w_cols = kFF; dn.expert_bytes = S;
+            dn.n = nb; dn.xq = m_hq; dn.bounds = m_rb[h]; dn.ids = m_dst + r0; dn.total_rows = nr; dn.max_rows = maxr;
+            dn.dst = c_rows; dn.ld_dst = kEmbd;
+            mmq_ctx->run(dn, s);
+            glm::scale_entry_wts(c_wts, m_dst + r0, m_rb[h], nb, m_tails[h], nr, s);
+            CK(cudaEventRecord(ev_done[h], s));
+        }
+        CK(cudaEventRecord(ev_moe, s));
+        ring_pos += ps_disk.size();
+        ts.ram += kNE - (long long) ps_disk.size();
+        ts.file += (long long) ps_disk.size();
+        ps_m = -1;
+    }
     void init_prompt_pipe(int T) {
         ring_stride = ((size_t) XL.bytes + 8192 + 4095) / 4096 * 4096;
         CK(cudaHostAlloc((void**) &pring, (size_t) kRing * ring_stride, cudaHostAllocPortable));
@@ -1040,6 +1149,7 @@ struct Engine {
             if (q) cudaFree(q);
         gm.release();
         glm::conv_silu_release();
+        if (ppool) { cudaFree(ppool); ppool = nullptr; }
         if (lru && stage) { cudaFree(stage); stage = nullptr; }
         chunk = 0;
     }
@@ -1087,6 +1197,7 @@ struct Engine {
         }
         CK(cudaMalloc(&c_xscratch, strata::kernels::native_expert_scratch_bytes((int64_t) T * kK, kFF)));
         glm::conv_silu_reserve((size_t) T * kKdaC);
+        if (!whole_layer && T >= kStreamMin) init_prompt_pool();
         gm.reserve_w((size_t) kEmbd * kMlaH * kDv);   // the largest FP8 matrix the prompt multiplies (MLA's o_proj)
         size_t fr = 0, tot = 0;
         cudaMemGetInfo(&fr, &tot);
@@ -1303,6 +1414,12 @@ struct Engine {
                 else if (tier.has_copy(m, e)) ram.push_back(e);
                 else disk.emplace_back(m, e);
             }
+            if (prompt_mmq && ps_m == m) {
+                moe_chunk_stream(m, T, by);
+                combine_rows_t(c_rows, c_wts, kK, c_y, kEmbd, T, s);
+                if (routes) routes->push_back({l, hid});
+                return;
+            }
             ts.vram += (long long) resident.size();
             ts.ram += (long long) ram.size();
             ts.file += (long long) disk.size();
@@ -1400,6 +1517,8 @@ struct Engine {
                                    cudaMemcpyDeviceToDevice, s));
         for (int l = 0; l < kLayers; ++l) {
             Layer& ly = L[(size_t) l];
+            static const bool no_stream = std::getenv("GLM_NO_STREAM") != nullptr;
+            if (l >= kDenseLead && T >= kStreamMin && prompt_mmq && !no_stream) prestage(l - kDenseLead);
             gm.w16(ly.hc_attn_fn, c_streams, c_mix, 24, kHc * kEmbd, T);
             hc_pre_rows(c_streams, c_mix, ly.hc_attn_base, ly.hc_attn_scale, kEmbd, kEps, kHcEps, kSinkhorn, c_x, c_post, c_comb, T, s);
             rmsnorm(c_x, ly.in_norm, kEps, c_xn, kEmbd, T, s);
