@@ -1169,22 +1169,25 @@ struct Engine {
         }
         if (added > 0) std::fprintf(stderr, "strata-glm: the prompt's buffers freed: %lld more VRAM slots (%zu)\n", added, vslot.size());
     }
+    int qsub = 0;                                                   // the prompt path's DSA query sub-chunk
     void init_chunk(int T, bool whole_layer) {   // whole_layer: no tiers, each layer's 288 experts read at once
         chunk = T;
-        gm.init(s, (size_t) T * kMlaH * kR);   // the widest split: the MLA context rows (64 x 512)
+        qsub = std::min(T, std::getenv("GLM_QSUB") ? std::atoi(std::getenv("GLM_QSUB")) : 2048);   // env: tests
+        // the widest split: the hc mixes' 4 streams, the dense MLP's rows, or a query sub-chunk's MLA context (64 x 512)
+        gm.init(s, std::max({(size_t) qsub * kMlaH * kR, (size_t) T * kDenseFF, (size_t) T * kHc * kEmbd}));
         auto buf = [&](size_t n) { float* p = nullptr; CK(cudaMalloc(&p, n * sizeof(float))); return p; };
         c_streams = buf((size_t) T * kHc * kEmbd); c_mix = buf((size_t) T * 24); c_x = buf((size_t) T * kEmbd);
         c_xn = buf((size_t) T * kEmbd); c_y = buf((size_t) T * kEmbd); c_post = buf((size_t) T * 4); c_comb = buf((size_t) T * 16);
         c_t1 = buf((size_t) T * kDenseFF); c_t2 = buf((size_t) T * kDenseFF); c_t3 = buf((size_t) T * kDenseFF);
         c_q = buf((size_t) T * kKdaC); c_k = buf((size_t) T * kKdaC); c_v = buf((size_t) T * kKdaC); c_gf = buf((size_t) T * kKdaC);
         c_b = buf((size_t) T * kKdaH); c_o = buf((size_t) T * kKdaC); c_gate = buf((size_t) T * kKdaC);
-        c_qr = buf((size_t) T * kQLora); c_qm = buf((size_t) T * kMlaH * kDk); c_qa = buf((size_t) T * kMlaH * kR);
-        c_ctx = buf((size_t) T * kMlaH * kR); c_vo = buf((size_t) T * kMlaH * kDv); c_iq = buf((size_t) T * kIdxH * kIdxD);
-        c_iw = buf((size_t) T * kIdxH); c_score = buf((size_t) T * (max_ctx / kKpool + 1));
+        c_qr = buf((size_t) T * kQLora); c_qm = buf((size_t) qsub * kMlaH * kDk); c_qa = buf((size_t) qsub * kMlaH * kR);
+        c_ctx = buf((size_t) qsub * kMlaH * kR); c_vo = buf((size_t) qsub * kMlaH * kDv); c_iq = buf((size_t) qsub * kIdxH * kIdxD);
+        c_iw = buf((size_t) qsub * kIdxH); c_score = buf((size_t) qsub * (max_ctx / kKpool + 1));
         c_rows = buf((size_t) T * kK * kEmbd); c_wts = buf((size_t) T * kK);
         CK(cudaMalloc(&c_ids, (size_t) T * kK * sizeof(int32_t)));
-        CK(cudaMalloc(&c_sel, (size_t) T * kSelLd * sizeof(int32_t)));
-        CK(cudaMalloc(&c_cnt, (size_t) T * sizeof(int32_t)));
+        CK(cudaMalloc(&c_sel, (size_t) qsub * kSelLd * sizeof(int32_t)));
+        CK(cudaMalloc(&c_cnt, (size_t) qsub * sizeof(int32_t)));
         CK(cudaMalloc(&c_grp_ptr, kNE * sizeof(unsigned long long)));
         CK(cudaMalloc(&c_grp_start, (kNE + 1) * sizeof(int32_t)));
         CK(cudaMalloc(&c_ngroups, sizeof(int32_t)));
@@ -1227,37 +1230,42 @@ struct Engine {
         using namespace glm;
         gm.wmat(ly.qa, c_xn, c_t1, kQLora, kEmbd, T);
         rmsnorm(c_t1, ly.qa_norm, kEps, c_qr, kQLora, T, s);
-        gm.wmat(ly.qb, c_qr, c_qm, kMlaH * kDk, kQLora, T);
         gm.wmat(ly.kva, c_xn, c_t1, kR, kEmbd, T);
         if (ly.lat8) rmsnorm_i8(c_t1, ly.kva_norm, kEps, ly.lat8 + (size_t) pos0 * kR, ly.lat8s + (size_t) pos0 * (kR / 64), kR, T, s);
         else rmsnorm_f16(c_t1, ly.kva_norm, kEps, ly.lat + (size_t) pos0 * kR, kR, T, s);
-        gm.wmat(ly.iwqb, c_qr, c_iq, kIdxH * kIdxD, kQLora, T);
         gm.wmat(ly.iwk, c_xn, c_t1, kIdxD, kEmbd, T);
         layernorm_rows(c_t1, ly.ik_w, ly.ik_b, 1e-6f, ly.ikc + (size_t) (pos0 - ic_base) * kIdxD, kIdxD, T, s);
         gm.wmat(ly.igate, c_xn, ly.igc + (size_t) (pos0 - ic_base) * kIdxD, kIdxD, kEmbd, T);
         const int pool_lo = pos0 / kKpool, pool_hi = (pos0 + T) / kKpool;   // the pools this chunk completes
         idx_pool_rows(ly.ikc, ly.igc, ly.iape, ly.pooled, pool_lo - (int) (ic_base / kKpool), pool_hi - pool_lo, kKpool, kIdxD, s,
                       pool_lo);
+        // the queries in sub-chunks of qsub (their buffers - scores over every pool, the absorbed q, the context - are
+        // ~650 KB a token at 262K): every key and pool of the chunk is written above, the masks keep it causal
         const int budget = kIdxTopk / kKpool;
-        const int32_t* sel = nullptr;
-        int max_sel = pos0 + T;
         static const bool dense = std::getenv("GLM_DENSE") != nullptr;   // tests: every visible token
-        if (pool_hi > budget && !dense) {
-            // some query sees more complete pools than the budget: the top ones by the indexer's score, then its tail
-            gm.wmat(ly.iwp, c_xn, c_iw, kIdxH, kEmbd, T);
-            static const bool idx_old = std::getenv("GLM_IDX_OLD") != nullptr;
-            if (idx_old) idx_scores_rows(c_iq, c_iw, ly.pooled, c_score, pool_hi, kIdxH, kIdxD, pos0, kKpool, T, s);
-            else idx_scores_tc(c_iq, c_iw, ly.pooled, c_score, pool_hi, pos0, kKpool, T, s);
-            idx_select_rows(c_score, pool_hi, pos0, kKpool, budget, c_sel, kSelLd, c_cnt, T, s);
-            max_sel = kSelLd;
-            sel = c_sel;
-        }
         const long long ws = (long long) (kDk + kDv) * kR;
-        gm.heads16(ly.kvb, ws, false, c_qm, kMlaH * kDk, c_qa, kMlaH * kR, kR, kDk, T, kMlaH);
-        (void) max_sel;
-        mla_attend_tc(c_qa, ly.lat, ly.lat8, ly.lat8s, sel, c_cnt, kSelLd, pos0, 1.0f / std::sqrt((float) kDk), c_ctx, T, 1, nullptr, s);
-        gm.heads16(ly.kvb + (size_t) kDk * kR, ws, true, c_ctx, kMlaH * kR, c_vo, kMlaH * kDv, kDv, kR, T, kMlaH);
-        gm.wmat(ly.wo, c_vo, c_y, kEmbd, kMlaH * kDv, T);
+        for (int t0 = 0; t0 < T; t0 += qsub) {
+            const int Ts = std::min(qsub, T - t0), p0 = pos0 + t0, phi = (p0 + Ts) / kKpool;
+            const float* xn_s = c_xn + (size_t) t0 * kEmbd;
+            const float* qr_s = c_qr + (size_t) t0 * kQLora;
+            gm.wmat(ly.qb, qr_s, c_qm, kMlaH * kDk, kQLora, Ts);
+            const int32_t* sel = nullptr;
+            if (phi > budget && !dense) {
+                // some query sees more complete pools than the budget: the top ones by the indexer's score, then its tail
+                gm.wmat(ly.iwqb, qr_s, c_iq, kIdxH * kIdxD, kQLora, Ts);
+                gm.wmat(ly.iwp, xn_s, c_iw, kIdxH, kEmbd, Ts);
+                static const bool idx_old = std::getenv("GLM_IDX_OLD") != nullptr;
+                if (idx_old) idx_scores_rows(c_iq, c_iw, ly.pooled, c_score, phi, kIdxH, kIdxD, p0, kKpool, Ts, s);
+                else idx_scores_tc(c_iq, c_iw, ly.pooled, c_score, phi, p0, kKpool, Ts, s);
+                idx_select_rows(c_score, phi, p0, kKpool, budget, c_sel, kSelLd, c_cnt, Ts, s);
+                sel = c_sel;
+            }
+            gm.heads16(ly.kvb, ws, false, c_qm, kMlaH * kDk, c_qa, kMlaH * kR, kR, kDk, Ts, kMlaH);
+            mla_attend_tc(c_qa, ly.lat, ly.lat8, ly.lat8s, sel, c_cnt, kSelLd, p0, 1.0f / std::sqrt((float) kDk), c_ctx, Ts, 1,
+                          nullptr, s);
+            gm.heads16(ly.kvb + (size_t) kDk * kR, ws, true, c_ctx, kMlaH * kR, c_vo, kMlaH * kDv, kDv, kR, Ts, kMlaH);
+            gm.wmat(ly.wo, c_vo, c_y + (size_t) t0 * kEmbd, kEmbd, kMlaH * kDv, Ts);
+        }
     }
 
     // The tiered prompt path through MMQ: every routed expert of the layer (VRAM's copied device to device, RAM's
