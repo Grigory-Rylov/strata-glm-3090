@@ -68,10 +68,10 @@ public:
             path_[d].assign((size_t) std::max(n, 1), L'\0');
             MultiByteToWideChar(CP_UTF8, 0, paths[(size_t) d].c_str(), -1, path_[d].data(), n);
             gbps_[d] = d < (int) gbps.size() ? gbps[(size_t) d] : 1.0;
-            queued_[d].store(0);
             for (int t = 0; t < threads; ++t) th_.emplace_back([this, d] { loop(d); });
         }
         for (int i = 0; i < kJobs; ++i) { left_[i].store(0); bad_[i].store(0); }
+        if (const char* e = std::getenv("GLM_LOW_INFLIGHT")) low_max_ = std::max(1, std::atoi(e));
         return nd_ > 0;
 #else
         (void) paths; (void) gbps; (void) threads;
@@ -90,11 +90,14 @@ public:
             left_[job].store(1 << 30);   // held until every piece is queued
             for (uint64_t at = 0; at < len; at += piece, ++n) {
                 const uint32_t pl = (uint32_t) std::min(piece, len - at);
-                int d = 0;   // each piece to the drive whose queue (with it) drains first
+                // each piece to the drive that gets to it first: a high one waits for the high queue and the pieces
+                // in flight (low ones queued are passed), a low one for everything
+                auto ahead = [&](int x) { return (double) (hq_[x] + fly_[x] + (high ? 0 : lqb_[x]) + pl) / gbps_[x]; };
+                int d = 0;
                 for (int x = 1; x < nd_; ++x)
-                    if ((queued_[x].load() + (double) pl) / gbps_[x] < (queued_[d].load() + (double) pl) / gbps_[d]) d = x;
+                    if (ahead(x) < ahead(d)) d = x;
                 (high ? q_[d] : lq_[d]).push_back({a0 + at, pl, dst + at, job});
-                queued_[d].fetch_add((long long) pl);
+                (high ? hq_[d] : lqb_[d]) += pl;
                 ++reads_[d];
             }
             left_[job].store(n, std::memory_order_release);
@@ -106,6 +109,23 @@ public:
         return bad_[job].load() == 0;
     }
     bool done(int job) const { return left_[job].load(std::memory_order_acquire) == 0; }
+    /// a prefetch the current layer now needs: its queued pieces move to the high-priority queues
+    void promote(int job) {
+        bool moved = false;
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            for (int d = 0; d < nd_; ++d)
+                for (auto it = lq_[d].begin(); it != lq_[d].end();) {
+                    if (it->job != job) { ++it; continue; }
+                    q_[d].push_back(*it);
+                    lqb_[d] -= it->len;
+                    hq_[d] += it->len;
+                    it = lq_[d].erase(it);
+                    moved = true;
+                }
+        }
+        if (moved) for (int d = 0; d < nd_; ++d) cv_[d].notify_all();
+    }
     long long reads(int d) const { return reads_[d]; }
     int drives() const { return nd_; }
     void close() {
@@ -124,13 +144,18 @@ private:
         if (h != INVALID_HANDLE_VALUE) GetFileSizeEx(h, &fs);
         for (;;) {
             Piece p{};
+            bool low = false;
             {
                 std::unique_lock<std::mutex> g(mu_);
-                cv_[d].wait(g, [&] { return quit_ || !q_[d].empty() || !lq_[d].empty(); });
-                if (quit_ && q_[d].empty() && lq_[d].empty()) break;
-                auto& q = !q_[d].empty() ? q_[d] : lq_[d];
+                cv_[d].wait(g, [&] { return quit_ || !q_[d].empty() || (!lq_[d].empty() && low_fly_[d] < low_max_); });
+                if (quit_) break;
+                low = q_[d].empty();
+                auto& q = low ? lq_[d] : q_[d];
                 p = q.front();
                 q.pop_front();
+                (low ? lqb_[d] : hq_[d]) -= p.len;
+                fly_[d] += p.len;
+                if (low) ++low_fly_[d];
             }
             OVERLAPPED ov{};
             ov.Offset = (DWORD) p.off;
@@ -144,7 +169,12 @@ private:
                 std::fprintf(stderr, "strata-glm: read of %u bytes at %llu (drive %d) failed: got %lu, error %lu\n", p.len,
                              (unsigned long long) p.off, d, (unsigned long) got, (unsigned long) GetLastError());
             }
-            queued_[d].fetch_sub((long long) p.len);
+            {
+                std::lock_guard<std::mutex> g(mu_);
+                fly_[d] -= p.len;
+                if (low) --low_fly_[d];
+            }
+            if (low) cv_[d].notify_one();   // the next low piece may go
             left_[p.job].fetch_sub(1, std::memory_order_acq_rel);
         }
         if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
@@ -153,7 +183,8 @@ private:
     int nd_ = 0;
     std::wstring path_[kDrives];
     double gbps_[kDrives] = {};
-    std::atomic<long long> queued_[kDrives];
+    long long hq_[kDrives] = {}, lqb_[kDrives] = {}, fly_[kDrives] = {};   // bytes queued high / low, in flight (mu_)
+    int low_fly_[kDrives] = {}, low_max_ = 2;                            // low pieces in flight a drive, and the cap
     long long reads_[kDrives] = {};
     std::vector<std::thread> th_;
     std::mutex mu_;
@@ -1879,7 +1910,7 @@ struct Engine {
             auto pf_copy = [&]() {
                 pf_copied = true;
                 const int mn = m + 1;
-                for (int i = 0; i < 3 && pf_vn < pf_copy_max; ++i) {
+                for (int i = 0; i < 3 && pf_vn < pf_copy_max; ++i) {   // ranks past 2: <= 64% routed there
                     const int32_t q = mn * kNE + pf_ids[i];
                     if (res[(size_t) q] >= 0 || !tier.has_copy(mn, pf_ids[i])) continue;
                     pf_vrank[pf_vn] = i;
@@ -1908,6 +1939,7 @@ struct Engine {
             for (int j = 0; j < kK; ++j) {
                 pfj[j] = spj[j] = -1;
                 for (int i = 0; i < kK; ++i) if (pf_pair[i] == pj[j]) pfj[j] = i;
+                if (pfj[j] >= 0 && !reader.done(kK + pfj[j])) reader.promote(kK + pfj[j]);
                 if (spool && res[(size_t) pj[j]] < 0 && !tier.has_copy(m, hid[j]))
                     for (int x = 0; x < kSpool; ++x) if (sp_pair[x] == pj[j]) spj[j] = x;
             }
@@ -2057,11 +2089,18 @@ struct Engine {
                 ++ts.file;
                 if (excl) pending_free.push_back(pj[j]);
             }
-            for (int j = 0; j < kK; ++j) {   // the disk reads, as they land
-                if (dslot[j] == nullptr) continue;
-                const auto t = std::chrono::steady_clock::now();
+            int nleft = 0;
+            bool landed[kK] = {};
+            for (int j = 0; j < kK; ++j) nleft += dslot[j] != nullptr;
+            const auto t_disk = std::chrono::steady_clock::now();
+            while (nleft > 0) {   // the disk reads, in the order they land
+                int j = -1;
+                for (int x = 0; x < kK && j < 0; ++x)
+                    if (dslot[x] != nullptr && !landed[x] && reader.done(x)) j = x;
+                if (j < 0) { std::this_thread::yield(); continue; }
+                landed[j] = true;
+                --nleft;
                 const bool ok = reader.wait(j);
-                ts.file_wait_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
                 if (!ok) { std::fprintf(stderr, "strata-glm: reading expert %d of layer %d failed\n", hid[j], l); std::exit(1); }
                 const size_t pad = (size_t) (strata::kernels::cpu::expert_layout().blob_offset(m, hid[j]) % 4096);
                 tier.demote_commit(m, hid[j], pad);
@@ -2072,6 +2111,7 @@ struct Engine {
                 gp[j] = (unsigned long long) vslot[(size_t) sl];
                 ++ts.file;
                 if (excl) pending_free.push_back(pj[j]);
+                if (nleft == 0) ts.file_wait_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t_disk).count();
             }
             // the GPU's groups: every expert but the CPU's, each writing its own row of `rows`
             unsigned long long* gq = gq_host + (size_t) m * kK;
@@ -2226,7 +2266,7 @@ int main(int argc, char** argv) {
     double vram_static = 0.7;   // --vram-static 0: VRAM all LRU (inclusive)
     float skip_disk = 0.f;
     std::string teacher_path, step_logits_path;   // decode forced to these tokens; every step's logits written out
-    int pf_copies = 2, pf_reads = 4;
+    int pf_copies = 2, pf_reads = 6;   // reads 6: chat_uk +1.3%, chat_code +0.7% over 4 (8: no better)
     // formats (KL to BF16 dense + FP16 latent, 48 teacher-forced steps after a 2600-token prompt, median): int8 dense
     // 0.0078 (old FP8: 0.0135); + NVFP4 KDA q/k 0.017 for 1 GB of VRAM; NVFP4 head / shared / mla add 0.006-0.012
     // each, all of them 0.041 (top-1 83%) - opt-in. --dense-fp4 none --dense-fp8 --latent-f16 restore the old ones.
@@ -2322,7 +2362,7 @@ int main(int argc, char** argv) {
     e.cpu_share = cpu_share;
     e.cpu_threads = cpu_threads;
     e.prefetch = !no_prefetch;
-    e.pf_copy_max = pf_copies;
+    e.pf_copy_max = std::min(pf_copies, kK);
     e.pf_stage = pf_stage_on;
     e.ram_freq = !ram_lru;
     e.pf_read_max = std::min(pf_reads, kK);
