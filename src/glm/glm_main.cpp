@@ -893,11 +893,21 @@ struct Engine {
     int32_t* gea_host = nullptr;
     cudaEvent_t ev_pfc = nullptr;
     bool pfc_pending = false;
+    // the speculative copies have their own stream: the layer's kernel waits for its own copies (ev_xs on xs) only;
+    // a slot a speculative copy may still be writing is reused only after ev_pfc (spec_slot)
+    cudaStream_t xp = nullptr;
+    std::vector<uint8_t> spec_slot;
     // GLM_PREDICT=1 (measurement): layer l+1's experts predicted by its own hc_pre, norm and router applied to the
     // streams (A) as layer l's router sees them, (B) after layer l; scored against what layer l+1 then routes
     bool predict = false;
     bool prefetch = true;                                            // --no-prefetch: off
-    int32_t* pf_ids = nullptr;                                       // pinned: layer l+1's predicted ids
+    int32_t* pf_ids = nullptr;                                       // pinned: layer l+1's predicted ids, kPred ranked
+    static constexpr int kPred = 16;
+    // what the prediction for each MoE layer was when its prefetch was decided, and where the disk reads a layer
+    // still waited for (no prefetch) stood in it: rank 0..kPred-1, or kPred = not predicted
+    int32_t pf_hist[kLayers][kPred];
+    bool pf_hist_ok[kLayers] = {};
+    long long miss_rank[kPred + 1] = {};
     cudaEvent_t ev_pred = nullptr;
     // disk reads started for the next layer: (pair, RAM slot) per reader job kK + i
     int pf_n = 0;
@@ -938,8 +948,8 @@ struct Engine {
         hc_pre_finish(streams, p_mixp, ly.hc_ffn_base, ly.hc_ffn_scale, kEmbd, kEps, kHcEps, kSinkhorn, p_x, p_post, p_comb, s,
                       ly.post_norm, p_xn, kMixParts);
         gemv_bf16(ly.router, p_xn, p_log, kNE, kEmbd, 1, s);
-        route_topk(p_log, ly.router_bias, kNE, kK, kRouteScale, p_ids, p_wts, s);
-        CK(cudaMemcpyAsync(pf_ids, p_ids, kK * sizeof(int32_t), cudaMemcpyDeviceToHost, s));
+        route_topk(p_log, ly.router_bias, kNE, kPred, kRouteScale, p_ids, p_wts, s);
+        CK(cudaMemcpyAsync(pf_ids, p_ids, kPred * sizeof(int32_t), cudaMemcpyDeviceToHost, s));
         CK(cudaEventRecord(ev_pred, s));
     }
     // Prefetch reads into RAM (reader jobs kK..2kK-1) land in the background: a layer waits only for the ones it
@@ -973,14 +983,14 @@ struct Engine {
         predict = std::getenv("GLM_PREDICT") != nullptr;
         prefetch = prefetch && tiered && lru && !predict;
         if (!predict && !prefetch) return;
-        CK(cudaMallocHost(&pf_ids, kK * sizeof(int32_t)));
+        CK(cudaMallocHost(&pf_ids, kPred * sizeof(int32_t)));
         CK(cudaEventCreateWithFlags(&ev_pred, cudaEventDisableTiming));
         CK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
         CK(cudaEventCreateWithFlags(&ev_cur, cudaEventDisableTiming));
         CK(cudaEventCreateWithFlags(&ev_pf, cudaEventDisableTiming));
         auto buf = [&](size_t n) { float* q = nullptr; CK(cudaMalloc(&q, n * sizeof(float))); return q; };
-        p_mix = buf(32); p_x = buf(kEmbd); p_xn = buf(kEmbd); p_post = buf(4); p_comb = buf(16); p_log = buf(kNE); p_wts = buf(kK);
-        CK(cudaMalloc(&p_ids, kK * sizeof(int32_t)));
+        p_mix = buf(32); p_x = buf(kEmbd); p_xn = buf(kEmbd); p_post = buf(4); p_comb = buf(16); p_log = buf(kNE); p_wts = buf(kPred);
+        CK(cudaMalloc(&p_ids, kPred * sizeof(int32_t)));
     }
     void predict_layer(int v, int l) {   // layer l's experts from the current streams, into pred[v][l]
         using namespace glm;
@@ -1058,6 +1068,7 @@ struct Engine {
             std::exit(1);
         }
         CK(cudaStreamCreateWithFlags(&xs, cudaStreamNonBlocking));
+        CK(cudaStreamCreateWithFlags(&xp, cudaStreamNonBlocking));
         CK(cudaEventCreateWithFlags(&ev_xs, cudaEventDisableTiming));
         CK(cudaEventCreateWithFlags(&ev_pfc, cudaEventDisableTiming));
         CK(cudaMallocHost(&gqa_host, (size_t) kMoe * kK * sizeof(unsigned long long)));
@@ -2036,6 +2047,10 @@ struct Engine {
                 }
                 int32_t sl = vlru.tail;
                 while (sl >= 0 && slot_pair[(size_t) sl] >= 0 && in_sel(slot_pair[(size_t) sl])) sl = vlru.prev[(size_t) sl];
+                if ((size_t) sl < spec_slot.size() && spec_slot[(size_t) sl]) {   // a speculative copy may still write it
+                    CK(cudaStreamWaitEvent(xs, ev_pfc, 0));
+                    std::fill(spec_slot.begin(), spec_slot.end(), 0);
+                }
                 const int32_t vv = slot_pair[(size_t) sl];
                 if (excl && vv >= 0 && !tier.has_copy(vv / kNE, vv % kNE)) {   // write it back before the slot is reused
                     if (tier.spares() == 0) {
@@ -2070,12 +2085,14 @@ struct Engine {
                     if (res[(size_t) q] >= 0 || !tier.has_copy(mn, pf_ids[i])) continue;
                     pf_vrank[pf_vn] = i;
                     const int32_t sl = vram_slot(q);
-                    CK(cudaMemcpyAsync(vslot[(size_t) sl], tier.stable_blob(mn, pf_ids[i]), XL.bytes, cudaMemcpyHostToDevice, xs));
+                    CK(cudaMemcpyAsync(vslot[(size_t) sl], tier.stable_blob(mn, pf_ids[i]), XL.bytes, cudaMemcpyHostToDevice, xp));
+                    if (spec_slot.size() < vslot.size()) spec_slot.resize(vslot.size(), 0);
+                    spec_slot[(size_t) sl] = 1;
                     rlru.touch(q);
                     pf_vpair[pf_vn++] = q;
                     ++pf_copies;
                 }
-                if (pf_vn > 0) { CK(cudaEventRecord(ev_pfc, xs)); pfc_pending = true; }
+                if (pf_vn > 0) { CK(cudaEventRecord(ev_pfc, xp)); pfc_pending = true; }
             };
             bool done[kK] = {};
             uint8_t* dslot[kK] = {};
@@ -2143,6 +2160,15 @@ struct Engine {
                 reader.start(j, strata::kernels::cpu::expert_layout().blob_offset(m, hid[j]), XL.bytes, d);
                 dslot[j] = d;
             }
+            if (pf_hist_ok[m]) {   // the disk reads this layer waits for: where the prediction had them
+                for (int j = 0; j < kK; ++j) {
+                    if (dslot[j] == nullptr) continue;
+                    int r = kPred;
+                    for (int i = 0; i < kPred; ++i) if (pf_hist[m][i] == hid[j]) { r = i; break; }
+                    ++miss_rank[r];
+                }
+                pf_hist_ok[m] = false;
+            }
             // the CPU's share of the RAM hits, computed from the tier while the GPU copies its own
             int ncpu = 0, cj[kK];
             if (cpu_share > 0 && cpux.ready()) {
@@ -2185,8 +2211,12 @@ struct Engine {
             if (pf) {
                 CK(cudaEventSynchronize(ev_pred));
                 const int mn = m + 1;
+                std::memcpy(pf_hist[mn], pf_ids, sizeof(pf_hist[mn]));
+                pf_hist_ok[mn] = true;
                 bool waits = false;
-                for (int j = 0; j < kK; ++j) waits |= dslot[j] != nullptr || pfj[j] >= 0 || spj[j] >= 0;
+                for (int j = 0; j < kK; ++j)   // a read still in flight: the copy engine would idle meanwhile
+                    waits |= dslot[j] != nullptr || (pfj[j] >= 0 && !reader.done(kK + pfj[j])) ||
+                             (spj[j] >= 0 && !reader.done(kSpoolJob0 + spj[j]));
                 if (waits) pf_copy();
 
                 for (int i = 0; i < pf_read_max && pf_n < kK; ++i) {
@@ -2429,6 +2459,11 @@ struct Engine {
         rmsnorm(x, final_norm, kEps, xn, kEmbd, 1, s);
         gemv(lm_head, xn, logits, kVocab, kEmbd, 1, s);
         CK(cudaStreamSynchronize(s));
+        if (xp && pfc_pending) {   // nothing of this token's speculation is in flight past it
+            CK(cudaStreamSynchronize(xp));
+            pfc_pending = false;
+            std::fill(spec_slot.begin(), spec_slot.end(), 0);
+        }
     }
 };
 
@@ -2553,7 +2588,7 @@ int main(int argc, char** argv) {
     e.pf_copy_max = std::min(pf_copies, kK);
     e.pf_stage = pf_stage_on;
     e.ram_freq = !ram_lru;
-    e.pf_read_max = std::min(pf_reads, kK);
+    e.pf_read_max = std::min(pf_reads, Engine::kPred);
     e.load(pack);
     std::vector<Engine::Route> routes;
     if (!routes_path.empty()) e.routes = &routes;
@@ -2678,6 +2713,16 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata-glm: prediction %s: %.1f%% of the routed experts, %.1f%% of those outside VRAM\n",
                          v ? "(B) after layer l" : "(A) at layer l's router", 100.0 * e.pred_hit[v] / std::max(1LL, e.pred_n[v]),
                          100.0 * e.pred_miss_hit[v] / std::max(1LL, e.pred_miss_n[v]));
+    {
+        long long tot = 0;
+        for (long long v : e.miss_rank) tot += v;
+        if (tot > 0) {
+            auto pct = [&](int a0, int a1) { long long n = 0; for (int i = a0; i < a1; ++i) n += e.miss_rank[i]; return 100.0 * n / tot; };
+            std::fprintf(stderr, "strata-glm: disk reads waited for (%lld), by predicted rank: 0-5 %.0f%%, 6-7 %.0f%%, 8-11 %.0f%%, "
+                                 "12-15 %.0f%%, not in the top 16 %.0f%%\n", tot, pct(0, 6), pct(6, 8), pct(8, 12), pct(12, 16),
+                         pct(16, 17));
+        }
+    }
     if (e.timing && e.tm.tokens > 0) {
         const double n = (double) e.tm.tokens, tok = 1e3 * e.tm.tok_s / n;
         std::fprintf(stderr, "strata-glm: a decode token %.1f ms: expert copies (with the disk waits) %.1f, expert kernels "
