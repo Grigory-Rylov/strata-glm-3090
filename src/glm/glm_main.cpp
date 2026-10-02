@@ -31,6 +31,12 @@
 #endif
 #include <windows.h>
 #endif
+#if !defined(_WIN32)
+#include <cstdio>
+#include <sys/types.h>
+// 408032gb: _fseeki64 is MSVC's; on Linux (64-bit off_t) fseeko is the same 64-bit seek
+#define _fseeki64(f, off, whence) fseeko((f), (off_t) (off), (whence))
+#endif
 
 #include <algorithm>
 #include <atomic>
