@@ -1457,7 +1457,7 @@ int main(int argc, char** argv) {
 #if defined(_WIN32)
         const bool small = installed > 0 && installed < (96ull << 30) && need + (16ull << 30) > installed;
 #else
-        const bool small = false;   // the tier's loader is Windows-only for now
+        const bool small = false;   // the loader is cross-platform since patch 0004; the <96 GiB heuristic stays validated on Windows only
 #endif
         if (o.low_ram == 1 && !can) {
             std::fprintf(stderr, "strata generate: --low-ram needs one GPU, an --expert-profile, the pack's experts.bin "

@@ -70,12 +70,14 @@
 |---|---|---|
 | единый движок, `--chunk 0` | 40 tok / 34.4 s = 1.16 tok/s | 16 tok / 14.0 s = **1.15 tok/s** |
 | 4 стадии на одной карте | 40 tok / 37.4 s = 1.07 tok/s | 8 tok / 6.9 s = **1.17 tok/s** |
-| **ярус RAM (патч 0004), `--profile`** | — | 24 tok / 1.22 s = **19.65 tok/s** |
+| **ярус RAM (патч 0004), `--profile`** | 40 tok / 2.63 s = 15.23 tok/s | 24 tok / 1.22 s = **19.65 tok/s** |
 
 Механика disk-only: на токен decode читается 42×8×14 155 792 B = **4.76 GB** (fread из page cache + H2D,
 сериализовано sync-ом на слой) → эффективные ~5.5 GB/s — потолок disk-only конвейера, не модель.
 Ярусный путь (замер GLM_TIMING, `glm-synthetic/tiered.log`): токен 49.4 мс = expert copies 13.0 + expert
-kernels 0.4 + остальное (dense, роутеры, sync) 36.1 мс; prefetch 100% попаданий, disk waits 0.0 мс.
+kernels 0.4 + остальное (dense, роутеры, sync) 36.1 мс; prefetch 100% попаданий, disk waits 0.0 мс,
+экспертов с карты 99.2% (RAM->GPU 0.8%, disk 0.0%). MAP_HUGETLB на машине не настроен — ярус на 4 KB
+страницах, на регистрацию не повлияло (43/43 slice pinned).
 Потолок сместился с дисковой полосы на dense-вычисления — на реальных весах dense те же, оценка скорости
 переносима. Ориентиры: upstream на 5090 с ярусами — 18 tok/s decode (README); ik_llama.cpp (GGUF Q4_K_XL)
 на этой машине — tg 7–15 tok/s (`../408032gb/PROBLEMS.md`).
