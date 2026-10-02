@@ -32,6 +32,7 @@
 #endif
 #include <windows.h>
 #else
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -1369,6 +1370,22 @@ namespace {
 constexpr uint64_t kSector = 4096;   // unbuffered reads: offset, length and buffer 4 KiB-aligned
 
 #if defined(_WIN32)
+using FileHandle = HANDLE;
+const FileHandle kInvalidFile = INVALID_HANDLE_VALUE;
+void close_handle(FileHandle h) { CloseHandle(h); }
+// UTF-8 path -> UTF-16, as FileExpertSource::open does (CreateFileA would take the ANSI code page)
+HANDLE open_path(const std::string& path, DWORD flags) {
+    const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    if (wide <= 0) return INVALID_HANDLE_VALUE;
+    std::vector<wchar_t> w((size_t) wide);
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, w.data(), wide);
+    return CreateFileW(w.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr);
+}
+HANDLE open_unbuffered(const std::string& path) {
+    return open_path(path, FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN);
+}
+// buffered, for the cold experts of reader_loop: no RANDOM_ACCESS, it lets the cache drop them (open())
+HANDLE open_buffered(const std::string& path) { return open_path(path, FILE_ATTRIBUTE_NORMAL); }
 // One blob, read unbuffered into `dst` (4 KiB-aligned, `off % 4096 + bytes` rounded up to 4 KiB long at least):
 // the blob starts at dst + off % 4096.
 bool read_blob_window(HANDLE h, uint64_t off, uint64_t bytes, uint8_t* dst) {
@@ -1380,16 +1397,51 @@ bool read_blob_window(HANDLE h, uint64_t off, uint64_t bytes, uint8_t* dst) {
     // the window may run past the end of the file: only the blob itself has to arrive
     return ReadFile(h, dst, (DWORD) (a1 - a0), &got, &ov) && (uint64_t) got >= off - a0 + bytes;
 }
-// UTF-8 path -> UTF-16, as FileExpertSource::open does (CreateFileA would take the ANSI code page)
-HANDLE open_path(const std::string& path, DWORD flags) {
-    const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-    if (wide <= 0) return INVALID_HANDLE_VALUE;
-    std::vector<wchar_t> w((size_t) wide);
-    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, w.data(), wide);
-    return CreateFileW(w.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, flags, nullptr);
+// One whole blob at its own offset, buffered (the reader threads): no alignment, the whole blob or nothing
+bool read_exact(HANDLE h, uint64_t off, void* dst, uint64_t bytes) {
+    OVERLAPPED ov{};
+    ov.Offset = (DWORD) off;
+    ov.OffsetHigh = (DWORD) (off >> 32);
+    DWORD got = 0;
+    return ReadFile(h, dst, (DWORD) bytes, &got, &ov) && (uint64_t) got == bytes;
 }
-HANDLE open_unbuffered(const std::string& path) {
-    return open_path(path, FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN);
+#else
+using FileHandle = int;
+constexpr FileHandle kInvalidFile = -1;
+void close_handle(FileHandle h) { ::close(h); }
+// O_RDONLY|O_DIRECT: unbuffered like FILE_FLAG_NO_BUFFERING (offset, length and buffer 4 KiB-aligned).
+// A filesystem that refuses O_DIRECT (EINVAL at open) gets the buffered fd; the window semantics hold either way.
+FileHandle open_unbuffered(const std::string& path) {
+    int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+    if (fd < 0 && errno == EINVAL) fd = ::open(path.c_str(), O_RDONLY);
+    return fd;
+}
+FileHandle open_buffered(const std::string& path) { return ::open(path.c_str(), O_RDONLY); }
+// One blob, read into `dst` (4 KiB-aligned, `off % 4096 + bytes` rounded up to 4 KiB long at least):
+// the blob starts at dst + off % 4096.
+bool read_blob_window(FileHandle fd, uint64_t off, uint64_t bytes, uint8_t* dst) {
+    const uint64_t a0 = off / kSector * kSector, a1 = (off + bytes + kSector - 1) / kSector * kSector;
+    uint64_t got = 0;
+    while (got < a1 - a0) {
+        const ssize_t r = ::pread(fd, dst + got, (size_t) (a1 - a0 - got), (off_t) (a0 + got));
+        if (r > 0) { got += (uint64_t) r; continue; }
+        if (r == 0) break;                 // end of file: the window may run past it
+        if (errno != EINTR) return false;  // EINTR: the same pread again
+    }
+    // the window may run past the end of the file: only the blob itself has to arrive
+    return got >= off - a0 + bytes;
+}
+// One whole blob at its own offset, buffered (the reader threads): short reads are retried until it is whole
+bool read_exact(FileHandle fd, uint64_t off, void* dst, uint64_t bytes) {
+    uint8_t* p = (uint8_t*) dst;
+    uint64_t got = 0;
+    while (got < bytes) {
+        const ssize_t r = ::pread(fd, p + got, (size_t) (bytes - got), (off_t) (off + got));
+        if (r > 0) { got += (uint64_t) r; continue; }
+        if (r == 0) return false;          // end of file mid-blob
+        if (errno != EINTR) return false;
+    }
+    return true;
 }
 #endif
 }  // namespace
@@ -1461,7 +1513,6 @@ uint64_t TieredExpertSource::file_offset(int64_t layer, int64_t expert) const {
 
 bool TieredExpertSource::load(const std::vector<std::pair<int32_t, int32_t>>& order, uint64_t budget_bytes,
                               int64_t spare, int threads, std::string& err) {
-#if defined(_WIN32)
     if (!file_.mapped()) { err = "TieredExpertSource: open the pack first"; return false; }
     if (arena_ != nullptr) { err = "TieredExpertSource: the tier is loaded already"; return false; }
     const auto t0 = std::chrono::steady_clock::now();
@@ -1507,8 +1558,8 @@ bool TieredExpertSource::load(const std::vector<std::pair<int32_t, int32_t>>& or
     std::mutex bad_mu;
     const auto& lay = strata::kernels::cpu::expert_layout();
     auto worker = [&] {
-        HANDLE h = open_unbuffered(path_);
-        if (h == INVALID_HANDLE_VALUE) {
+        FileHandle h = open_unbuffered(path_);
+        if (h == kInvalidFile) {
             std::lock_guard<std::mutex> g(bad_mu);
             bad_msg = "cannot open " + path_ + " unbuffered";
             bad = true;
@@ -1528,7 +1579,7 @@ bool TieredExpertSource::load(const std::vector<std::pair<int32_t, int32_t>>& or
             host_[idx(p.first, p.second)] = dst + off % kSector;
             slot_of_[idx(p.first, p.second)] = (int32_t) s;
         }
-        CloseHandle(h);
+        close_handle(h);
     };
     std::vector<std::thread> pool;
     for (int t = 1; t < std::max(1, threads); ++t) pool.emplace_back(worker);
@@ -1586,17 +1637,11 @@ bool TieredExpertSource::load(const std::vector<std::pair<int32_t, int32_t>>& or
                   a->note.c_str());
     note_ = m;
     return true;
-#else
-    (void) order; (void) budget_bytes; (void) spare; (void) threads;
-    err = "TieredExpertSource: the low-RAM tier is Windows-only for now";
-    return false;
-#endif
 }
 
 bool TieredExpertSource::stream(const std::vector<std::pair<int32_t, int32_t>>& pairs,
                                 const std::function<bool(size_t, const uint8_t*)>& sink, int threads,
                                 std::string& err) {
-#if defined(_WIN32)
     if (pairs.empty()) return true;
     threads = std::max(1, threads);
     const int ring = 4 * threads;
@@ -1607,10 +1652,10 @@ bool TieredExpertSource::stream(const std::vector<std::pair<int32_t, int32_t>>& 
         return false;
     }
     const auto& lay = strata::kernels::cpu::expert_layout();
-    std::vector<HANDLE> hs;
+    std::vector<FileHandle> hs;
     for (int t = 0; t < threads; ++t) {
-        HANDLE h = open_unbuffered(path_);
-        if (h == INVALID_HANDLE_VALUE) break;
+        FileHandle h = open_unbuffered(path_);
+        if (h == kInvalidFile) break;
         hs.push_back(h);
     }
     bool ok = !hs.empty();
@@ -1645,21 +1690,15 @@ bool TieredExpertSource::stream(const std::vector<std::pair<int32_t, int32_t>>& 
     }
     if (!ok) bad = true;   // a failed sink stops the readers too
     for (auto& x : th) x.join();
-    for (HANDLE h : hs) CloseHandle(h);
+    for (FileHandle h : hs) close_handle(h);
     cudaFreeHost(buf);
     return ok;
-#else
-    (void) pairs; (void) sink; (void) threads;
-    err = "TieredExpertSource: streaming is Windows-only for now";
-    return false;
-#endif
 }
 
 void TieredExpertSource::reader_loop() {
-#if defined(_WIN32)
     // buffered, unlike the bulk reads: the few cold experts a token needs are read again and again, and the OS
     // cache keeps them in RAM nobody else wants (standby pages, handed back on demand) - not in this process
-    HANDLE h = open_path(path_, FILE_ATTRIBUTE_NORMAL);   // no RANDOM_ACCESS: it lets the cache drop them (open())
+    FileHandle h = open_buffered(path_);
     const auto& lay = strata::kernels::cpu::expert_layout();
     for (;;) {
         int b = -1;
@@ -1672,19 +1711,13 @@ void TieredExpertSource::reader_loop() {
         }
         const int32_t i = scratch_pair_[(size_t) b];
         const int64_t l = i / n_expert_, e = i % n_expert_;
-        const uint64_t off = file_offset(l, e);
-        OVERLAPPED ov{};
-        ov.Offset = (DWORD) off;
-        ov.OffsetHigh = (DWORD) (off >> 32);
-        DWORD got = 0;
-        const DWORD n = (DWORD) lay.blob_bytes(l);
-        const bool ok = h != INVALID_HANDLE_VALUE && ReadFile(h, scratch_ + (size_t) b * stride_, n, &got, &ov) && got == n;
+        const bool ok = h != kInvalidFile && read_exact(h, file_offset(l, e), scratch_ + (size_t) b * stride_,
+                                                        lay.blob_bytes(l));
         scratch_pad_[(size_t) b] = 0;
         scratch_state_[b].store(ok ? 1 : -1, std::memory_order_release);
         scratch_busy_.fetch_sub(1, std::memory_order_acq_rel);
     }
-    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
-#endif
+    if (h != kInvalidFile) close_handle(h);
 }
 
 const uint8_t* TieredExpertSource::stable_blob(int64_t layer, int64_t expert) {
@@ -1725,6 +1758,9 @@ void TieredExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t 
         const uintptr_t a = (uintptr_t) p / kSector * kSector;
         VirtualUnlock((LPVOID) a, (SIZE_T) ((uintptr_t) p + n - a));
     }
+#else
+    // Linux: nothing to hand back - the page cache drops those cold file pages by itself when RAM is wanted,
+    // and MADV_DONTNEED would only make the next read of them go to the NVMe again.
 #endif
     handed_.clear();
     if (scratch_ == nullptr || ids == nullptr) return;
@@ -1757,18 +1793,17 @@ void TieredExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t 
 }
 
 bool TieredExpertSource::read_blob(int64_t layer, int64_t expert, uint8_t* dst, size_t cap, size_t& pad) {
-#if defined(_WIN32)
     if (layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_ || host_[idx(layer, expert)] != nullptr ||
         cap < stride_ || ((uintptr_t) dst % kSector) != 0)
         return false;
     // one unbuffered handle per thread (the stager's and the refill's threads call this concurrently)
-    thread_local HANDLE h = INVALID_HANDLE_VALUE;
+    thread_local FileHandle h = kInvalidFile;
     thread_local std::string h_path;
-    if (h == INVALID_HANDLE_VALUE || h_path != path_) {
-        if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    if (h == kInvalidFile || h_path != path_) {
+        if (h != kInvalidFile) close_handle(h);
         h = open_unbuffered(path_);
         h_path = path_;
-        if (h == INVALID_HANDLE_VALUE) return false;
+        if (h == kInvalidFile) return false;
     }
     const uint64_t off = file_offset(layer, expert);
     if (!read_blob_window(h, off, strata::kernels::cpu::expert_layout().blob_bytes(layer), dst)) return false;
@@ -1776,10 +1811,6 @@ bool TieredExpertSource::read_blob(int64_t layer, int64_t expert, uint8_t* dst, 
     ++reads_;
     ++file_reads_;
     return true;
-#else
-    (void) layer; (void) expert; (void) dst; (void) cap; (void) pad;
-    return false;
-#endif
 }
 
 bool TieredExpertSource::pinned(int64_t layer, int64_t expert) const {
@@ -1872,7 +1903,6 @@ void TieredExpertSource::rerank(std::vector<int32_t> rank) {
 
 int64_t TieredExpertSource::admit_from_file(const std::vector<std::pair<int32_t, int32_t>>& pairs, int threads,
                                             std::string& err) {
-#if defined(_WIN32)
     // the slots first (demote_begin is not thread-safe), then the reads in parallel straight into them
     std::vector<std::pair<int32_t, int32_t>> go;
     std::vector<uint8_t*> dst;
@@ -1888,11 +1918,11 @@ int64_t TieredExpertSource::admit_from_file(const std::vector<std::pair<int32_t,
     std::vector<uint8_t> ok(go.size(), 0);
     std::atomic<size_t> next{0};
     auto worker = [&] {
-        HANDLE h = open_unbuffered(path_);
-        if (h == INVALID_HANDLE_VALUE) return;
+        FileHandle h = open_unbuffered(path_);
+        if (h == kInvalidFile) return;
         for (size_t j; (j = next.fetch_add(1)) < go.size();)
             ok[j] = read_blob_window(h, file_offset(go[j].first, go[j].second), lay.blob_bytes(go[j].first), dst[j]) ? 1 : 0;
-        CloseHandle(h);
+        close_handle(h);
     };
     std::vector<std::thread> pool;
     for (int t = 1; t < std::max(1, threads); ++t) pool.emplace_back(worker);
@@ -1909,11 +1939,6 @@ int64_t TieredExpertSource::admit_from_file(const std::vector<std::pair<int32_t,
     }
     if (n < (int64_t) go.size()) err = "TieredExpertSource: " + std::to_string(go.size() - (size_t) n) + " reads failed";
     return n;
-#else
-    (void) pairs; (void) threads;
-    err = "TieredExpertSource: the low-RAM tier is Windows-only for now";
-    return 0;
-#endif
 }
 
 }  // namespace strata::core
