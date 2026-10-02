@@ -32,8 +32,13 @@
 #include <windows.h>
 #endif
 #if !defined(_WIN32)
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 // 408032gb: _fseeki64 is MSVC's; on Linux (64-bit off_t) fseeko is the same 64-bit seek
 #define _fseeki64(f, off, whence) fseeko((f), (off_t) (off), (whence))
 #endif
@@ -80,9 +85,16 @@ public:
         for (int i = 0; i < kJobs; ++i) { left_[i].store(0); bad_[i].store(0); }
         if (const char* e = std::getenv("GLM_LOW_INFLIGHT")) low_max_ = std::max(1, std::atoi(e));
         return nd_ > 0;
-#else
-        (void) paths; (void) gbps; (void) threads;
-        return false;
+#else   // 408032gb: Linux - O_DIRECT pread per drive thread (the Windows path's unbuffered ReadFile)
+        nd_ = (int) std::min<size_t>(paths.size(), kDrives);
+        for (int d = 0; d < nd_; ++d) {
+            upath_[d] = paths[(size_t) d];
+            gbps_[d] = d < (int) gbps.size() ? gbps[(size_t) d] : 1.0;
+            for (int t = 0; t < threads; ++t) th_.emplace_back([this, d] { loop(d); });
+        }
+        for (int i = 0; i < kJobs; ++i) { left_[i].store(0); bad_[i].store(0); }
+        if (const char* e = std::getenv("GLM_LOW_INFLIGHT")) low_max_ = std::max(1, std::atoi(e));
+        return nd_ > 0;
 #endif
     }
     /// high: a read the current layer waits for (served before every low-priority prefetch piece)
@@ -185,9 +197,60 @@ private:
             left_[p.job].fetch_sub(1, std::memory_order_acq_rel);
         }
         if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+#else
+        const int fdd = ::open(upath_[d].c_str(), O_RDONLY | O_DIRECT);   // unbuffered, like FILE_FLAG_NO_BUFFERING
+        const int fdb = ::open(upath_[d].c_str(), O_RDONLY);              // fallback when a destination is not aligned
+        struct stat st{};
+        const uint64_t fsz = fdb >= 0 && ::fstat(fdb, &st) == 0 ? (uint64_t) st.st_size : 0;
+        if (fdb < 0) std::fprintf(stderr, "strata-glm: cannot open %s: %s\n", upath_[d].c_str(), std::strerror(errno));
+        for (;;) {
+            Piece p{};
+            bool low = false;
+            {
+                std::unique_lock<std::mutex> g(mu_);
+                cv_[d].wait(g, [&] { return quit_ || !q_[d].empty() || (!lq_[d].empty() && low_fly_[d] < low_max_); });
+                if (quit_) break;
+                low = q_[d].empty();
+                auto& q = low ? lq_[d] : q_[d];
+                p = q.front();
+                q.pop_front();
+                (low ? lqb_[d] : hq_[d]) -= p.len;
+                fly_[d] += p.len;
+                if (low) ++low_fly_[d];
+            }
+            // the last blob's aligned window runs past the end of the file: only the bytes up to it must arrive
+            const uint64_t need = std::min<uint64_t>(p.len, fsz > p.off ? fsz - p.off : 0);
+            uint64_t got = 0;
+            int err = 0;
+            for (int fd = fdd >= 0 ? fdd : fdb; fd >= 0 && got < need;) {
+                const ssize_t r = ::pread(fd, p.dst + got, (size_t) (p.len - got), (off_t) (p.off + got));
+                if (r > 0) { got += (uint64_t) r; continue; }
+                if (r == 0) break;                                           // end of file
+                if (errno == EINTR) continue;
+                if (errno == EINVAL && fd == fdd && fdb >= 0) { fd = fdb; continue; }   // O_DIRECT refused: buffered
+                err = errno;
+                break;
+            }
+            const bool ok = got >= need && need > 0;
+            if (!ok) {
+                bad_[p.job].store(1);
+                std::fprintf(stderr, "strata-glm: read of %u bytes at %llu (drive %d) failed: got %llu, %s\n", p.len,
+                             (unsigned long long) p.off, d, (unsigned long long) got, err ? std::strerror(err) : "short read");
+            }
+            {
+                std::lock_guard<std::mutex> g(mu_);
+                fly_[d] -= p.len;
+                if (low) --low_fly_[d];
+            }
+            if (low) cv_[d].notify_one();
+            left_[p.job].fetch_sub(1, std::memory_order_acq_rel);
+        }
+        if (fdd >= 0) ::close(fdd);
+        if (fdb >= 0) ::close(fdb);
 #endif
     }
     int nd_ = 0;
+    std::string upath_[kDrives];   // 408032gb: the Linux paths
     std::wstring path_[kDrives];
     double gbps_[kDrives] = {};
     long long hq_[kDrives] = {}, lqb_[kDrives] = {}, fly_[kDrives] = {};   // bytes queued high / low, in flight (mu_)
