@@ -405,6 +405,11 @@ struct Layer {
 struct Engine {
     Checkpoint ck;
     std::vector<Layer> L;
+    // 408032gb (G4): this engine runs layers [lo, hi) - one stage of a layer pipeline; 0..kLayers is the whole model.
+    // A stage loads only its layers, its tiers hold only its experts, it reads its input streams from `streams` /
+    // `c_streams` when lo > 0 and leaves them there for the next stage when hi < kLayers (no head then).
+    int lo = 0, hi = kLayers;
+    bool own_moe(int m) const { const int l = m + kDenseLead; return l >= lo && l < hi; }
     glm::bf16* final_norm = nullptr;
     glm::Mat lm_head;
     // --dense-bf16: keep the checkpoint's BF16; default: FP8 E4M3 with a scale per row, quantized here once
@@ -1000,7 +1005,7 @@ struct Engine {
     }
     void predict_layer(int v, int l) {   // layer l's experts from the current streams, into pred[v][l]
         using namespace glm;
-        if (!predict || l >= kLayers || l < kDenseLead) return;
+        if (!predict || l >= hi || l < kDenseLead) return;   // l >= hi: the next stage's layer
         Layer& ly = L[(size_t) l];
         hc_mix(ly.hc_ffn_fn, streams, p_mixp, 24, kHc * kEmbd, kMixParts, s);
         hc_pre_finish(streams, p_mixp, ly.hc_ffn_base, ly.hc_ffn_scale, kEmbd, kEps, kHcEps, kSinkhorn, p_x, p_post, p_comb, s,
@@ -1073,6 +1078,10 @@ struct Engine {
             std::fprintf(stderr, "strata-glm: %s\n", err.c_str());
             std::exit(1);
         }
+        // 408032gb: a stage ranks and holds only its own layers' experts
+        profile.erase(std::remove_if(profile.begin(), profile.end(),
+                                     [&](const std::pair<int32_t, int32_t>& q) { return !own_moe(q.first); }),
+                      profile.end());
         CK(cudaStreamCreateWithFlags(&xs, cudaStreamNonBlocking));
         CK(cudaStreamCreateWithFlags(&xp, cudaStreamNonBlocking));
         CK(cudaEventCreateWithFlags(&ev_xs, cudaEventDisableTiming));
@@ -1167,6 +1176,8 @@ struct Engine {
         std::vector<int32_t> order(np);
         for (size_t i = 0; i < np; ++i) order[i] = (int32_t) i;
         std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {   // hotter; then where it is (no churn); prior
+            const bool oa = own_moe(a / kNE), ob = own_moe(b / kNE);       // 408032gb: this stage's experts first
+            if (oa != ob) return oa;
             if (heat[(size_t) a] != heat[(size_t) b]) return heat[(size_t) a] > heat[(size_t) b];
             const int ta = tier_of(a), tb = tier_of(b);
             if (ta != tb) return ta < tb;
@@ -1197,7 +1208,7 @@ struct Engine {
             }
         }
         std::vector<int32_t> in, out;   // out: slots - the empty ones, then those of the coldest residents
-        for (size_t i = 0; i < nv; ++i) if (res[(size_t) order[i]] < 0) in.push_back(order[i]);
+        for (size_t i = 0; i < nv; ++i) if (res[(size_t) order[i]] < 0 && own_moe(order[i] / kNE)) in.push_back(order[i]);
         for (size_t sl = 0; sl < nv; ++sl) if (slot_pair[sl] < 0) out.push_back((int32_t) sl);
         for (size_t i = np; i-- > nv;) if (res[(size_t) order[i]] >= 0) out.push_back(res[(size_t) order[i]]);
         const size_t moves = std::min<size_t>({in.size(), out.size(), (size_t) std::max(0LL, max_vram)});
@@ -1252,6 +1263,7 @@ struct Engine {
         const size_t cap = (size_t) tier.tier_slots(), r0 = lru && !excl ? 0 : nv;
         for (size_t i = r0, held = 0; i < np && held < cap && (long long) want.size() < max_ram; ++i) {
             const int32_t p = order[i];
+            if (!own_moe(p / kNE)) break;   // own pairs come first in `order`: the rest belong to other stages
             if (res[(size_t) p] >= 0 && is_static(res[(size_t) p])) continue;
             ++held;
             if (((lru && !excl) || res[(size_t) p] < 0) && !tier.has_copy(p / kNE, p % kNE)) want.emplace_back(p / kNE, p % kNE);
@@ -1799,15 +1811,17 @@ struct Engine {
         using namespace glm;
         heat_tokens += T;
         ic_prepare(pos0, T);
-        for (int t = 0; t < T; ++t)
-            CK(cudaMemcpyAsync(c_emb + (size_t) t * kEmbd, embed.data() + (size_t) toks[t] * kEmbd, kEmbd * sizeof(bf16),
-                               cudaMemcpyHostToDevice, s));
-        bf16_to_f32(c_emb, c_x, T * kEmbd, s);
-        for (int t = 0; t < T; ++t)
-            for (int j = 0; j < kHc; ++j)
-                CK(cudaMemcpyAsync(c_streams + ((size_t) t * kHc + j) * kEmbd, c_x + (size_t) t * kEmbd, kEmbd * sizeof(float),
-                                   cudaMemcpyDeviceToDevice, s));
-        for (int l = 0; l < kLayers; ++l) {
+        if (lo == 0) {   // a later stage finds its input streams in c_streams (copied there by the driver)
+            for (int t = 0; t < T; ++t)
+                CK(cudaMemcpyAsync(c_emb + (size_t) t * kEmbd, embed.data() + (size_t) toks[t] * kEmbd, kEmbd * sizeof(bf16),
+                                   cudaMemcpyHostToDevice, s));
+            bf16_to_f32(c_emb, c_x, T * kEmbd, s);
+            for (int t = 0; t < T; ++t)
+                for (int j = 0; j < kHc; ++j)
+                    CK(cudaMemcpyAsync(c_streams + ((size_t) t * kHc + j) * kEmbd, c_x + (size_t) t * kEmbd, kEmbd * sizeof(float),
+                                       cudaMemcpyDeviceToDevice, s));
+        }
+        for (int l = lo; l < hi; ++l) {
             Layer& ly = L[(size_t) l];
             static const bool no_stream = std::getenv("GLM_NO_STREAM") != nullptr;
             if (l >= kDenseLead && T >= kStreamMin && prompt_mmq && !no_stream) prestage(l - kDenseLead);
@@ -1831,10 +1845,12 @@ struct Engine {
                 if (std::FILE* f = std::fopen((dump_dir + name).c_str(), "wb")) { std::fwrite(h.data(), 4, h.size(), f); std::fclose(f); }
             }
         }
-        hc_mean(c_streams + (size_t) (T - 1) * kHc * kEmbd, x, kEmbd, s);
-        rmsnorm(x, final_norm, kEps, xn, kEmbd, 1, s);
-        gemv(lm_head, xn, logits, kVocab, kEmbd, 1, s);
-        CK(cudaStreamSynchronize(s));
+        if (hi == kLayers) {
+            hc_mean(c_streams + (size_t) (T - 1) * kHc * kEmbd, x, kEmbd, s);
+            rmsnorm(x, final_norm, kEps, xn, kEmbd, 1, s);
+            gemv(lm_head, xn, logits, kVocab, kEmbd, 1, s);
+        }
+        CK(cudaStreamSynchronize(s));   // the driver copies c_streams on to the next stage after this
     }
 
     void load(const std::string& pack) {
@@ -1843,7 +1859,7 @@ struct Engine {
         if (!ck.open(pack, err)) { std::fprintf(stderr, "strata-glm: %s\n", err.c_str()); std::exit(1); }
         const auto t0 = std::chrono::steady_clock::now();
         L.resize(kLayers);
-        for (int l = 0; l < kLayers; ++l) {
+        for (int l = lo; l < hi; ++l) {
             Layer& y = L[(size_t) l];
             const std::string p = "model.language_model.layers." + std::to_string(l) + ".";
             y.hc_attn_fn = ck.bf(p + "hc_attn_fn"); y.hc_attn_base = ck.bf(p + "hc_attn_base"); y.hc_attn_scale = ck.bf(p + "hc_attn_scale");
@@ -1888,10 +1904,12 @@ struct Engine {
                 y.sd = mat(m + "shared_experts.down_proj.weight", fp4_shared);
             }
         }
-        final_norm = ck.bf("model.language_model.norm.weight");
-        lm_head = mat("lm_head.weight", fp4_head);
+        if (hi == kLayers) {   // the last stage owns the head
+            final_norm = ck.bf("model.language_model.norm.weight");
+            lm_head = mat("lm_head.weight", fp4_head);
+        }
         if (fp4_saved) std::fprintf(stderr, "strata-glm: dense NVFP4 saves %.2f GB of VRAM\n", fp4_saved / 1e9);
-        {
+        if (lo == 0) {   // the first stage owns the embedding
             const auto b = ck.read("model.language_model.embed_tokens.weight");
             embed.resize(b.size() / 2);
             std::memcpy(embed.data(), b.data(), b.size());
@@ -2018,7 +2036,7 @@ struct Engine {
         if (skip_disk > 0 || skip_ram > 0) CK(cudaMemcpyAsync(wts_pin, wts, kK * sizeof(float), cudaMemcpyDeviceToHost, s));
         if (cpu_share > 0) CK(cudaMemcpyAsync(x_host, xn, kEmbd * sizeof(float), cudaMemcpyDeviceToHost, s));
         CK(cudaEventRecord(ev_ids, s));
-        const bool pf = prefetch && l + 1 < kLayers;
+        const bool pf = prefetch && l + 1 < hi;   // the next stage's layer: not prefetched across the boundary
         if (pf) predict_enqueue(l + 1);
         // the shared expert (BF16, clamped SwiGLU): the GPU runs it while the host sorts the routed ones
         gemv(ly.sg, xn, tmp1, kFF, kEmbd, 1, s);
@@ -2435,10 +2453,12 @@ struct Engine {
         ++heat_tokens;
         ++dec_tok;
         ic_prepare(pos, 1);
-        CK(cudaMemcpyAsync(emb_row, embed.data() + (size_t) token * kEmbd, kEmbd * sizeof(bf16), cudaMemcpyHostToDevice, s));
-        bf16_to_f32(emb_row, x, kEmbd, s);
-        for (int j = 0; j < kHc; ++j) CK(cudaMemcpyAsync(streams + (size_t) j * kEmbd, x, kEmbd * sizeof(float), cudaMemcpyDeviceToDevice, s));
-        for (int l = 0; l < kLayers; ++l) {
+        if (lo == 0) {   // a later stage finds its input streams in `streams`
+            CK(cudaMemcpyAsync(emb_row, embed.data() + (size_t) token * kEmbd, kEmbd * sizeof(bf16), cudaMemcpyHostToDevice, s));
+            bf16_to_f32(emb_row, x, kEmbd, s);
+            for (int j = 0; j < kHc; ++j) CK(cudaMemcpyAsync(streams + (size_t) j * kEmbd, x, kEmbd * sizeof(float), cudaMemcpyDeviceToDevice, s));
+        }
+        for (int l = lo; l < hi; ++l) {
             Layer& ly = L[(size_t) l];
             hc_mix(ly.hc_attn_fn, streams, mixp, 24, kHc * kEmbd, kMixParts, s);
             hc_pre_finish(streams, mixp, ly.hc_attn_base, ly.hc_attn_scale, kEmbd, kEps, kHcEps, kSinkhorn, x, post, comb, s,
@@ -2461,9 +2481,11 @@ struct Engine {
                 if (std::FILE* f = std::fopen((dump_dir + name).c_str(), "wb")) { std::fwrite(h.data(), 4, h.size(), f); std::fclose(f); }
             }
         }
-        hc_mean(streams, x, kEmbd, s);
-        rmsnorm(x, final_norm, kEps, xn, kEmbd, 1, s);
-        gemv(lm_head, xn, logits, kVocab, kEmbd, 1, s);
+        if (hi == kLayers) {
+            hc_mean(streams, x, kEmbd, s);
+            rmsnorm(x, final_norm, kEps, xn, kEmbd, 1, s);
+            gemv(lm_head, xn, logits, kVocab, kEmbd, 1, s);
+        }
         CK(cudaStreamSynchronize(s));
         if (xp && pfc_pending) {   // nothing of this token's speculation is in flight past it
             CK(cudaStreamSynchronize(xp));
@@ -2501,6 +2523,7 @@ int main(int argc, char** argv) {
     std::string dense_fp4 = "kdaqk";
     bool dense_i8 = true;
     long long rebalance_vram = 32, rebalance_ram = 64;
+    std::string layer_split, gpus;   // 408032gb (G4): --layer-split K1,K2,.. (first layer of each later stage), --gpus D0,D1,..
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(2); } return argv[++i]; };
@@ -2542,6 +2565,8 @@ int main(int argc, char** argv) {
         else if (a == "--teacher") teacher_path = next();
         else if (a == "--dump-step-logits") step_logits_path = next();
         else if (a == "--rebalance-moves") { rebalance_vram = std::atoll(next().c_str()); rebalance_ram = 2 * rebalance_vram; }
+        else if (a == "--layer-split") layer_split = next();
+        else if (a == "--gpus") gpus = next();
         else { std::fprintf(stderr, "strata-glm: unknown argument %s\n", a.c_str()); return 2; }
     }
     if (pack.empty() || tokens_path.empty()) {
@@ -2565,76 +2590,134 @@ int main(int argc, char** argv) {
 
     if (policy != "lru" && policy != "rebalance") { std::fprintf(stderr, "strata-glm: --policy is lru or rebalance\n"); return 2; }
     if (rebalance_every < 0) rebalance_every = policy == "lru" ? 0 : 16;
-    Engine e;
-    e.max_ctx = max_ctx;
-    e.vreserve_mib = vram_reserve_mib;
-    e.dense_fp8 = !dense_bf16;
-    e.chunk_cap = chunk;
-    e.latent_i8 = latent_i8;
-    e.dense_i8 = dense_i8;
-    // a comma list: all, attn (= kda + mla), kda (= kdaqk + kdavo: KDA's q/k and v/o projections), mla (MLA and the
-    // indexer's query), shared, head; none
-    for (std::stringstream ss(dense_fp4); ss.good();) {
-        std::string c;
-        std::getline(ss, c, ',');
-        const bool all = c == "all", attn = all || c == "attn", kda = attn || c == "kda";
-        e.fp4_qk |= kda || c == "kdaqk";
-        e.fp4_vo |= kda || c == "kdavo";
-        e.fp4_mla |= attn || c == "mla";
-        e.fp4_shared |= all || c == "shared";
-        e.fp4_head |= all || c == "head";
+    // 408032gb (G4): the layers [0, kLayers) split into stages, each its own Engine on its own GPU (pipeline).
+    // One stage (the default) is the original engine. --gpus 0,0,.. (one GPU for every stage) is the bit-exact check.
+    std::vector<int> cuts, devs;
+    auto ints = [](const std::string& t, std::vector<int>& v) {
+        std::stringstream ss(t);
+        for (std::string c; std::getline(ss, c, ',');) if (!c.empty()) v.push_back(std::atoi(c.c_str()));
+    };
+    ints(layer_split, cuts);
+    ints(gpus, devs);
+    const int n_st = (int) cuts.size() + 1;
+    for (int k = 0; k < (int) cuts.size(); ++k)
+        if (cuts[(size_t) k] <= (k ? cuts[(size_t) k - 1] : 0) || cuts[(size_t) k] >= kLayers) {
+            std::fprintf(stderr, "strata-glm: --layer-split wants increasing layers in 1..%d\n", kLayers - 1);
+            return 2;
+        }
+    if (devs.empty()) { int d = 0; CK(cudaGetDevice(&d)); devs.assign((size_t) n_st, d); }
+    if ((int) devs.size() != n_st) { std::fprintf(stderr, "strata-glm: --gpus needs %d devices for %d stages\n", n_st, n_st); return 2; }
+    double ram_gib_stage = ram_gib;   // each stage pins its own RAM tier: split the budget instead of the first taking it all
+    if (n_st > 1 && ram_gib < 0) {
+        const double avail = strata::core::available_ram_bytes() / 1073741824.0;
+        ram_gib_stage = std::max(0.0, (avail - ram_reserve_gib) / n_st);
+    } else if (n_st > 1) {
+        ram_gib_stage = ram_gib / n_st;
     }
-    e.lru = policy == "lru";
-    e.excl = ram_exclusive;
-    e.vram_static = vram_static;
-    e.skip_disk = skip_disk;
-    e.skip_ram = skip_ram;
-    e.mirrors = mirrors;
-    e.cpu_share = cpu_share;
-    e.cpu_threads = cpu_threads;
-    e.prefetch = !no_prefetch;
-    e.pf_copy_max = std::min(pf_copies, kK);
-    e.pf_stage = pf_stage_on;
-    e.ram_freq = !ram_lru;
-    e.pf_read_max = std::min(pf_reads, Engine::kPred);
-    e.load(pack);
     std::vector<Engine::Route> routes;
-    if (!routes_path.empty()) e.routes = &routes;
-    if (chunk > 0) e.init_chunk(chunk, profile.empty());
-    if (!profile.empty()) e.init_tier(pack, profile, vram_experts, ram_gib, ram_reserve_gib, vram_reserve_mib);
-    if (chunk > 0 && e.tiered) {
-        e.init_prompt_pipe(chunk);
-        if (!prompt_f32) e.init_prompt_mmq(chunk);
-        else e.prompt_mmq = false;
+    std::vector<std::unique_ptr<Engine>> E;
+    for (int si = 0; si < n_st; ++si) {
+        CK(cudaSetDevice(devs[(size_t) si]));
+        E.push_back(std::make_unique<Engine>());
+        Engine& e = *E.back();
+        e.lo = si == 0 ? 0 : cuts[(size_t) si - 1];
+        e.hi = si + 1 < n_st ? cuts[(size_t) si] : kLayers;
+        if (n_st > 1) std::fprintf(stderr, "strata-glm: stage %d: layers %d-%d on GPU %d\n", si, e.lo, e.hi - 1, devs[(size_t) si]);
+        e.max_ctx = max_ctx;
+        e.vreserve_mib = vram_reserve_mib;
+        e.dense_fp8 = !dense_bf16;
+        e.chunk_cap = chunk;
+        e.latent_i8 = latent_i8;
+        e.dense_i8 = dense_i8;
+        // a comma list: all, attn (= kda + mla), kda (= kdaqk + kdavo: KDA's q/k and v/o projections), mla (MLA and the
+        // indexer's query), shared, head; none
+        for (std::stringstream ss(dense_fp4); ss.good();) {
+            std::string c;
+            std::getline(ss, c, ',');
+            const bool all = c == "all", attn = all || c == "attn", kda = attn || c == "kda";
+            e.fp4_qk |= kda || c == "kdaqk";
+            e.fp4_vo |= kda || c == "kdavo";
+            e.fp4_mla |= attn || c == "mla";
+            e.fp4_shared |= all || c == "shared";
+            e.fp4_head |= all || c == "head";
+        }
+        e.lru = policy == "lru";
+        e.excl = ram_exclusive;
+        e.vram_static = vram_static;
+        e.skip_disk = skip_disk;
+        e.skip_ram = skip_ram;
+        e.mirrors = mirrors;
+        e.cpu_share = cpu_share;
+        e.cpu_threads = cpu_threads;
+        e.prefetch = !no_prefetch;
+        e.pf_copy_max = std::min(pf_copies, kK);
+        e.pf_stage = pf_stage_on;
+        e.ram_freq = !ram_lru;
+        e.pf_read_max = std::min(pf_reads, Engine::kPred);
+        e.load(pack);
+        if (!routes_path.empty()) e.routes = &routes;   // every stage appends its layers' records
+        if (chunk > 0) e.init_chunk(chunk, profile.empty());
+        if (!profile.empty()) e.init_tier(pack, profile, vram_experts, ram_gib_stage, ram_reserve_gib, vram_reserve_mib);
+        if (chunk > 0 && e.tiered) {
+            e.init_prompt_pipe(chunk);
+            if (!prompt_f32) e.init_prompt_mmq(chunk);
+            else e.prompt_mmq = false;
+        }
+        e.timing_init();
+        e.predict_init();
     }
-    e.timing_init();
-    e.predict_init();
+    Engine& e = *E.back();   // the stage with the head: logits and the summary below
+    auto on = [&](int si) { CK(cudaSetDevice(devs[(size_t) si])); return std::ref(*E[(size_t) si]); };
+    // one prompt chunk / one token through every stage; the residual streams move on between stages
+    auto run_chunk = [&](size_t i, int T, const std::string& dd) {
+        for (int si = 0; si < n_st; ++si) {
+            Engine& st = on(si);
+            if (si > 0)
+                CK(cudaMemcpyPeer(st.c_streams, devs[(size_t) si], E[(size_t) si - 1]->c_streams, devs[(size_t) si - 1],
+                                  (size_t) T * kHc * kEmbd * sizeof(float)));
+            st.forward_chunk(prompt.data() + i, T, (int) i, dd);
+        }
+    };
+    auto run_token = [&](int tok, int p, const std::string& dd) {
+        for (int si = 0; si < n_st; ++si) {
+            Engine& st = on(si);
+            if (si > 0)
+                CK(cudaMemcpyPeer(st.streams, devs[(size_t) si], E[(size_t) si - 1]->streams, devs[(size_t) si - 1],
+                                  (size_t) kHc * kEmbd * sizeof(float)));
+            st.forward(tok, p, dd);
+        }
+    };
     const char* nsys_env = std::getenv("GLM_NSYS");   // 1: decode, 2: the prompt (nsys --capture-range=cudaProfilerApi)
     if (nsys_env && std::atoi(nsys_env) == 2) CK(cudaProfilerStart());
     const auto t0 = std::chrono::steady_clock::now();
     if (chunk > 0) {
         for (size_t i = 0; i < prompt.size(); i += (size_t) chunk) {
             const int T = (int) std::min<size_t>((size_t) chunk, prompt.size() - i);
-            e.forward_chunk(prompt.data() + i, T, (int) i, i + T == prompt.size() ? dump_dir : std::string());
+            run_chunk(i, T, i + T == prompt.size() ? dump_dir : std::string());
             std::fprintf(stderr, "strata-glm: %zu of %zu prompt tokens\n", i + T, prompt.size());
         }
     } else {
         for (size_t i = 0; i < prompt.size(); ++i)
-            e.forward(prompt[i], (int) i, i + 1 == prompt.size() ? dump_dir : std::string());
+            run_token(prompt[i], (int) i, i + 1 == prompt.size() ? dump_dir : std::string());
     }
     const double tp = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (nsys_env && std::atoi(nsys_env) == 2) CK(cudaProfilerStop());
-    if (e.tiered && chunk > 0) {
-        e.release_prompt();
-        e.grow_vram_tier(vram_reserve_mib);
+    for (int si = 0; si < n_st; ++si) {
+        Engine& st = on(si);
+        if (st.tiered && chunk > 0) {
+            st.release_prompt();
+            st.grow_vram_tier(vram_reserve_mib);
+        }
+        if (st.tiered) {   // the prompt said which experts this conversation uses: the tiers follow it
+            const double ps = (double) (st.ts.vram + st.ts.ram + st.ts.file);
+            if (ps > 0)
+                std::fprintf(stderr, "strata-glm: %sprompt experts: %.1f%% VRAM, %.1f%% RAM, %.1f%% disk\n",
+                             n_st > 1 ? ("stage " + std::to_string(si) + ": ").c_str() : "", 100 * st.ts.vram / ps,
+                             100 * st.ts.ram / ps, 100 * st.ts.file / ps);
+            st.rebalance(1LL << 40, 1LL << 40, true);
+        }
     }
-    if (e.tiered) {   // the prompt said which experts this conversation uses: the tiers follow it
-        const double ps = (double) (e.ts.vram + e.ts.ram + e.ts.file);
-        if (ps > 0)
-            std::fprintf(stderr, "strata-glm: prompt experts: %.1f%% VRAM, %.1f%% RAM, %.1f%% disk\n", 100 * e.ts.vram / ps,
-                         100 * e.ts.ram / ps, 100 * e.ts.file / ps);
-        e.rebalance(1LL << 40, 1LL << 40, true);
-    }
+    on(n_st - 1);
     std::vector<float> lg(kVocab);
     CK(cudaMemcpy(lg.data(), e.logits, lg.size() * sizeof(float), cudaMemcpyDeviceToHost));
     if (!dump_logits.empty())
@@ -2643,6 +2726,8 @@ int main(int argc, char** argv) {
     std::vector<int> out;
     int pos = (int) prompt.size(), steps = 0;
     const Engine::TierStats ts0 = e.ts;
+    std::vector<Engine::TierStats> ts0s;
+    for (const auto& st : E) ts0s.push_back(st->ts);
     const bool nsys = nsys_env && std::atoi(nsys_env) == 1;
     if (nsys) CK(cudaProfilerStart());
     const auto t1 = std::chrono::steady_clock::now();
@@ -2660,11 +2745,15 @@ int main(int argc, char** argv) {
         out.push_back(tok);
         if (tok == 154820 || tok == 154827 || tok == 154829) break;   // eos ids (config.json)
         const auto tf = std::chrono::steady_clock::now();
-        e.forward(tok, pos++, std::string());
+        run_token(tok, pos++, std::string());
         e.timing_token(std::chrono::duration<double>(std::chrono::steady_clock::now() - tf).count());
         ++steps;
-        if (e.tiered && rebalance_every > 0 && steps % rebalance_every == 0) e.rebalance(rebalance_vram, rebalance_ram, false);
-        if (e.tiered && restatic_every > 0 && steps % restatic_every == 0) e.restatic(16, 1.5);
+        for (int si = 0; si < n_st; ++si) {
+            Engine& st = on(si);
+            if (st.tiered && rebalance_every > 0 && steps % rebalance_every == 0) st.rebalance(rebalance_vram, rebalance_ram, false);
+            if (st.tiered && restatic_every > 0 && steps % restatic_every == 0) st.restatic(16, 1.5);
+        }
+        on(n_st - 1);
         if (steps % 32 == 0) {   // the machine is also a desktop: say so when RAM runs low
             const double avail = strata::core::available_ram_bytes() / 1073741824.0;
             if (avail > 0 && avail < 8) std::fprintf(stderr, "strata-glm: only %.1f GiB of RAM left for Windows\n", avail);
@@ -2689,6 +2778,16 @@ int main(int argc, char** argv) {
     for (int t : out) std::printf(" %d", t);
     std::printf("\n");
     std::fprintf(stderr, "strata-glm: decode %d steps in %.1f s (%.2f tok/s)\n", steps, td, steps / td);
+    if (n_st > 1 && steps > 0)
+        for (int si = 0; si < n_st; ++si) {
+            const Engine& st = *E[(size_t) si];
+            const Engine::TierStats& b0 = ts0s[(size_t) si];
+            const double v = (double) (st.ts.vram - b0.vram), r = (double) (st.ts.ram - b0.ram), f = (double) (st.ts.file - b0.file);
+            const double c = (double) (st.ts.cpu - b0.cpu), n = std::max(1.0, v + r + f + c);
+            std::fprintf(stderr, "strata-glm: stage %d (layers %d-%d, GPU %d) decode experts: %.1f%% VRAM, %.1f%% RAM to the GPU, "
+                                 "%.1f%% RAM on the CPU, %.1f%% disk\n", si, st.lo, st.hi - 1, devs[(size_t) si], 100 * v / n,
+                         100 * r / n, 100 * c / n, 100 * f / n);
+        }
     if (e.tiered && steps > 0) {
         const double v = (double) (e.ts.vram - ts0.vram), r = (double) (e.ts.ram - ts0.ram), f = (double) (e.ts.file - ts0.file);
         const double c = (double) (e.ts.cpu - ts0.cpu), n = v + r + f + c;
