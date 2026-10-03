@@ -122,3 +122,16 @@ not a bigger tier, it is either (a) more VRAM (layer-split: 2 cards = 2x the hot
 (b) speculative prefetch of the router's next-token candidates, or (c) the ik_llama-style
 GGUF path where all experts live in RAM (no disk tier at all). MAP_HUGETLB unavailable on
 this host (no hugetlb pool) - 4 KB pages, minor.
+
+## 2026-10-03: real weights answer - quality confirmed, decode is PCIe-bound
+
+Quality: "What is the capital of France? Answer in one short sentence." ->
+"<|im_start|>The capital of France is Paris." (stops at EOS). A 256-token continuation of a real
+16K-token docs+code prompt produces fluent on-style API documentation. The pack is value-true.
+
+Speeds on the real pack (GPU2, chunk 4096): prefill 16K real text 401.49 tok/s (random ids:
+381.59); decode 6.85 tok/s on real text, 9.25 on random ids, 8.03 on the 13-token prompt.
+The decode token at 144.1 ms: copies 99.5 (48.6% of expert loads come from RAM = ~2.3 GB/token
+over the ~25 GB/s PCIe), kernels 7.0, the rest 37.6. Disk is NOT the ceiling on real text
+(0.1%, 1.4 ms) - the ceiling is RAM->GPU expert copies. Layer-split doubles the VRAM-resident
+hot set (51.3% VRAM now) and adds a second PCIe line: the measured case for --gpus 2,X.
