@@ -135,3 +135,22 @@ The decode token at 144.1 ms: copies 99.5 (48.6% of expert loads come from RAM =
 over the ~25 GB/s PCIe), kernels 7.0, the rest 37.6. Disk is NOT the ceiling on real text
 (0.1%, 1.4 ms) - the ceiling is RAM->GPU expert copies. Layer-split doubles the VRAM-resident
 hot set (51.3% VRAM now) and adds a second PCIe line: the measured case for --gpus 2,X.
+
+## 2026-10-03: decode 6.85 -> 13.89 - the CPU pool is the lever, not PCIe tuning
+
+The decode ceiling was RAM->GPU copies (2.3 GB/token at 23 GB/s, ~90% of PCIe). The fix is not
+to move those bytes faster but to not move them: `--cpu-share 1.0 --cpu-threads 90` computes the
+RAM-resident experts on the 96-core EPYC (the pool already existed for cache misses; the share
+knob routes RAM hits to it). Copies 99.5 -> 8.5 ms; decode 6.85 -> 13.30 tok/s (256 steps, real
+16K prompt). `--dense-i8` (int8 dense GEMV) cuts the dense part 37.6 -> 27.3 ms: 13.89 tok/s
+(64 steps). The breakdown stays ADDITIVE (copies + kernels + dense): the per-token chain
+dense -> x to host -> CPU experts -> back is a dependency, nothing overlaps - speculative
+verification amortizes the fixed 27-37 ms dense part over k drafted tokens, the next lever.
+
+Tuning table (real pack, 16K prompt, GPU2): baseline 6.85 | share 1.0/90 13.30 | share 0.7/90
+10.30 (copies return, CPU idle - worse) | share 1.0/90 + latent-i8 12.82 (no gain) | share
+1.0/90 + dense-i8 13.89 BEST. Bugs found: --cpu-threads >= nproc (96, 120) HANGS decode after
+prefill; --latent-i8 + cpu-share hangs at 96 threads, fine at 90. VRAM-set A/B exhausted:
+chunk 2048 grows the VRAM set 562 -> 690 but prefill drops 401 -> 241 and decode does not move
+(the hit rate is set by routing concentration, not the tail); --vram-experts 650/700 OOM the
+chunk-4096 prompt buffers (the auto-size is correct).
