@@ -1,6 +1,6 @@
 # strata-glm — GLM-5.3-Flash NVFP4 on one desktop (archived experiment)
 
-A native C++/CUDA engine that runs **GLM-5.3-Flash in NVFP4** — a 204 GB MoE checkpoint (42 MoE layers × 288
+A native C++/CUDA engine that runs **GLM-5.3-Flash** — a 204 GB MoE model (42 MoE layers × 288
 experts, 12,096 routed experts of 14.16 MB each) — on **one RTX 5090 (32 GB) + 128 GB RAM + two NVMe drives**,
 without GGUF and without a GPU cluster. It is built on the [Strata](https://github.com/Niko1221/Strata) engine
 (via the [strata-nvfp4](https://github.com/sergqwer/strata-nvfp4) fork, whose README is kept as
@@ -90,9 +90,9 @@ cmake --build build --target strata-glm
 
 Without `-DSTRATA_GGML_DIR=<llama.cpp checkout>` CMake fetches the pinned ggml commit.
 
-1. Download the ModelOpt checkpoint `nvidia/GLM-5.3-Flash-NVFP4`.
-2. Pack the experts (lossless repack into ggml's block_nvfp4 rows, ~171 GB):
-   `python tools/glm_pack.py --model <checkpoint> --out <pack>`; optionally copy `experts.bin` to a second drive.
+1. Canonical weights for this deployment: `/mnt/data/home/grishberg/models/GLM-5.3-Flash-GGUF/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-*-of-00006.gguf` (GGUF; see `../408032gb/AGENTS.md`). The pack is converted from them; the upstream `glm_pack.py` below expects a different (safetensors) layout and is legacy here.
+2. (legacy upstream flow) Pack the experts (lossless repack into ggml's block_nvfp4 rows, ~171 GB):
+   `python tools/glm_pack.py --model <weights> --out <pack>`; optionally copy `experts.bin` to a second drive.
 3. An expert profile (the boot ranking of the tiers): `tools/glm_profile.py split / run / stats --profile`.
 4. Run on a file of token ids (tokenize with the checkpoint's `tokenizer.json`):
 
