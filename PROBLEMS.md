@@ -71,7 +71,8 @@ experts.bin, ярус RAM) и **механику скорости** (байты,
 | единый движок, `--chunk 0` | 40 tok / 34.4 s = 1.16 tok/s | 16 tok / 14.0 s = **1.15 tok/s** |
 | 4 стадии на одной карте | 40 tok / 37.4 s = 1.07 tok/s | 8 tok / 6.9 s = **1.17 tok/s** |
 | **ярус RAM (патч 0004), `--profile`, `--chunk 0`** | 1024 tok / 52.3 s = 19.58 tok/s | 32 tok / 1.6 s = **19.69 tok/s** |
-| **ярус RAM, `--profile`, `--chunk 512`** | 1024 tok / 15.5 s = **66.18 tok/s** | 32 tok / 1.6 s = 19.85 tok/s |
+| ярус RAM, `--profile`, `--chunk 512` | 1024 tok / 15.5 s = 66.18 tok/s | 32 tok / 1.6 s = 19.85 tok/s |
+| **ярус RAM, `--profile`, `--chunk 1024`** | 1024 tok / 8.2 s = **124.18 tok/s** | 32 tok / 1.6 s = 19.81 tok/s |
 
 Механика disk-only: на токен decode читается 42×8×14 155 792 B = **4.76 GB** (fread из page cache + H2D,
 сериализовано sync-ом на слой) → эффективные ~5.5 GB/s — потолок disk-only конвейера, не модель.
