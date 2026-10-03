@@ -14,13 +14,14 @@ Writes, one expert at a time (flat memory):
                        byte offset, dtype and shape: the engine reads them from the checkpoint itself.
 
 Resumable: experts.bin grows a whole layer at a time; a run finds the layers already written and continues.
-The process stops itself above --max-private-gb of committed memory (default 8).
+The process stops itself above --max-private-gb of private memory (default 8).
 """
 from __future__ import annotations
 
 import argparse
 import ctypes
 import json
+import os
 import pathlib
 import random
 import struct
@@ -35,10 +36,26 @@ GU_ROW, D_ROW = (N_EMBD // 64) * 36, (N_FF // 64) * 36
 BLOB = 2 * N_FF * GU_ROW + N_EMBD * D_ROW + 16
 E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], dtype=np.float32)
 KV_FP4 = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], dtype=np.float32)   # ggml: doubled
+LM_PREFIX = ("model.language_model.", "model.", "")   # the wrapped checkpoint, the bare language model, unscoped
+PEAK_GB = 0.0
 
 
 def private_gb() -> float:
-    """This process's committed memory (Windows PrivateUsage), GB."""
+    """This process's private memory, GB - its peak, so a spike that already fell back still trips
+    --max-private-gb.
+
+    Linux: the anonymous footprint from /proc/self/smaps_rollup (Pss_Anon, else Private_Clean +
+    Private_Dirty), VmHWM from /proc/self/status where the rollup has neither. The checkpoint's pages,
+    faulted in through the read-only memmaps, are resident too - 2 GiB of them per shard read - and a
+    resident or peak-resident limit would stop the run on the page cache rather than on this process.
+    """
+    global PEAK_GB
+    PEAK_GB = max(PEAK_GB, _private_gb_nt() if os.name == "nt" else _private_gb_proc())
+    return PEAK_GB
+
+
+def _private_gb_nt() -> float:
+    """psapi GetProcessMemoryInfo: the process's private bytes, GB."""
     class PMC(ctypes.Structure):
         _fields_ = [("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong)] + \
                    [(n, ctypes.c_size_t) for n in ("PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
@@ -55,14 +72,41 @@ def private_gb() -> float:
     return pmc.PrivateUsage / 1e9
 
 
+def _private_gb_proc() -> float:
+    def fields(path: str) -> dict:
+        with open(path, encoding="ascii") as fh:
+            return {line.split(":")[0]: int(line.split()[1]) * 1024 for line in fh if line.endswith(" kB\n")}
+
+    try:
+        rollup = fields("/proc/self/smaps_rollup")
+    except OSError:                    # a hardened container without the rollup
+        rollup = {}
+    if "Pss_Anon" in rollup:
+        return rollup["Pss_Anon"] / 1e9
+    if "Private_Dirty" in rollup:
+        return (rollup.get("Private_Clean", 0) + rollup["Private_Dirty"]) / 1e9
+    status = fields("/proc/self/status")
+    if "VmHWM" not in status:
+        raise OSError("no memory accounting in /proc/self")
+    return status["VmHWM"] / 1e9
+
+
 class Checkpoint:
     """The safetensors files: headers parsed once, tensors read as zero-copy views of a memmap."""
 
     def __init__(self, d: pathlib.Path):
         self.d = d
-        self.where = json.loads((d / "model.safetensors.index.json").read_text())["weight_map"]
+        self.where = json.loads((d / "model.safetensors.index.json").read_text(encoding="utf-8"))["weight_map"]
+        self.lm = next((p for p in LM_PREFIX if any(k.startswith(p + "layers.") for k in self.where)), None)
+        if self.lm is None:
+            raise ValueError("%s: no transformer layers under %s"
+                             % (d, " or ".join('"%slayers."' % p for p in LM_PREFIX)))
         self.headers: dict[str, tuple[dict, int]] = {}
         self.maps: dict[str, np.memmap] = {}
+
+    def pre(self, layer: int, e: int) -> str:
+        """The tensor-name prefix of one routed expert, in this checkpoint's naming."""
+        return "%slayers.%d.mlp.experts.%d." % (self.lm, layer, e)
 
     def header(self, f: str):
         if f not in self.headers:
@@ -72,6 +116,8 @@ class Checkpoint:
         return self.headers[f]
 
     def info(self, name: str):
+        if name not in self.where:
+            raise KeyError("%s: not in model.safetensors.index.json (language model under %r)" % (name, self.lm))
         f = self.where[name]
         h, base = self.header(f)
         t = h[name]
@@ -119,7 +165,7 @@ def decode_blocks(raw: np.ndarray, rows: int, cols: int) -> np.ndarray:
 
 
 def expert_blob(ck: Checkpoint, layer: int, e: int, verify: bool = False) -> bytes:
-    pre = "model.language_model.layers.%d.mlp.experts.%d." % (layer, e)
+    pre = ck.pre(layer, e)
     parts, tail = [], []
     for proj, rows, cols in (("gate_proj", N_FF, N_EMBD), ("up_proj", N_FF, N_EMBD), ("down_proj", N_EMBD, N_FF)):
         w, s = ck.raw(pre + proj + ".weight"), ck.raw(pre + proj + ".weight_scale")
@@ -162,7 +208,7 @@ def main() -> int:
             continue   # the vision tower is not part of the language model
         f, off, n, dt, shape = ck.info(name)
         dense[name] = {"file": f, "offset": off, "bytes": n, "dtype": dt, "shape": shape}
-    (out / "dense.json").write_text(json.dumps({"model": str(ck.d), "tensors": dense}, indent=0))
+    (out / "dense.json").write_text(json.dumps({"model": str(ck.d), "tensors": dense}, indent=0), encoding="utf-8")
     # the same as plain text for the engine: name dtype file offset bytes ndim dims...
     with open(out / "dense.txt", "w", encoding="utf-8", newline="\n") as fo:
         fo.write("# model %s\n" % ck.d)
@@ -185,13 +231,15 @@ def main() -> int:
             tl = time.time()
             for e in range(N_EXPERT):
                 fo.write(expert_blob(ck, m + DENSE_LEAD, e, verify=(m, e) in check))
-                if e % 32 == 31 and private_gb() > a.max_private_gb:
-                    print("stopping: %.1f GB committed (limit %.1f)" % (private_gb(), a.max_private_gb), flush=True)
-                    return 2
+                if e % 32 == 31:
+                    gb = private_gb()
+                    if gb > a.max_private_gb:
+                        print("stopping: %.1f GB private (limit %.1f)" % (gb, a.max_private_gb), flush=True)
+                        return 2
             fo.flush()
             ck.maps.clear()   # drop the views of this layer's shards
             el = time.time() - tl
-            print("layer %2d (model %2d): %.1f s, %.2f GB/s, %d of %d; %.1f GB committed"
+            print("layer %2d (model %2d): %.1f s, %.2f GB/s, %d of %d; %.1f GB private"
                   % (m, m + DENSE_LEAD, el, layer_bytes / el / 1e9, m + 1, n_moe, private_gb()), flush=True)
     part.replace(out / "experts.bin")
 
