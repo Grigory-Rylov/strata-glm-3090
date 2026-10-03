@@ -104,3 +104,21 @@ kernels 0.4 + остальное (dense, роутеры, sync) 36.1 мс; prefet
 6. ~~Портировать ли `TieredExpertSource` (ярус RAM) на Linux~~ — **сделано 03.10 (патч 0004, 19.65 tok/s
    decode на тестовом паке)**. Осталось: подтвердить на реальных весах (вопрос 1).
 6. **Портировать ли `glm_pack.py` на Linux** заранее, до решения по вопросу 1?
+
+## 2026-10-03: real weights - the routing spread is the decode ceiling
+
+The NVFP4 checkpoint packed (glm_pack.py, 42 layers, 171.2 GB, 24 experts verified value by
+value, 34 min). Routing profile from 16 real segments (code/docs/prose, glm_profile.py):
+expert reuse from the previous token 24.6% (the synthetic pack: ~60%), per-layer top-1310
+covers 42-64% of the routed mass. First run on the real pack (GPU2, chunk 4096, 16K prompt,
+256 new tokens, tier 562 VRAM + 11036 RAM + 498 disk):
+
+  prefill 381.59 tok/s (synthetic 437.8), decode 9.25 tok/s (synthetic 19.80)
+  decode token 106.5 ms: copies (with disk waits) 64.1, kernels 4.8, the rest 37.6
+
+The decode gap is the 498 disk-side experts the spread routing keeps hitting (~4.5 disk
+experts/token at 14.16 MB each). The RAM tier already holds 91% of all experts - the fix is
+not a bigger tier, it is either (a) more VRAM (layer-split: 2 cards = 2x the hot set),
+(b) speculative prefetch of the router's next-token candidates, or (c) the ik_llama-style
+GGUF path where all experts live in RAM (no disk tier at all). MAP_HUGETLB unavailable on
+this host (no hugetlb pool) - 4 KB pages, minor.
