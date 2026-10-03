@@ -154,3 +154,65 @@ prefill; --latent-i8 + cpu-share hangs at 96 threads, fine at 90. VRAM-set A/B e
 chunk 2048 grows the VRAM set 562 -> 690 but prefill drops 401 -> 241 and decode does not move
 (the hit rate is set by routing concentration, not the tail); --vram-experts 650/700 OOM the
 chunk-4096 prompt buffers (the auto-size is correct).
+
+## 2026-10-03: --spec K - speculative decoding, and the MoE ceiling on it
+
+The lever named above, built. `--spec K` drafts up to K tokens by prompt lookup (the longest suffix of
+the sequence, 2..8 tokens, that occurs earlier in it, plus what followed that occurrence), runs [the
+token just taken, the drafts] through the prompt path at the current position and reads the head at
+every row. Each position's token is the model's own argmax at that row, so the drafts choose only
+which positions are computed together, never what comes out - greedy by construction. `--spec 0` is
+the old loop, unchanged (verified: same 64 ids, same speed). `--spec` asks for `--profile`: without the
+tiers a chunk re-reads all 288 experts of a layer, so a pass over T of them would save nothing.
+
+What a pass leaves behind is the KDA layers' recurrence, advanced by K+1 tokens when only a prefix was
+accepted. Each pass snapshots S, the conv state, the raw q/k/v and the post-prep scan inputs of all 34
+KDA layers; spec_fix(keep) restores S and the conv, re-runs the conv and the scan over the kept rows.
+The MLA, indexer and pool caches need no repair: their garbage rows sit at or beyond the next pass's
+first position, and a block is first read at query >= 4j+4, always after the pass that writes row 4j+3
+has re-pooled it.
+
+Three pieces the pass needed that the engine did not have. CpuExperts::start_multi computes the RAM
+experts on the CPU pool over all their rows at once - an expert's blob is read once for its rows; the
+alternative, a PCIe copy of ~20 blobs a layer, is ~500 ms a pass. dmat runs the dense projections of a
+pass through gemv: cuBLASLt dequantizes each quantized matrix to BF16 on every call, bytes with
+nothing to do with T and a rounding the decode token never sees, while gemv reads the quantized weights
+once for all its rows as the decode path does. That was 370 -> 205 ms a pass, and acceptance 64 -> 83%
+in the short high-copy stretch, because verifier and decoder now round alike. And the pool's job boundary
+had to be closed: a worker leaves its gate the moment the generation changes but is still inside its
+claim loops when the last unit lands, so the producer could reset the counters and the shape under a
+straggler - it then takes a unit of the next job with the previous job's n_ and pointers, which either
+sets finished_ early (half-computed rows copied to the GPU) or never sets it (a permanent spin in
+cpux.wait()). Harmless while every job had one row; --spec alternates single-row and multi-row jobs
+every iteration. start()/start_multi() now wait for every worker back at the gate before publishing.
+
+Measured (real pack, GPU2, 16K prompt, 256 tokens, share 1.0/90, dense-i8, one batch, same build):
+spec 0 13.60 tok/s (a step 71 ms, 50.8% of the experts in VRAM) | spec 3 14.12 (55.6% of the drafts
+accepted, 2.67 tokens a pass, a pass 206 ms, break-even 2.76, 44.5% VRAM) | spec 5 10.47 (46.7%, 3.33
+tokens, a pass 328 ms, break-even 4.0, 44.4% VRAM). The same build measured spec 0 at 14.61 in another
+run, so the spread between runs is as wide as the difference between the modes - and the pass machinery
+is not free: its staging and snapshot buffers cost ~650 MB of VRAM the expert tier would otherwise
+hold, six points of the hot set. The cost model is a pass = F + V*T with F ~ 100 ms (dense, attention,
+the GPU's experts - read once for all T rows) and V ~ 25 ms a token (the CPU pool's MACs and the extra
+expert blobs, both linear in tokens) against a 66-82 ms step. The first 16 tokens, deep inside a block
+the model is copying, ran 15.41 tok/s at 83% acceptance; the rest of the run copies less.
+
+The MoE is the ceiling, not the plumbing. 8 of 288 experts a token, so a pass over T tokens touches
+~6.5T distinct experts: the CPU pool reads ~311 MB a layer where a decode step reads ~85 MB. Expert
+bytes are ~70% of a token's cost and barely amortize; only the dense part and the per-step chain do,
+which bounds the gain near 1.2x even at perfect acceptance. Speculative decoding on this engine is
+marginal by construction, not by tuning.
+
+So the flag measures itself rather than trusting a constant: every 8th position (until six plain
+samples) goes through a plain step, and once both sides have samples, tokens a pass is compared with
+the measured pass/step ratio and speculation stops when it is below it - `spec 3 off after 9 passes:
+2.67 tokens a pass for 206.2 ms, a plain step is 74.8 ms`. Being wrong about a corpus then costs the
+passes before the guard fires, not the run. Once off it stays off: acceptance decays as the model
+stops copying, and re-probing costs a pass each time.
+
+Numerics: a pass is the prompt path (FP32 experts on the CPU pool, gemv dense), a step is the decode
+path (quantized experts on the GPU). The two diverge after ~15 ids here. That is legal for greedy
+speculative decoding - every token of a --spec run is the argmax of a pass, and the passes are
+self-consistent - but --spec K does not reproduce --spec 0's text. The straggler race above is the
+likeliest explanation of the one hang seen while building this: a run stopped after the prefill with the
+GPU at 0% and no reads from the process, and did not reproduce with identical flags afterwards.

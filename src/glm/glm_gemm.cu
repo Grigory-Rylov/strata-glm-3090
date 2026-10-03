@@ -35,7 +35,7 @@ __global__ void split_kernel(const float* __restrict__ x, int rows, int cols, in
 
 void Gemm::init(cudaStream_t s, size_t max_elems) {
     s_ = s;
-    ckb(cublasCreate(&h_), "create");
+    if (!h_) ckb(cublasCreate(&h_), "create");   // release() keeps the handle; a re-init reuses it
     ckb(cublasSetStream(h_, s), "stream");
     ckb(cublasSetMathMode(h_, CUBLAS_DEFAULT_MATH), "math mode");   // no TF32 for the FP32 path
     cap_ = max_elems;
